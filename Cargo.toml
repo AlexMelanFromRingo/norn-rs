@@ -1,0 +1,26 @@
+[package]
+name = "norn-rs"
+version = "0.1.0"
+edition = "2024"
+description = "A next-generation mesh routing protocol — K=3 spanning trees, cuckoo filter, ChaCha20-Poly1305 sessions"
+license = "MIT"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+x25519-dalek = { version = "2", features = ["reusable_secrets", "static_secrets"] }
+chacha20poly1305 = "0.10"
+blake2 = "0.10"
+rand = "0.8"
+hex = "0.4"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+bytes = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+curve25519-dalek = "4"
+sha2 = "0.10"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util"] }

@@ -1,0 +1,14 @@
+/home/young-developer/Rust/norn-rs/target/debug/deps/serde-276ff2203e2deede.d: /home/young-developer/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/lib.rs /home/young-developer/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/integer128.rs /home/young-developer/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/mod.rs /home/young-developer/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/de.rs /home/young-developer/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/ser.rs /home/young-developer/Rust/norn-rs/target/debug/build/serde-5e55967fd4a49097/out/private.rs
+
+/home/young-developer/Rust/norn-rs/target/debug/deps/libserde-276ff2203e2deede.rlib: /home/young-developer/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/lib.rs /home/young-developer/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/integer128.rs /home/young-developer/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/mod.rs /home/young-developer/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/de.rs /home/young-developer/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/ser.rs /home/young-developer/Rust/norn-rs/target/debug/build/serde-5e55967fd4a49097/out/private.rs
+
+/home/young-developer/Rust/norn-rs/target/debug/deps/libserde-276ff2203e2deede.rmeta: /home/young-developer/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/lib.rs /home/young-developer/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/integer128.rs /home/young-developer/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/mod.rs /home/young-developer/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/de.rs /home/young-developer/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/ser.rs /home/young-developer/Rust/norn-rs/target/debug/build/serde-5e55967fd4a49097/out/private.rs
+
+/home/young-developer/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/lib.rs:
+/home/young-developer/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/integer128.rs:
+/home/young-developer/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/mod.rs:
+/home/young-developer/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/de.rs:
+/home/young-developer/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/ser.rs:
+/home/young-developer/Rust/norn-rs/target/debug/build/serde-5e55967fd4a49097/out/private.rs:
+
+# env-dep:OUT_DIR=/home/young-developer/Rust/norn-rs/target/debug/build/serde-5e55967fd4a49097/out
