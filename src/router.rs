@@ -12,6 +12,7 @@ use tokio::sync::mpsc;
 use tracing::{debug, warn};
 
 use crate::cuckoo::CuckooFilter;
+use crate::hyperbolic::HypCoord;
 use crate::packet::*;
 use crate::session::{SessionManager, SharedSessionManager, SESSION_INIT_MAGIC, SESSION_ACK_MAGIC};
 
@@ -71,6 +72,8 @@ struct TreeAnnounce {
     path_cost: u64,
     sender: [u8; 32],
     received_at: Instant,
+    /// Hop depth of the sender in this tree
+    depth: u32,
 }
 
 struct TreeState {
@@ -121,6 +124,10 @@ struct RouterState {
     next_conn_id: ConnId,
     // Path lookup dedup: lookup_id -> sent_time
     pending_lookups: HashMap<u64, Instant>,
+    // Hyperbolic coordinate routing
+    coord_table: HashMap<[u8; 32], HypCoord>,
+    own_coord: HypCoord,
+    own_depth: u32,
 }
 
 // ──────────────────────────────────────────────
@@ -165,6 +172,10 @@ impl RouterState {
             parent_cost: 0,
         });
 
+        let own_coord = HypCoord::origin();
+        let mut coord_table = HashMap::new();
+        coord_table.insert(pub_key, own_coord);
+
         RouterState {
             signing_key,
             pub_key,
@@ -176,6 +187,9 @@ impl RouterState {
             traffic_tx,
             next_conn_id: 0,
             pending_lookups: HashMap::new(),
+            coord_table,
+            own_coord,
+            own_depth: 0,
         }
     }
 
@@ -284,10 +298,21 @@ impl RouterState {
             self.trees[tree_id].root = self.pub_key;
             self.trees[tree_id].parent_cost = 0;
             // Increment root_seq to indicate we're claiming root
+            if tree_id == 0 {
+                self.own_depth = 0;
+            }
         } else {
             self.trees[tree_id].parent = best_parent;
             self.trees[tree_id].root = best_root.unwrap();
             self.trees[tree_id].parent_cost = best_cost;
+            if tree_id == 0 {
+                // Our depth = parent's depth + 1
+                if let Some(parent_key) = best_parent {
+                    if let Some(ann) = self.peers.get(&parent_key).and_then(|p| p.trees[0].as_ref()) {
+                        self.own_depth = ann.depth + 1;
+                    }
+                }
+            }
         }
     }
 
@@ -300,6 +325,7 @@ impl RouterState {
         let sender = self.pub_key;
 
         // Sign the announce
+        let depth = if tree_id == 0 { self.own_depth } else { 0 };
         let ann_unsigned = Announce {
             tree_id: tree_id as u8,
             root,
@@ -307,6 +333,7 @@ impl RouterState {
             path_cost,
             sender,
             signature: [0u8; 64],
+            depth,
         };
         let sign_bytes = ann_unsigned.sign_bytes();
         let signature = self.signing_key.sign(&sign_bytes).to_bytes();
@@ -432,8 +459,49 @@ impl RouterState {
             self.send_announces(i);
             self.cuckoo_do_maintenance(i);
         }
+        self.update_own_coord();
+        self.broadcast_coord();
         self.send_keepalives();
         self.cleanup_stale_lookups();
+    }
+
+    /// Recompute our own hyperbolic coordinate from current depth.
+    fn update_own_coord(&mut self) {
+        self.own_coord = HypCoord::from_tree_depth(self.own_depth, &self.pub_key);
+        self.coord_table.insert(self.pub_key, self.own_coord);
+    }
+
+    /// Broadcast our hyperbolic coordinate to all peers.
+    fn broadcast_coord(&mut self) {
+        let coord_bytes = self.own_coord.encode();
+        let mut msg = coord_bytes.to_vec();
+        msg.extend_from_slice(&self.own_depth.to_le_bytes());
+        let sig = self.signing_key.sign(&msg).to_bytes();
+        let ann = CoordAnnounce { coord: coord_bytes, tree_depth: self.own_depth, sig };
+        let mut frame = vec![TYPE_COORD_ANNOUNCE];
+        ann.encode_into(&mut frame);
+        let peer_keys: Vec<PeerId> = self.peers.keys().copied().collect();
+        for pk in peer_keys {
+            self.send_to_peer(&pk, frame.clone());
+        }
+    }
+
+    /// Handle an incoming CoordAnnounce from a peer.
+    pub fn handle_coord_announce(&mut self, from_key: [u8; 32], ann: CoordAnnounce) {
+        // Verify signature: sig over (coord || tree_depth as 4-byte LE)
+        let vk = match ed25519_dalek::VerifyingKey::from_bytes(&from_key) {
+            Ok(v) => v,
+            Err(_) => return,
+        };
+        let mut msg = ann.coord.to_vec();
+        msg.extend_from_slice(&ann.tree_depth.to_le_bytes());
+        let sig = ed25519_dalek::Signature::from_bytes(&ann.sig);
+        if vk.verify(&msg, &sig).is_err() {
+            warn!("invalid coord announce signature from {:?}", &from_key[..4]);
+            return;
+        }
+        let coord = HypCoord::decode(&ann.coord);
+        self.coord_table.insert(from_key, coord);
     }
 
     fn cleanup_stale_lookups(&mut self) {
@@ -528,6 +596,7 @@ impl RouterState {
                 path_cost: ann.path_cost,
                 sender: ann.sender,
                 received_at: Instant::now(),
+                depth: ann.depth,
             });
         }
     }
@@ -679,9 +748,33 @@ impl RouterState {
     }
 
     /// Greedy routing: find best next-hop for destination across all K trees.
+    /// Hyperbolic greedy routing is tried first; falls back to cuckoo/XOR.
     pub fn lookup(&self, dst: &PeerId) -> Option<PeerId> {
-        // For each tree, find the peer whose subtree contains dst (or is closest)
-        // Simplified: pick peer whose cuckoo filter contains dst
+        // ── Hyperbolic greedy routing (primary) ────────────────────────────
+        if let Some(&dst_coord) = self.coord_table.get(dst) {
+            let own_dist = self.own_coord.distance(dst_coord);
+            let mut best_peer: Option<PeerId> = None;
+            let mut best_dist = own_dist; // must strictly improve
+
+            for (peer_key, peer) in &self.peers {
+                if let Some(&peer_coord) = self.coord_table.get(&peer.pub_key) {
+                    let d = peer_coord.distance(dst_coord);
+                    if d < best_dist {
+                        best_dist = d;
+                        best_peer = Some(*peer_key);
+                    }
+                }
+            }
+
+            if let Some(p) = best_peer {
+                return Some(p);
+            }
+            // No closer neighbour — either we ARE the destination or
+            // hyperbolic lookup is vacuous with 1 peer (same-coord case).
+            // Let fallback decide.
+        }
+
+        // ── Cuckoo-filter lookup (fallback) ────────────────────────────────
         let mut best: Option<(PeerId, u64)> = None;
 
         for (peer_key, peer) in &self.peers {
@@ -700,11 +793,10 @@ impl RouterState {
             }
         }
 
-        // Fallback: pick the peer with the best XOR distance to dst across all trees
+        // ── XOR-distance last-resort ────────────────────────────────────────
         if best.is_none() {
             let mut best_dist: Option<([u8; 32], u64)> = None;
             for (peer_key, peer) in &self.peers {
-                // XOR distance
                 let mut dist = [0u8; 32];
                 for i in 0..32 {
                     dist[i] = peer_key[i] ^ dst[i];
@@ -781,6 +873,11 @@ fn dispatch(state: &Arc<Mutex<RouterState>>, from: PeerId, frame: Vec<u8>) {
         TRAFFIC => {
             if let Ok(traffic) = Traffic::decode(data) {
                 state.lock().unwrap().handle_traffic(from, traffic);
+            }
+        }
+        TYPE_COORD_ANNOUNCE => {
+            if let Ok(ann) = CoordAnnounce::decode(data) {
+                state.lock().unwrap().handle_coord_announce(from, ann);
             }
         }
         t if t == SESSION_INIT_MAGIC => {

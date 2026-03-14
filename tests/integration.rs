@@ -5,6 +5,7 @@ use norn_rs::PacketConn;
 use rand::rngs::OsRng;
 use std::time::Duration;
 use tokio::io::duplex;
+use norn_rs::hyperbolic::HypCoord;
 
 /// Create a pair of connected PacketConns using tokio duplex pipes.
 async fn make_connected_pair() -> (PacketConn, PacketConn) {
@@ -157,4 +158,120 @@ async fn mtu_is_correct() {
     let sk = SigningKey::generate(&mut OsRng);
     let conn = PacketConn::new(sk);
     assert_eq!(conn.mtu(), 65535);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn hyperbolic_routing_two_nodes() {
+    // Test that the hyperbolic coordinate announce/receive/lookup path works.
+    // With 2 nodes the hyperbolic lookup and fallback give the same result,
+    // but this exercises the full coord-announce → coord_table → lookup pipeline.
+    let _ = tracing_subscriber::fmt().with_env_filter("warn").try_init();
+
+    let (conn_a, conn_b) = make_connected_pair().await;
+    let pub_a = conn_a.pub_key;
+    let pub_b = conn_b.pub_key;
+
+    // Wait for session A→B
+    assert!(
+        wait_for_session(&conn_a, &pub_b).await,
+        "A→B session failed to establish"
+    );
+
+    // Allow maintenance cycle(s) to fire so CoordAnnounces are exchanged
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+
+    // Verify coord table: each node should know the other's coord
+    // (We check this indirectly by verifying that get_peer_stats returns the peer.)
+    let stats_a = conn_a.get_peer_stats();
+    assert_eq!(stats_a.len(), 1, "A should see 1 peer after warmup");
+    assert_eq!(stats_a[0].key, pub_b);
+
+    let stats_b = conn_b.get_peer_stats();
+    assert_eq!(stats_b.len(), 1, "B should see 1 peer after warmup");
+    assert_eq!(stats_b[0].key, pub_a);
+
+    // Drain any warmup messages
+    let drain_timeout = Duration::from_millis(200);
+    loop {
+        match tokio::time::timeout(drain_timeout, conn_b.read_from()).await {
+            Ok(Ok(_)) => continue,
+            _ => break,
+        }
+    }
+
+    // Wait for B→A session
+    assert!(
+        wait_for_session(&conn_b, &pub_a).await,
+        "B→A session failed to establish"
+    );
+
+    loop {
+        match tokio::time::timeout(drain_timeout, conn_a.read_from()).await {
+            Ok(Ok(_)) => continue,
+            _ => break,
+        }
+    }
+
+    // Send 10 messages A→B and 10 messages B→A
+    let msgs_a: Vec<Vec<u8>> = (0..10)
+        .map(|i| format!("hyp_a_to_b_{}", i).into_bytes())
+        .collect();
+    let msgs_b: Vec<Vec<u8>> = (0..10)
+        .map(|i| format!("hyp_b_to_a_{}", i).into_bytes())
+        .collect();
+
+    for msg in &msgs_a {
+        conn_a.write_to(msg, &pub_b).await.expect("A→B write failed");
+    }
+    for msg in &msgs_b {
+        conn_b.write_to(msg, &pub_a).await.expect("B→A write failed");
+    }
+
+    // Receive on B
+    let recv_b = tokio::time::timeout(Duration::from_secs(5), async {
+        let mut received = Vec::new();
+        for _ in 0..10 {
+            let pkt = conn_b.read_from().await.expect("B read_from failed");
+            assert_eq!(pkt.from, pub_a, "wrong sender on B");
+            received.push(pkt.payload);
+        }
+        received
+    })
+    .await
+    .expect("timed out waiting for B to receive 10 messages");
+
+    for (i, (sent, recv)) in msgs_a.iter().zip(recv_b.iter()).enumerate() {
+        assert_eq!(sent, recv, "message {} mismatch A→B", i);
+    }
+
+    // Receive on A
+    let recv_a = tokio::time::timeout(Duration::from_secs(5), async {
+        let mut received = Vec::new();
+        for _ in 0..10 {
+            let pkt = conn_a.read_from().await.expect("A read_from failed");
+            assert_eq!(pkt.from, pub_b, "wrong sender on A");
+            received.push(pkt.payload);
+        }
+        received
+    })
+    .await
+    .expect("timed out waiting for A to receive 10 messages");
+
+    for (i, (sent, recv)) in msgs_b.iter().zip(recv_a.iter()).enumerate() {
+        assert_eq!(sent, recv, "message {} mismatch B→A", i);
+    }
+
+    // Sanity-check the HypCoord distance function directly
+    let origin = HypCoord::origin();
+    let far = HypCoord { r: 0.9, theta: 1.0 };
+    assert!(
+        origin.distance(far) > 0.0,
+        "distance from origin to far point should be positive"
+    );
+    let d_ab = far.distance(origin);
+    let d_ba = origin.distance(far);
+    assert!(
+        (d_ab - d_ba).abs() < 1e-9,
+        "distance should be symmetric"
+    );
 }
