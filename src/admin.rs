@@ -75,6 +75,13 @@ pub async fn listen(
     let _ = std::fs::remove_file(socket_path);
     let listener = UnixListener::bind(socket_path)
         .map_err(|e| anyhow::anyhow!("admin socket bind {}: {}", socket_path, e))?;
+    // Restrict socket to owner only (no world-readable admin access)
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let perms = std::fs::Permissions::from_mode(0o600);
+        let _ = std::fs::set_permissions(socket_path, perms);
+    }
     info!("admin socket at {}", socket_path);
 
     loop {

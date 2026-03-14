@@ -10,8 +10,24 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tracing::{debug, warn};
+
+/// Extension trait that recovers from poisoned mutexes instead of panicking.
+/// If a thread panicked while holding a lock, we log an error and continue —
+/// better than a cascade crash from an unrelated panic.
+trait LockOrRecover<T> {
+    fn lock_or_recover(&self) -> std::sync::MutexGuard<'_, T>;
+}
+
+impl<T> LockOrRecover<T> for std::sync::Mutex<T> {
+    fn lock_or_recover(&self) -> std::sync::MutexGuard<'_, T> {
+        self.lock().unwrap_or_else(|p| {
+            tracing::error!("mutex poisoned, recovering — data may be inconsistent");
+            p.into_inner()
+        })
+    }
+}
 use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret};
 
 use crate::cuckoo::CuckooFilter;
@@ -46,6 +62,10 @@ const PEER_TIMEOUT: Duration = Duration::from_secs(60);
 const KEY_ROTATION_INTERVAL: u64 = 100;
 /// Increment cuckoo generation every N ticks (~5 minutes at 1 tick/sec)
 const CUCKOO_GEN_TICKS: u32 = 300;
+/// Maximum number of pending PathLookup dedup entries (prevents memory DoS)
+const MAX_PENDING_LOOKUPS: usize = 10_000;
+/// Remove sessions idle for longer than this
+const SESSION_IDLE_EXPIRY: Duration = Duration::from_secs(300);
 
 // ──────────────────────────────────────────────
 // Public types
@@ -561,6 +581,10 @@ impl RouterState {
         for peer_key in peer_keys {
             let seq = {
                 let peer = self.peers.get_mut(&peer_key).unwrap();
+                // If a previous SigReq was never acknowledged, count it as a loss.
+                if peer.pending_sig_req_time.is_some() {
+                    peer.loss_rate = peer.loss_rate * 0.875 + 0.125;
+                }
                 peer.sig_req_seq += 1;
                 peer.sig_req_seq
             };
@@ -613,11 +637,12 @@ impl RouterState {
         }
         self.rotate_session_keys();
         self.cleanup_stale_lookups();
+        self.cleanup_stale_sessions();
     }
 
     /// Rotate x25519 keys for sessions that have sent many messages.
     fn rotate_session_keys(&self) {
-        let mut sm = self.sessions.lock().unwrap();
+        let mut sm = self.sessions.lock_or_recover();
         for info in sm.sessions.values_mut() {
             if info.established && info.local_seq > 0 && info.local_seq % KEY_ROTATION_INTERVAL == 0 {
                 info.rotate_local_key();
@@ -667,6 +692,15 @@ impl RouterState {
     fn cleanup_stale_lookups(&mut self) {
         let now = Instant::now();
         self.pending_lookups.retain(|_, t| now.duration_since(*t) < Duration::from_secs(10));
+    }
+
+    /// Remove sessions that have been idle beyond SESSION_IDLE_EXPIRY.
+    fn cleanup_stale_sessions(&self) {
+        let now = Instant::now();
+        let mut sm = self.sessions.lock_or_recover();
+        sm.sessions.retain(|_, info| {
+            now.duration_since(info.last_used) < SESSION_IDLE_EXPIRY
+        });
     }
 
     // ──────────────────────────────────────────────
@@ -732,7 +766,7 @@ impl RouterState {
 
         if let Some(peer) = self.peers.get_mut(&from) {
             peer.last_rx_time = Instant::now();
-            // Measure RTT
+            // Measure RTT and update loss rate EWMA
             if let Some((pending_seq, sent_time)) = peer.pending_sig_req_time.take()
                 && pending_seq == res.seq {
                     let rtt = Instant::now().duration_since(sent_time);
@@ -747,6 +781,8 @@ impl RouterState {
                     peer.lag = Duration::from_micros(
                         (old_lag_us as u64 * 7 / 8) + new_lag_us as u64 / 8
                     );
+                    // Successful ACK — decay loss estimate toward 0
+                    peer.loss_rate *= 0.875;
                 }
         }
     }
@@ -801,8 +837,12 @@ impl RouterState {
     }
 
     pub fn handle_path_lookup(&mut self, from: PeerId, lookup: PathLookup) {
-        // Dedup
+        // Dedup + DoS protection: cap pending_lookups to prevent memory exhaustion
         if self.pending_lookups.contains_key(&lookup.id) {
+            return;
+        }
+        if self.pending_lookups.len() >= MAX_PENDING_LOOKUPS {
+            debug!("handle_path_lookup: pending_lookups full, dropping lookup {}", lookup.id);
             return;
         }
         self.pending_lookups.insert(lookup.id, Instant::now());
@@ -919,7 +959,7 @@ impl RouterState {
                         }
                     };
                     if raw.first().copied() == Some(SESSION_INIT_MAGIC) {
-                        let ack_opt = self.sessions.lock().unwrap().handle_init(&raw).ok();
+                        let ack_opt = self.sessions.lock_or_recover().handle_init(&raw).ok();
                         if let Some(ack_bytes) = ack_opt
                             && raw.len() >= 33 {
                                 let mut sender = [0u8; 32];
@@ -927,7 +967,7 @@ impl RouterState {
                                 self.send_traffic_to(&sender, ack_bytes);
                             }
                     } else if raw.first().copied() == Some(SESSION_ACK_MAGIC) {
-                        let _ = self.sessions.lock().unwrap().handle_ack(&raw);
+                        let _ = self.sessions.lock_or_recover().handle_ack(&raw);
                     }
                 }
                 packet::PKT_DATA => {
@@ -941,7 +981,7 @@ impl RouterState {
                         }
                     };
                     let padded_pt = {
-                        let mut sm = self.sessions.lock().unwrap();
+                        let mut sm = self.sessions.lock_or_recover();
                         match sm.decrypt(&source, &traffic.payload) {
                             Ok(d) => d,
                             Err(e) => {
@@ -958,7 +998,9 @@ impl RouterState {
                         }
                     };
                     let pkt = InboundPacket { from: source, payload };
-                    let _ = self.traffic_tx.try_send(pkt);
+                    if self.traffic_tx.try_send(pkt).is_err() {
+                        warn!("traffic_rx channel full, dropping inbound packet from {:?}", &source[..4]);
+                    }
                 }
                 t => {
                     debug!("unknown pkt_type {} from {:?}", t, &from[..4]);
@@ -1147,77 +1189,77 @@ fn dispatch(state: &Arc<Mutex<RouterState>>, from: PeerId, frame: Vec<u8>) {
     match ptype {
         DUMMY => {}
         KEEP_ALIVE => {
-            if let Some(peer) = state.lock().unwrap().peers.get_mut(&from) {
+            if let Some(peer) = state.lock_or_recover().peers.get_mut(&from) {
                 peer.last_rx_time = Instant::now();
             }
         }
         SIG_REQ => {
             if let Ok(req) = SigReq::decode(data) {
-                state.lock().unwrap().handle_sig_req(from, req);
+                state.lock_or_recover().handle_sig_req(from, req);
             }
         }
         SIG_RES => {
             if let Ok(res) = SigRes::decode(data) {
-                state.lock().unwrap().handle_sig_res(from, res);
+                state.lock_or_recover().handle_sig_res(from, res);
             }
         }
         ANNOUNCE => {
             if let Ok(ann) = Announce::decode(data) {
-                state.lock().unwrap().handle_announce(from, ann);
+                state.lock_or_recover().handle_announce(from, ann);
             }
         }
         CUCKOO_FILTER => {
             if let Ok(msg) = CuckooMsg::decode(data) {
-                state.lock().unwrap().handle_cuckoo(from, msg);
+                state.lock_or_recover().handle_cuckoo(from, msg);
             }
         }
         PATH_LOOKUP => {
             if let Ok(lookup) = PathLookup::decode(data) {
-                state.lock().unwrap().handle_path_lookup(from, lookup);
+                state.lock_or_recover().handle_path_lookup(from, lookup);
             }
         }
         PATH_NOTIFY => {
             if let Ok(notify) = PathNotify::decode(data) {
-                state.lock().unwrap().handle_path_notify(from, notify);
+                state.lock_or_recover().handle_path_notify(from, notify);
             }
         }
         PATH_BROKEN => {
             if let Ok(broken) = PathBroken::decode(data) {
-                state.lock().unwrap().handle_path_broken(from, broken);
+                state.lock_or_recover().handle_path_broken(from, broken);
             }
         }
         TRAFFIC => {
             if let Ok(traffic) = Traffic::decode(data) {
-                let my_pub = state.lock().unwrap().pub_key;
+                let my_pub = state.lock_or_recover().pub_key;
                 let my_tag = routing_tag(&my_pub);
                 if traffic.routing_tag == my_tag {
                     // For us: handle immediately (no jitter — latency matters)
-                    state.lock().unwrap().handle_traffic(from, traffic);
+                    state.lock_or_recover().handle_traffic(from, traffic);
                 } else {
                     // Forwarding: apply random 0–49 ms jitter to resist timing correlation
                     let state_fwd = state.clone();
                     tokio::spawn(async move {
                         let jitter_ms = rand::random::<u64>() % 50;
                         tokio::time::sleep(Duration::from_millis(jitter_ms)).await;
-                        state_fwd.lock().unwrap().handle_traffic(from, traffic);
+                        state_fwd.lock_or_recover().handle_traffic(from, traffic);
                     });
                 }
             }
         }
         TYPE_COORD_ANNOUNCE => {
             if let Ok(ann) = CoordAnnounce::decode(data) {
-                state.lock().unwrap().handle_coord_announce(from, ann);
+                state.lock_or_recover().handle_coord_announce(from, ann);
             }
         }
         TYPE_ONION => {
             if let Ok(pkt) = OnionPacket::decode(data) {
-                let my_pub = state.lock().unwrap().pub_key;
+                let my_pub = state.lock_or_recover().pub_key;
                 let my_tag = routing_tag(&my_pub);
                 if pkt.routing_tag == my_tag {
                     // This layer is for us — peel and act
                     let state2 = state.clone();
                     tokio::spawn(async move {
-                        state2.lock().unwrap().handle_onion(from, pkt);
+                        state2.lock_or_recover().handle_onion(from, pkt);
                     });
                 } else {
                     // Forward with jitter
@@ -1227,8 +1269,8 @@ fn dispatch(state: &Arc<Mutex<RouterState>>, from: PeerId, frame: Vec<u8>) {
                         tokio::time::sleep(Duration::from_millis(jitter_ms)).await;
                         let tag = pkt.routing_tag;
                         let encoded = pkt.encode();
-                        if let Some(next) = state_fwd.lock().unwrap().lookup_by_tag(&tag) {
-                            state_fwd.lock().unwrap().send_to_peer(&next, encoded);
+                        if let Some(next) = state_fwd.lock_or_recover().lookup_by_tag(&tag) {
+                            state_fwd.lock_or_recover().send_to_peer(&next, encoded);
                         }
                     });
                 }
@@ -1248,6 +1290,7 @@ pub struct PacketConn {
     inner: Arc<Mutex<RouterState>>,
     traffic_rx: tokio::sync::Mutex<mpsc::Receiver<InboundPacket>>,
     pub pub_key: [u8; 32],
+    shutdown_tx: watch::Sender<bool>,
 }
 
 impl PacketConn {
@@ -1255,15 +1298,21 @@ impl PacketConn {
         let pub_key = signing_key.verifying_key().to_bytes();
         let (traffic_tx, traffic_rx) = mpsc::channel(1024);
         let state = Arc::new(Mutex::new(RouterState::new(signing_key, traffic_tx)));
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
         // Spawn maintenance background task
         {
             let state = state.clone();
+            let mut shutdown = shutdown_rx.clone();
             tokio::spawn(async move {
                 let mut interval = tokio::time::interval(Duration::from_secs(1));
                 loop {
-                    interval.tick().await;
-                    state.lock().unwrap().do_maintenance();
+                    tokio::select! {
+                        _ = interval.tick() => {
+                            state.lock_or_recover().do_maintenance();
+                        }
+                        _ = shutdown.changed() => break,
+                    }
                 }
             });
         }
@@ -1272,16 +1321,20 @@ impl PacketConn {
         // This makes it harder to correlate traffic patterns with communication endpoints.
         {
             let state = state.clone();
+            let mut shutdown = shutdown_rx.clone();
             tokio::spawn(async move {
                 use rand::Rng;
                 let mut rng = rand::rngs::OsRng;
                 loop {
                     // Random delay 8–30 seconds
                     let delay_ms = rng.gen_range(8_000u64..30_000u64);
-                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                    tokio::select! {
+                        _ = tokio::time::sleep(Duration::from_millis(delay_ms)) => {}
+                        _ = shutdown.changed() => break,
+                    }
 
                     let peers: Vec<PeerId> = {
-                        state.lock().unwrap().peers.keys().copied().collect()
+                        state.lock_or_recover().peers.keys().copied().collect()
                     };
                     for peer in peers {
                         // ~40% chance per peer per check — adds variability
@@ -1290,7 +1343,7 @@ impl PacketConn {
                             let dummy_len = rng.gen_range(64usize..256usize);
                             let mut cover = vec![DUMMY];
                             cover.resize(dummy_len, 0u8);
-                            state.lock().unwrap().send_to_peer(&peer, cover);
+                            state.lock_or_recover().send_to_peer(&peer, cover);
                         }
                     }
                 }
@@ -1301,6 +1354,7 @@ impl PacketConn {
             inner: state,
             traffic_rx: tokio::sync::Mutex::new(traffic_rx),
             pub_key,
+            shutdown_tx,
         }
     }
 
@@ -1319,7 +1373,7 @@ impl PacketConn {
         let (tx, mut rx) = mpsc::channel::<Vec<u8>>(256);
 
         // Register peer (guarded against duplicates inside add_peer)
-        self.inner.lock().unwrap().add_peer(remote_pub_key, tx, priority);
+        self.inner.lock_or_recover().add_peer(remote_pub_key, tx, priority);
 
         let state = self.inner.clone();
 
@@ -1335,11 +1389,11 @@ impl PacketConn {
 
         // Initiate session exchange before entering the read loop.
         let init_bytes = {
-            let s = state.lock().unwrap();
-            s.sessions.lock().unwrap().get_or_initiate_bytes(&remote_pub_key)
+            let s = state.lock_or_recover();
+            s.sessions.lock_or_recover().get_or_initiate_bytes(&remote_pub_key)
         };
         if let Some(init_data) = init_bytes {
-            state.lock().unwrap().send_traffic_to(&remote_pub_key, init_data);
+            state.lock_or_recover().send_traffic_to(&remote_pub_key, init_data);
         }
 
         // Reader loop — runs inline so that handle_conn() only returns after the
@@ -1353,7 +1407,7 @@ impl PacketConn {
                 }
                 Err(e) => {
                     debug!("peer {:?} disconnected: {}", &remote_pub_key[..4], e);
-                    state.lock().unwrap().remove_peer(&remote_pub_key);
+                    state.lock_or_recover().remove_peer(&remote_pub_key);
                     break;
                 }
             }
@@ -1370,18 +1424,18 @@ impl PacketConn {
         // Caller should retry; wait_for_session() in tests handles this.
         {
             let established = {
-                let state = self.inner.lock().unwrap();
-                let sm = state.sessions.lock().unwrap();
+                let state = self.inner.lock_or_recover();
+                let sm = state.sessions.lock_or_recover();
                 sm.is_established(dst)
             };
             if !established {
                 let init_data = {
-                    let state = self.inner.lock().unwrap();
-                    let mut sm = state.sessions.lock().unwrap();
+                    let state = self.inner.lock_or_recover();
+                    let mut sm = state.sessions.lock_or_recover();
                     sm.get_or_initiate_bytes(dst).unwrap_or_default()
                 };
                 if !init_data.is_empty() {
-                    self.inner.lock().unwrap().send_traffic_to(dst, init_data);
+                    self.inner.lock_or_recover().send_traffic_to(dst, init_data);
                 }
                 bail!("session not established with {:?}", &dst[..4]);
             }
@@ -1391,8 +1445,8 @@ impl PacketConn {
         // This hides message length from observers.
         let padded = pad_payload(payload);
         let ciphertext = {
-            let state = self.inner.lock().unwrap();
-            state.sessions.lock().unwrap().encrypt(dst, &padded)?
+            let state = self.inner.lock_or_recover();
+            state.sessions.lock_or_recover().encrypt(dst, &padded)?
         };
 
         let pub_key = self.pub_key;
@@ -1409,9 +1463,9 @@ impl PacketConn {
         let encoded = traffic.encode();
         // Important: extract next_hop into a variable so the MutexGuard is
         // dropped at the `;` before we try to lock again in send_to_peer.
-        let next_hop = self.inner.lock().unwrap().lookup(dst);
+        let next_hop = self.inner.lock_or_recover().lookup(dst);
         if let Some(next_hop) = next_hop {
-            self.inner.lock().unwrap().send_to_peer(&next_hop, encoded);
+            self.inner.lock_or_recover().send_to_peer(&next_hop, encoded);
         } else {
             bail!("no route to {:?}", &dst[..4]);
         }
@@ -1422,7 +1476,7 @@ impl PacketConn {
     /// Returns fewer than `n` relays if insufficient peers are connected.
     pub fn select_relays(&self, n: usize) -> Vec<[u8; 32]> {
         use rand::seq::SliceRandom;
-        let mut peers: Vec<[u8; 32]> = self.inner.lock().unwrap().peers.keys().copied().collect();
+        let mut peers: Vec<[u8; 32]> = self.inner.lock_or_recover().peers.keys().copied().collect();
         peers.shuffle(&mut rand::rngs::OsRng);
         peers.truncate(n);
         peers
@@ -1448,17 +1502,17 @@ impl PacketConn {
         // Check session
         {
             let established = {
-                let state = self.inner.lock().unwrap();
-                state.sessions.lock().unwrap().is_established(dst)
+                let state = self.inner.lock_or_recover();
+                state.sessions.lock_or_recover().is_established(dst)
             };
             if !established {
                 let init_data = {
-                    let state = self.inner.lock().unwrap();
-                    let mut sm = state.sessions.lock().unwrap();
+                    let state = self.inner.lock_or_recover();
+                    let mut sm = state.sessions.lock_or_recover();
                     sm.get_or_initiate_bytes(dst).unwrap_or_default()
                 };
                 if !init_data.is_empty() {
-                    self.inner.lock().unwrap().send_traffic_to(dst, init_data);
+                    self.inner.lock_or_recover().send_traffic_to(dst, init_data);
                 }
                 bail!("session not established with {:?}", &dst[..4]);
             }
@@ -1467,8 +1521,8 @@ impl PacketConn {
         // Encrypt payload with session key, wrap in Traffic, then wrap in onion layers
         let padded = pad_payload(payload);
         let ciphertext = {
-            let state = self.inner.lock().unwrap();
-            state.sessions.lock().unwrap().encrypt(dst, &padded)?
+            let state = self.inner.lock_or_recover();
+            state.sessions.lock_or_recover().encrypt(dst, &padded)?
         };
 
         let pub_key = self.pub_key;
@@ -1493,9 +1547,9 @@ impl PacketConn {
 
         // Send to first relay
         let first_relay = relays[0];
-        let next_hop = self.inner.lock().unwrap().lookup(&first_relay);
+        let next_hop = self.inner.lock_or_recover().lookup(&first_relay);
         if let Some(next) = next_hop {
-            self.inner.lock().unwrap().send_to_peer(&next, encoded);
+            self.inner.lock_or_recover().send_to_peer(&next, encoded);
         } else {
             bail!("no route to first relay {:?}", &first_relay[..4]);
         }
@@ -1507,12 +1561,14 @@ impl PacketConn {
     }
 
     pub async fn close(&self) {
+        // Signal all background tasks to exit
+        let _ = self.shutdown_tx.send(true);
         // Drop all peer connections
-        self.inner.lock().unwrap().peers.clear();
+        self.inner.lock_or_recover().peers.clear();
     }
 
     pub fn get_peer_stats(&self) -> Vec<PeerStats> {
-        let state = self.inner.lock().unwrap();
+        let state = self.inner.lock_or_recover();
         let now = Instant::now();
         state.peers.values().map(|p| PeerStats {
             key: p.pub_key,
@@ -1527,7 +1583,7 @@ impl PacketConn {
     }
 
     pub async fn set_path_notify<F: Fn([u8; 32]) + Send + Sync + 'static>(&self, f: F) {
-        self.inner.lock().unwrap().path_notify = Some(Arc::new(f));
+        self.inner.lock_or_recover().path_notify = Some(Arc::new(f));
     }
 
     pub async fn send_lookup(&self, partial: &[u8]) {
@@ -1544,9 +1600,9 @@ impl PacketConn {
             path: vec![],
         };
         let encoded = lookup.encode();
-        let peer_keys: Vec<PeerId> = self.inner.lock().unwrap().peers.keys().copied().collect();
+        let peer_keys: Vec<PeerId> = self.inner.lock_or_recover().peers.keys().copied().collect();
         for pk in peer_keys {
-            self.inner.lock().unwrap().send_to_peer(&pk, encoded.clone());
+            self.inner.lock_or_recover().send_to_peer(&pk, encoded.clone());
         }
     }
 }

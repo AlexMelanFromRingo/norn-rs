@@ -1,4 +1,5 @@
 // Integration tests for norn-rs
+#![allow(clippy::while_let_loop)]
 
 use ed25519_dalek::SigningKey;
 use norn_rs::PacketConn;

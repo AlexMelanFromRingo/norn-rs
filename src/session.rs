@@ -9,6 +9,7 @@ use rand::rngs::OsRng;
 use sha2::{Digest as Sha2Digest, Sha512};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret};
 
 /// Convert an ed25519 private key scalar to an x25519 static secret.
@@ -63,6 +64,8 @@ pub struct SessionInfo {
 
     // Session is established (handshake complete)
     pub established: bool,
+    // Last time this session was used for encrypt or decrypt
+    pub last_used: Instant,
 }
 
 impl SessionInfo {
@@ -81,6 +84,7 @@ impl SessionInfo {
             remote_seq_high: 0,
             remote_seq_window: 0,
             established: false,
+            last_used: Instant::now(),
         }
     }
 
@@ -122,6 +126,7 @@ impl SessionInfo {
         out.extend_from_slice(&buf);
 
         self.local_seq += 1;
+        self.last_used = Instant::now();
         Ok(out)
     }
 
@@ -198,6 +203,7 @@ impl SessionInfo {
 
         // Update remote_x25519_pub: use sender's latest pub for our next encrypt
         self.remote_x25519_pub = sender_x_pub;
+        self.last_used = Instant::now();
         Ok(buf)
     }
 }
