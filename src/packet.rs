@@ -16,6 +16,7 @@ pub const PATH_NOTIFY: u8 = 7;
 pub const PATH_BROKEN: u8 = 8;
 pub const TRAFFIC: u8 = 9;
 pub const TYPE_COORD_ANNOUNCE: u8 = 10;
+pub const TYPE_ONION: u8 = 11;
 
 /// Encode a uvarint into a byte buffer.
 pub fn encode_uvarint(mut v: u64, buf: &mut Vec<u8>) {
@@ -491,6 +492,26 @@ impl Traffic {
         let payload = data[pos..pos + payload_len as usize].to_vec();
         Ok(Traffic { path, from, enc_header, routing_tag, pkt_type, watermark, payload })
     }
+}
+
+/// Compute the 16-byte routing tag for an ed25519 public key.
+///
+/// Used in two places:
+/// 1. Cuckoo filter gossip — nodes add `routing_tag(own_pub_key)` to their filter
+///    so the filter does not expose the raw pub key.
+/// 2. Traffic / Onion packet headers — `routing_tag(dest_pub_key)` replaces the
+///    plaintext dest field, hiding the full destination identity from relays.
+///
+/// The tag is a one-way function of the pub key (Blake2b domain-separated).
+/// An observer who does NOT already know a destination's pub key cannot reverse
+/// the tag to learn who the destination is.
+pub fn routing_tag(pub_key: &[u8; 32]) -> [u8; 16] {
+    use blake2::{Blake2b, Digest};
+    use blake2::digest::consts::U16;
+    let mut h: Blake2b<U16> = Blake2b::new();
+    h.update(b"norn:route");
+    h.update(pub_key);
+    h.finalize().into()
 }
 
 /// Broadcast by each node: its hyperbolic coordinate + signed by its key.

@@ -395,3 +395,79 @@ async fn three_nodes_forwarding() {
     let mut recv_a_sorted = recv_a.clone(); recv_a_sorted.sort();
     assert_eq!(sent_back_sorted, recv_a_sorted, "message set mismatch C→A");
 }
+
+/// Test onion routing: A sends via B (relay) to C.
+/// Topology: A ↔ B ↔ C (linear, same as three_nodes_forwarding)
+/// A uses write_to_onion with B as the relay → onion path: A → B(relay) → C(dest)
+#[tokio::test]
+async fn onion_routing_via_relay() {
+    let sk_a = SigningKey::generate(&mut OsRng);
+    let sk_b = SigningKey::generate(&mut OsRng);
+    let sk_c = SigningKey::generate(&mut OsRng);
+
+    let pub_a = sk_a.verifying_key().to_bytes();
+    let pub_b = sk_b.verifying_key().to_bytes();
+    let pub_c = sk_c.verifying_key().to_bytes();
+
+    let conn_a = PacketConn::new(sk_a);
+    let conn_b = PacketConn::new(sk_b);
+    let conn_c = PacketConn::new(sk_c);
+
+    // A ↔ B
+    let (ab_r, ab_w) = duplex(65536);
+    let (ba_r, ba_w) = duplex(65536);
+    conn_a.handle_conn(pub_b, ba_r, ab_w, 0).await;
+    conn_b.handle_conn(pub_a, ab_r, ba_w, 0).await;
+
+    // B ↔ C
+    let (bc_r, bc_w) = duplex(65536);
+    let (cb_r, cb_w) = duplex(65536);
+    conn_b.handle_conn(pub_c, cb_r, bc_w, 0).await;
+    conn_c.handle_conn(pub_b, bc_r, cb_w, 0).await;
+
+    // Wait for cuckoo filters to propagate so B and A can route to C
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    // Establish direct A→C session (needed for session encryption inside the onion)
+    assert!(
+        wait_for_session(&conn_a, &pub_c).await,
+        "A→C session failed to establish"
+    );
+
+    // Drain warmup messages at C
+    let drain = Duration::from_millis(300);
+    loop {
+        match tokio::time::timeout(drain, conn_c.read_from()).await {
+            Ok(Ok(_)) => continue,
+            _ => break,
+        }
+    }
+
+    // Send 3 messages via onion: A → B(relay) → C
+    let msgs: Vec<Vec<u8>> = (0..3)
+        .map(|i| format!("onion_msg_{}", i).into_bytes())
+        .collect();
+
+    for msg in &msgs {
+        conn_a
+            .write_to_onion(msg, &pub_c, &[pub_b])
+            .await
+            .expect("write_to_onion failed");
+    }
+
+    let recv_c = tokio::time::timeout(Duration::from_secs(5), async {
+        let mut out = Vec::new();
+        for _ in 0..3 {
+            let pkt = conn_c.read_from().await.expect("C read_from failed");
+            assert_eq!(pkt.from, pub_a, "wrong sender on C (onion)");
+            out.push(pkt.payload);
+        }
+        out
+    })
+    .await
+    .expect("timed out waiting for onion messages at C");
+
+    let mut sent_s = msgs.clone(); sent_s.sort();
+    let mut recv_s = recv_c.clone(); recv_s.sort();
+    assert_eq!(sent_s, recv_s, "onion message set mismatch");
+}

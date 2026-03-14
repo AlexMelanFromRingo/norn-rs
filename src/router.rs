@@ -16,7 +16,8 @@ use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret};
 
 use crate::cuckoo::CuckooFilter;
 use crate::hyperbolic::HypCoord;
-use crate::packet::{self, *};
+use crate::onion::{build_onion, OnionPacket, PeeledOnion};
+use crate::packet::{self, routing_tag, *};
 use crate::session::{
     ed25519_priv_to_x25519, ed25519_pub_to_x25519,
     SessionManager, SharedSessionManager, SESSION_INIT_MAGIC, SESSION_ACK_MAGIC,
@@ -173,20 +174,6 @@ fn unpad_payload(padded: &[u8]) -> Result<Vec<u8>> {
         bail!("unpad: length field {} > available {}", orig_len, padded.len() - 2);
     }
     Ok(padded[2..2 + orig_len].to_vec())
-}
-
-/// Compute the 16-byte routing tag for a destination pub key.
-///
-/// Intermediate nodes check this tag against their cuckoo filters rather than
-/// the full 32-byte pub key. An observer who does not already know the
-/// destination cannot reverse this to learn the destination's identity.
-fn routing_tag(pub_key: &[u8; 32]) -> [u8; 16] {
-    use blake2::{Blake2b, Digest};
-    use blake2::digest::consts::U16;
-    let mut h: Blake2b<U16> = Blake2b::new();
-    h.update(b"norn:route");
-    h.update(pub_key);
-    h.finalize().into()
 }
 
 /// Encrypt both source and destination identities into a 128-byte header.
@@ -1062,6 +1049,48 @@ impl RouterState {
         best.map(|(k, _)| k)
     }
 
+    /// Handle an incoming OnionPacket addressed to this node.
+    pub fn handle_onion(&mut self, from: PeerId, pkt: OnionPacket) {
+        if let Some(peer) = self.peers.get_mut(&from) {
+            peer.last_rx_time = Instant::now();
+        }
+
+        match pkt.peel(&self.signing_key) {
+            Ok(PeeledOnion::Forward(inner_bytes)) => {
+                // We are a relay: decode the next layer and forward it
+                match OnionPacket::decode(&inner_bytes) {
+                    Ok(inner) => {
+                        let tag = inner.routing_tag;
+                        let encoded = inner.encode();
+                        if let Some(next) = self.lookup_by_tag(&tag) {
+                            self.send_to_peer(&next, encoded);
+                        } else {
+                            debug!("onion: no route for next tag {:?}", &tag[..4]);
+                        }
+                    }
+                    Err(e) => debug!("onion: failed to decode inner layer: {}", e),
+                }
+            }
+            Ok(PeeledOnion::Deliver(traffic_bytes)) => {
+                // We are the exit relay: dispatch the inner Traffic packet
+                if traffic_bytes.is_empty() {
+                    return;
+                }
+                // traffic_bytes starts with TRAFFIC type byte; re-use dispatch
+                let ptype = traffic_bytes[0];
+                if ptype == TRAFFIC {
+                    match Traffic::decode(&traffic_bytes[1..]) {
+                        Ok(traffic) => self.handle_traffic(from, traffic),
+                        Err(e) => debug!("onion: inner Traffic decode failed: {}", e),
+                    }
+                }
+            }
+            Err(e) => {
+                debug!("onion peel failed from {:?}: {}", &from[..4], e);
+            }
+        }
+    }
+
     /// Route lookup using only the 16-byte routing_tag (for forwarding Traffic
     /// where the full dest pub key is not known to intermediate nodes).
     fn lookup_by_tag(&self, tag: &[u8; 16]) -> Option<PeerId> {
@@ -1156,6 +1185,31 @@ fn dispatch(state: &Arc<Mutex<RouterState>>, from: PeerId, frame: Vec<u8>) {
         TYPE_COORD_ANNOUNCE => {
             if let Ok(ann) = CoordAnnounce::decode(data) {
                 state.lock().unwrap().handle_coord_announce(from, ann);
+            }
+        }
+        TYPE_ONION => {
+            if let Ok(pkt) = OnionPacket::decode(data) {
+                let my_pub = state.lock().unwrap().pub_key;
+                let my_tag = routing_tag(&my_pub);
+                if pkt.routing_tag == my_tag {
+                    // This layer is for us — peel and act
+                    let state2 = state.clone();
+                    tokio::spawn(async move {
+                        state2.lock().unwrap().handle_onion(from, pkt);
+                    });
+                } else {
+                    // Forward with jitter
+                    let state_fwd = state.clone();
+                    tokio::spawn(async move {
+                        let jitter_ms = rand::random::<u64>() % 50;
+                        tokio::time::sleep(Duration::from_millis(jitter_ms)).await;
+                        let tag = pkt.routing_tag;
+                        let encoded = pkt.encode();
+                        if let Some(next) = state_fwd.lock().unwrap().lookup_by_tag(&tag) {
+                            state_fwd.lock().unwrap().send_to_peer(&next, encoded);
+                        }
+                    });
+                }
             }
         }
         _ => {
@@ -1334,6 +1388,90 @@ impl PacketConn {
             self.inner.lock().unwrap().send_to_peer(&next_hop, encoded);
         } else {
             bail!("no route to {:?}", &dst[..4]);
+        }
+        Ok(())
+    }
+
+    /// Select up to `n` random peers to use as onion relays.
+    /// Returns fewer than `n` relays if insufficient peers are connected.
+    pub fn select_relays(&self, n: usize) -> Vec<[u8; 32]> {
+        use rand::seq::SliceRandom;
+        let mut peers: Vec<[u8; 32]> = self.inner.lock().unwrap().peers.keys().copied().collect();
+        peers.shuffle(&mut rand::rngs::OsRng);
+        peers.truncate(n);
+        peers
+    }
+
+    /// Send a payload to `dst` via the given `relays` using onion routing.
+    ///
+    /// The payload is encrypted with the session key for `dst`, then wrapped
+    /// in an onion packet through each relay. Each relay sees only its
+    /// predecessor and successor — not the full path or endpoints.
+    ///
+    /// If `relays` is empty this falls back to direct Traffic (same as `write_to`).
+    pub async fn write_to_onion(
+        &self,
+        payload: &[u8],
+        dst: &[u8; 32],
+        relays: &[[u8; 32]],
+    ) -> Result<()> {
+        if relays.is_empty() {
+            return self.write_to(payload, dst).await;
+        }
+
+        // Check session
+        {
+            let established = {
+                let state = self.inner.lock().unwrap();
+                state.sessions.lock().unwrap().is_established(dst)
+            };
+            if !established {
+                let init_data = {
+                    let state = self.inner.lock().unwrap();
+                    let mut sm = state.sessions.lock().unwrap();
+                    sm.get_or_initiate_bytes(dst).unwrap_or_default()
+                };
+                if !init_data.is_empty() {
+                    self.inner.lock().unwrap().send_traffic_to(dst, init_data);
+                }
+                bail!("session not established with {:?}", &dst[..4]);
+            }
+        }
+
+        // Encrypt payload with session key, wrap in Traffic, then wrap in onion layers
+        let padded = pad_payload(payload);
+        let ciphertext = {
+            let state = self.inner.lock().unwrap();
+            state.sessions.lock().unwrap().encrypt(dst, &padded)?
+        };
+
+        let pub_key = self.pub_key;
+        let (enc_header, tag) = encrypt_header(&pub_key, dst);
+        let traffic = Traffic {
+            path: vec![],
+            from: pub_key,
+            enc_header,
+            routing_tag: tag,
+            pkt_type: packet::PKT_DATA,
+            watermark: 0,
+            payload: ciphertext,
+        };
+        let traffic_bytes = traffic.encode(); // includes leading TRAFFIC byte
+
+        // Build onion around the Traffic packet
+        let onion_pkt = match build_onion(relays, dst, traffic_bytes) {
+            Ok(p) => p,
+            Err(e) => bail!("failed to build onion: {}", e),
+        };
+        let encoded = onion_pkt.encode();
+
+        // Send to first relay
+        let first_relay = relays[0];
+        let next_hop = self.inner.lock().unwrap().lookup(&first_relay);
+        if let Some(next) = next_hop {
+            self.inner.lock().unwrap().send_to_peer(&next, encoded);
+        } else {
+            bail!("no route to first relay {:?}", &first_relay[..4]);
         }
         Ok(())
     }
