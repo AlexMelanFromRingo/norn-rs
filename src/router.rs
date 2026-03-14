@@ -16,7 +16,7 @@ use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret};
 
 use crate::cuckoo::CuckooFilter;
 use crate::hyperbolic::HypCoord;
-use crate::packet::*;
+use crate::packet::{self, *};
 use crate::session::{
     ed25519_priv_to_x25519, ed25519_pub_to_x25519,
     SessionManager, SharedSessionManager, SESSION_INIT_MAGIC, SESSION_ACK_MAGIC,
@@ -142,65 +142,134 @@ struct RouterState {
 }
 
 // ──────────────────────────────────────────────
-// Source privacy helpers
+// Header privacy helpers (source + dest hiding)
 // ──────────────────────────────────────────────
 
-/// Encrypt a sender's ed25519 pub key so only `dest_ed_pub` can read it.
-///
-/// Output: [epk: 32][ChaCha20Poly1305(source_ed_pub, aad=epk): 48] = 80 bytes
-/// The ephemeral X25519 keypair is discarded after use (forward secrecy).
-fn encrypt_source(source_ed_pub: &[u8; 32], dest_ed_pub: &[u8; 32]) -> [u8; 80] {
-    // Ephemeral X25519 keypair
-    let epk_priv = StaticSecret::random_from_rng(OsRng);
-    let epk_pub = X25519PublicKey::from(&epk_priv);
+/// Block size for payload padding (bytes). All payloads are padded to a
+/// multiple of this before encryption so observers cannot infer content
+/// length from ciphertext length.
+const PAD_BLOCK: usize = 256;
 
-    // Derive dest's X25519 pub key from its ed25519 pub key
-    let dest_x = match ed25519_pub_to_x25519(dest_ed_pub) {
-        Ok(k) => k,
-        Err(_) => return [0u8; 80],
-    };
-
-    // ECDH shared secret → ChaCha20Poly1305 key
-    let shared = epk_priv.diffie_hellman(&dest_x);
-    let key = Key::from_slice(shared.as_bytes());
-    let cipher = ChaCha20Poly1305::new(key);
-
-    // Nonce = 0 (safe because key is unique per ephemeral pair)
-    let nonce = Nonce::from([0u8; 12]);
-    let aad = epk_pub.as_bytes();
-
-    let mut buf = source_ed_pub.to_vec();
-    if cipher.encrypt_in_place(&nonce, aad, &mut buf).is_err() {
-        return [0u8; 80];
-    }
-    // buf is now 48 bytes (32 plaintext + 16 tag)
-
-    let mut out = [0u8; 80];
-    out[..32].copy_from_slice(epk_pub.as_bytes());
-    out[32..].copy_from_slice(&buf);
+/// Pad `data` to the next `PAD_BLOCK` boundary.
+/// Wire: [orig_len: 2 bytes LE][data...][zero padding...]
+fn pad_payload(data: &[u8]) -> Vec<u8> {
+    let orig_len = data.len();
+    let mut out = Vec::with_capacity(PAD_BLOCK);
+    out.push((orig_len & 0xFF) as u8);
+    out.push((orig_len >> 8) as u8);
+    out.extend_from_slice(data);
+    let target = ((out.len() + PAD_BLOCK - 1) / PAD_BLOCK) * PAD_BLOCK;
+    out.resize(target, 0u8);
     out
 }
 
-/// Decrypt enc_source using our ed25519 signing key.
-/// Returns the sender's ed25519 pub key, or None if decryption fails.
-fn decrypt_source(enc_source: &[u8; 80], my_signing_key: &SigningKey) -> Option<[u8; 32]> {
-    let epk_pub_bytes: [u8; 32] = enc_source[..32].try_into().ok()?;
-    let epk_pub = X25519PublicKey::from(epk_pub_bytes);
-    let ciphertext = &enc_source[32..]; // 48 bytes
+/// Strip padding added by `pad_payload`.
+fn unpad_payload(padded: &[u8]) -> Result<Vec<u8>> {
+    if padded.len() < 2 {
+        bail!("unpad: too short");
+    }
+    let orig_len = (padded[0] as usize) | ((padded[1] as usize) << 8);
+    if padded.len() < 2 + orig_len {
+        bail!("unpad: length field {} > available {}", orig_len, padded.len() - 2);
+    }
+    Ok(padded[2..2 + orig_len].to_vec())
+}
 
-    // Convert our ed25519 priv to x25519 priv
-    let my_x_priv = ed25519_priv_to_x25519(&my_signing_key.to_bytes());
+/// Compute the 16-byte routing tag for a destination pub key.
+///
+/// Intermediate nodes check this tag against their cuckoo filters rather than
+/// the full 32-byte pub key. An observer who does not already know the
+/// destination cannot reverse this to learn the destination's identity.
+fn routing_tag(pub_key: &[u8; 32]) -> [u8; 16] {
+    use blake2::{Blake2b, Digest};
+    use blake2::digest::consts::U16;
+    let mut h: Blake2b<U16> = Blake2b::new();
+    h.update(b"norn:route");
+    h.update(pub_key);
+    h.finalize().into()
+}
 
-    // ECDH shared secret
-    let shared = my_x_priv.diffie_hellman(&epk_pub);
+/// Encrypt both source and destination identities into a 128-byte header.
+///
+/// Layout: [epk: 32][AEAD_nonce0(source_ed_pub): 48][AEAD_nonce1(dest_ed_pub): 48]
+///
+/// The single ephemeral keypair is derived from a DH with the *destination's*
+/// X25519 public key, so only the destination can decrypt either field.
+/// Forward secrecy: the ephemeral private key is discarded immediately.
+///
+/// Returns `(enc_header, routing_tag)`.
+fn encrypt_header(
+    source_ed_pub: &[u8; 32],
+    dest_ed_pub: &[u8; 32],
+) -> ([u8; 128], [u8; 16]) {
+    let epk_priv = StaticSecret::random_from_rng(OsRng);
+    let epk_pub = X25519PublicKey::from(&epk_priv);
+
+    let dest_x = match ed25519_pub_to_x25519(dest_ed_pub) {
+        Ok(k) => k,
+        Err(_) => return ([0u8; 128], [0u8; 16]),
+    };
+    let shared = epk_priv.diffie_hellman(&dest_x);
     let key = Key::from_slice(shared.as_bytes());
     let cipher = ChaCha20Poly1305::new(key);
+    let aad = epk_pub.as_bytes();
 
-    let nonce = Nonce::from([0u8; 12]);
-    let aad = &epk_pub_bytes;
+    // Encrypt source with nonce=0
+    let mut src_buf = source_ed_pub.to_vec();
+    if cipher
+        .encrypt_in_place(&Nonce::from([0u8; 12]), aad, &mut src_buf)
+        .is_err()
+    {
+        return ([0u8; 128], [0u8; 16]);
+    }
 
-    let mut buf = ciphertext.to_vec();
-    cipher.decrypt_in_place(&nonce, aad, &mut buf).ok()?;
+    // Encrypt dest with nonce=1 (first 8 bytes = 1u64 LE)
+    let mut dst_buf = dest_ed_pub.to_vec();
+    let mut n1 = [0u8; 12];
+    n1[..8].copy_from_slice(&1u64.to_le_bytes());
+    if cipher
+        .encrypt_in_place(&Nonce::from(n1), aad, &mut dst_buf)
+        .is_err()
+    {
+        return ([0u8; 128], [0u8; 16]);
+    }
+
+    let mut header = [0u8; 128];
+    header[..32].copy_from_slice(epk_pub.as_bytes());
+    header[32..80].copy_from_slice(&src_buf);  // 48 bytes
+    header[80..128].copy_from_slice(&dst_buf); // 48 bytes
+
+    (header, routing_tag(dest_ed_pub))
+}
+
+/// Decrypt the source identity from enc_header using our ed25519 signing key.
+fn decrypt_source_from_header(enc_header: &[u8; 128], my_sk: &SigningKey) -> Option<[u8; 32]> {
+    let epk_pub_bytes: [u8; 32] = enc_header[..32].try_into().ok()?;
+    let epk_pub = X25519PublicKey::from(epk_pub_bytes);
+    let my_x = ed25519_priv_to_x25519(&my_sk.to_bytes());
+    let shared = my_x.diffie_hellman(&epk_pub);
+    let cipher = ChaCha20Poly1305::new(Key::from_slice(shared.as_bytes()));
+    let mut buf = enc_header[32..80].to_vec();
+    cipher
+        .decrypt_in_place(&Nonce::from([0u8; 12]), &epk_pub_bytes, &mut buf)
+        .ok()?;
+    buf.try_into().ok()
+}
+
+/// Decrypt the destination identity from enc_header (used to confirm packet is for us).
+#[allow(dead_code)]
+fn decrypt_dest_from_header(enc_header: &[u8; 128], my_sk: &SigningKey) -> Option<[u8; 32]> {
+    let epk_pub_bytes: [u8; 32] = enc_header[..32].try_into().ok()?;
+    let epk_pub = X25519PublicKey::from(epk_pub_bytes);
+    let my_x = ed25519_priv_to_x25519(&my_sk.to_bytes());
+    let shared = my_x.diffie_hellman(&epk_pub);
+    let cipher = ChaCha20Poly1305::new(Key::from_slice(shared.as_bytes()));
+    let mut n1 = [0u8; 12];
+    n1[..8].copy_from_slice(&1u64.to_le_bytes());
+    let mut buf = enc_header[80..128].to_vec();
+    cipher
+        .decrypt_in_place(&Nonce::from(n1), &epk_pub_bytes, &mut buf)
+        .ok()?;
     buf.try_into().ok()
 }
 
@@ -455,8 +524,9 @@ impl RouterState {
         let parent = self.trees[tree_id].parent;
         let mut merged = CuckooFilter::new();
 
-        // Add our own key to our cuckoo
-        merged.add(&self.pub_key);
+        // Add our routing tag (not raw pub key) — hides identity in filter gossip
+        let my_tag = routing_tag(&self.pub_key);
+        merged.add(&my_tag);
 
         for (peer_key, peer) in &self.peers {
             if Some(*peer_key) == parent {
@@ -741,11 +811,12 @@ impl RouterState {
             return;
         }
 
-        // Check cuckoo filters for all peers
+        // Check cuckoo filters for all peers — filters store routing_tags, not raw keys
+        let target_tag = routing_tag(&lookup.target);
         let mut candidates: Vec<(PeerId, u64)> = Vec::new();
         for (peer_key, peer) in &self.peers {
             for tree_id in 0..K {
-                if peer.cuckoo[tree_id].contains(&lookup.target) {
+                if peer.cuckoo[tree_id].contains(&target_tag) {
                     let cost = peer.effective_cost();
                     candidates.push((*peer_key, cost));
                     break;
@@ -824,71 +895,95 @@ impl RouterState {
             peer.rx_bytes += traffic.payload.len() as u64;
         }
 
-        if traffic.dest == self.pub_key {
-            // Session control messages carry the sender's ed pub key inside the
-            // payload wire format ([magic:1][ed_pub:32]...) — no need to decrypt
-            // enc_source for routing the ACK.
-            if traffic.payload.first().copied() == Some(SESSION_INIT_MAGIC) {
-                let ack_opt = self.sessions.lock().unwrap().handle_init(&traffic.payload).ok();
-                if let Some(ack_bytes) = ack_opt {
-                    // Extract sender's ed pub from payload (bytes 1..33)
-                    if traffic.payload.len() >= 33 {
-                        let mut sender = [0u8; 32];
-                        sender.copy_from_slice(&traffic.payload[1..33]);
-                        self.send_traffic_to(&sender, ack_bytes);
+        // Determine if this packet is addressed to us by comparing routing tags.
+        let my_tag = routing_tag(&self.pub_key);
+        if traffic.routing_tag == my_tag {
+            match traffic.pkt_type {
+                packet::PKT_CONTROL => {
+                    // Session control — padded, NOT session-encrypted.
+                    let raw = match unpad_payload(&traffic.payload) {
+                        Ok(b) => b,
+                        Err(e) => {
+                            debug!("unpad control payload failed: {}", e);
+                            return;
+                        }
+                    };
+                    if raw.first().copied() == Some(SESSION_INIT_MAGIC) {
+                        let ack_opt = self.sessions.lock().unwrap().handle_init(&raw).ok();
+                        if let Some(ack_bytes) = ack_opt {
+                            if raw.len() >= 33 {
+                                let mut sender = [0u8; 32];
+                                sender.copy_from_slice(&raw[1..33]);
+                                self.send_traffic_to(&sender, ack_bytes);
+                            }
+                        }
+                    } else if raw.first().copied() == Some(SESSION_ACK_MAGIC) {
+                        let _ = self.sessions.lock().unwrap().handle_ack(&raw);
                     }
                 }
-                return;
-            }
-            if traffic.payload.first().copied() == Some(SESSION_ACK_MAGIC) {
-                let _ = self.sessions.lock().unwrap().handle_ack(&traffic.payload);
-                return;
-            }
-
-            // Regular encrypted payload: decrypt enc_source to identify sender,
-            // then use the session key for that sender to decrypt the payload.
-            let source = match decrypt_source(&traffic.enc_source, &self.signing_key) {
-                Some(s) => s,
-                None => {
-                    debug!("failed to decrypt enc_source in Traffic from {:?}", &from[..4]);
-                    return;
+                packet::PKT_DATA => {
+                    // Session-encrypted data: decrypt enc_header → identify source →
+                    // session-decrypt payload → unpad → deliver.
+                    let source = match decrypt_source_from_header(&traffic.enc_header, &self.signing_key) {
+                        Some(s) => s,
+                        None => {
+                            debug!("failed to decrypt enc_header from {:?}", &from[..4]);
+                            return;
+                        }
+                    };
+                    let padded_pt = {
+                        let mut sm = self.sessions.lock().unwrap();
+                        match sm.decrypt(&source, &traffic.payload) {
+                            Ok(d) => d,
+                            Err(e) => {
+                                debug!("session decrypt failed from {:?}: {}", &source[..4], e);
+                                return;
+                            }
+                        }
+                    };
+                    let payload = match unpad_payload(&padded_pt) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            debug!("unpad plaintext failed: {}", e);
+                            return;
+                        }
+                    };
+                    let pkt = InboundPacket { from: source, payload };
+                    let _ = self.traffic_tx.try_send(pkt);
                 }
-            };
-
-            let decrypted = {
-                let mut sm = self.sessions.lock().unwrap();
-                match sm.decrypt(&source, &traffic.payload) {
-                    Ok(d) => d,
-                    Err(e) => {
-                        debug!("decrypt failed from {:?}: {}", &source[..4], e);
-                        return;
-                    }
+                t => {
+                    debug!("unknown pkt_type {} from {:?}", t, &from[..4]);
                 }
-            };
-            let pkt = InboundPacket { from: source, payload: decrypted };
-            let _ = self.traffic_tx.try_send(pkt);
+            }
         } else {
-            // Forward using greedy routing — enc_source is opaque to us
-            if let Some(next_hop) = self.lookup(&traffic.dest) {
+            // Forward using cuckoo-filter lookup on routing_tag.
+            // enc_header is completely opaque to intermediate nodes.
+            if let Some(next_hop) = self.lookup_by_tag(&traffic.routing_tag) {
                 let encoded = traffic.encode();
                 self.send_to_peer(&next_hop, encoded);
             } else {
-                debug!("no route to {:?}", &traffic.dest[..4]);
+                debug!("no route for routing_tag {:?}", &traffic.routing_tag[..4]);
             }
         }
     }
 
-    /// Send a payload wrapped in a Traffic packet to `dst`, routing greedily.
+    /// Send a session-control payload (SessionInit / SessionAck) wrapped in a
+    /// Traffic packet to `dst`.
+    ///
+    /// Control payloads are NOT session-encrypted (they carry ed25519 signatures).
+    /// pkt_type = PKT_CONTROL (0x00). Payload is padded to normalise packet sizes.
     fn send_traffic_to(&mut self, dst: &PeerId, payload: Vec<u8>) {
         let src = self.pub_key;
-        let enc_source = encrypt_source(&src, dst);
+        let (enc_header, tag) = encrypt_header(&src, dst);
+        let padded = pad_payload(&payload);
         let traffic = Traffic {
             path: vec![],
             from: src,
-            enc_source,
-            dest: *dst,
+            enc_header,
+            routing_tag: tag,
+            pkt_type: packet::PKT_CONTROL,
             watermark: 0,
-            payload,
+            payload: padded,
         };
         let encoded = traffic.encode();
         if let Some(next_hop) = self.lookup(dst) {
@@ -924,11 +1019,13 @@ impl RouterState {
         }
 
         // ── Cuckoo-filter lookup (fallback) ────────────────────────────────
+        // Filters store routing_tags, not raw pub keys.
+        let dst_tag = routing_tag(dst);
         let mut best: Option<(PeerId, u64)> = None;
 
         for (peer_key, peer) in &self.peers {
             for tree_id in 0..K {
-                if peer.cuckoo[tree_id].contains(dst) {
+                if peer.cuckoo[tree_id].contains(&dst_tag) {
                     let cost = peer.effective_cost();
                     let better = match &best {
                         None => true,
@@ -962,6 +1059,25 @@ impl RouterState {
             }
         }
 
+        best.map(|(k, _)| k)
+    }
+
+    /// Route lookup using only the 16-byte routing_tag (for forwarding Traffic
+    /// where the full dest pub key is not known to intermediate nodes).
+    fn lookup_by_tag(&self, tag: &[u8; 16]) -> Option<PeerId> {
+        let mut best: Option<(PeerId, u64)> = None;
+        for (peer_key, peer) in &self.peers {
+            for tree_id in 0..K {
+                if peer.cuckoo[tree_id].contains(tag) {
+                    let cost = peer.effective_cost();
+                    let better = best.map_or(true, |(_, bc)| cost < bc);
+                    if better {
+                        best = Some((*peer_key, cost));
+                    }
+                    break;
+                }
+            }
+        }
         best.map(|(k, _)| k)
     }
 }
@@ -1021,7 +1137,20 @@ fn dispatch(state: &Arc<Mutex<RouterState>>, from: PeerId, frame: Vec<u8>) {
         }
         TRAFFIC => {
             if let Ok(traffic) = Traffic::decode(data) {
-                state.lock().unwrap().handle_traffic(from, traffic);
+                let my_pub = state.lock().unwrap().pub_key;
+                let my_tag = routing_tag(&my_pub);
+                if traffic.routing_tag == my_tag {
+                    // For us: handle immediately (no jitter — latency matters)
+                    state.lock().unwrap().handle_traffic(from, traffic);
+                } else {
+                    // Forwarding: apply random 0–49 ms jitter to resist timing correlation
+                    let state_fwd = state.clone();
+                    tokio::spawn(async move {
+                        let jitter_ms = rand::random::<u64>() % 50;
+                        tokio::time::sleep(Duration::from_millis(jitter_ms)).await;
+                        state_fwd.lock().unwrap().handle_traffic(from, traffic);
+                    });
+                }
             }
         }
         TYPE_COORD_ANNOUNCE => {
@@ -1059,6 +1188,35 @@ impl PacketConn {
                 loop {
                     interval.tick().await;
                     state.lock().unwrap().do_maintenance();
+                }
+            });
+        }
+
+        // Cover traffic: send DUMMY packets at randomised intervals to all peers.
+        // This makes it harder to correlate traffic patterns with communication endpoints.
+        {
+            let state = state.clone();
+            tokio::spawn(async move {
+                use rand::Rng;
+                let mut rng = rand::rngs::OsRng;
+                loop {
+                    // Random delay 8–30 seconds
+                    let delay_ms = rng.gen_range(8_000u64..30_000u64);
+                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+
+                    let peers: Vec<PeerId> = {
+                        state.lock().unwrap().peers.keys().copied().collect()
+                    };
+                    for peer in peers {
+                        // ~40% chance per peer per check — adds variability
+                        if rng.gen_bool(0.4) {
+                            // Randomised dummy size (64–256 bytes) to prevent size fingerprinting
+                            let dummy_len = rng.gen_range(64usize..256usize);
+                            let mut cover = vec![DUMMY];
+                            cover.resize(dummy_len, 0u8);
+                            state.lock().unwrap().send_to_peer(&peer, cover);
+                        }
+                    }
                 }
             });
         }
@@ -1149,26 +1307,28 @@ impl PacketConn {
             }
         }
 
+        // Pad plaintext before encryption so ciphertext sizes are multiples of PAD_BLOCK.
+        // This hides message length from observers.
+        let padded = pad_payload(payload);
         let ciphertext = {
             let state = self.inner.lock().unwrap();
-            state.sessions.lock().unwrap().encrypt(dst, payload)?
+            state.sessions.lock().unwrap().encrypt(dst, &padded)?
         };
 
         let pub_key = self.pub_key;
-        let enc_source = encrypt_source(&pub_key, dst);
+        let (enc_header, tag) = encrypt_header(&pub_key, dst);
         let traffic = Traffic {
             path: vec![],
             from: pub_key,
-            enc_source,
-            dest: *dst,
+            enc_header,
+            routing_tag: tag,
+            pkt_type: packet::PKT_DATA,
             watermark: 0,
             payload: ciphertext,
         };
         let encoded = traffic.encode();
         // Important: extract next_hop into a variable so the MutexGuard is
         // dropped at the `;` before we try to lock again in send_to_peer.
-        // Rust extends temporary lifetimes in `if let` scrutinees to the end
-        // of the block, which would cause a deadlock with std::sync::Mutex.
         let next_hop = self.inner.lock().unwrap().lookup(dst);
         if let Some(next_hop) = next_hop {
             self.inner.lock().unwrap().send_to_peer(&next_hop, encoded);
