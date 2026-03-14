@@ -3,6 +3,7 @@
 
 pub mod address;
 pub mod cuckoo;
+pub mod hyperbolic;
 pub mod packet;
 pub mod router;
 pub mod session;

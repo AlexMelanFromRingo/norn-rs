@@ -15,6 +15,7 @@ pub const PATH_LOOKUP: u8 = 6;
 pub const PATH_NOTIFY: u8 = 7;
 pub const PATH_BROKEN: u8 = 8;
 pub const TRAFFIC: u8 = 9;
+pub const TYPE_COORD_ANNOUNCE: u8 = 10;
 
 /// Encode a uvarint into a byte buffer.
 pub fn encode_uvarint(mut v: u64, buf: &mut Vec<u8>) {
@@ -207,6 +208,8 @@ pub struct Announce {
     pub sender: [u8; 32],
     /// ed25519 signature over (tree_id || root || root_seq || path_cost || sender)
     pub signature: [u8; 64],
+    /// Hop depth from tree root (used for hyperbolic coord assignment)
+    pub depth: u32,
 }
 
 impl Announce {
@@ -216,6 +219,7 @@ impl Announce {
         encode_uvarint(self.root_seq, &mut buf);
         encode_uvarint(self.path_cost, &mut buf);
         buf.extend_from_slice(&self.sender);
+        encode_uvarint(self.depth as u64, &mut buf);
         buf
     }
 
@@ -226,6 +230,7 @@ impl Announce {
         encode_uvarint(self.path_cost, &mut buf);
         buf.extend_from_slice(&self.sender);
         buf.extend_from_slice(&self.signature);
+        encode_uvarint(self.depth as u64, &mut buf);
         buf
     }
 
@@ -251,7 +256,15 @@ impl Announce {
         pos += 32;
         let mut signature = [0u8; 64];
         signature.copy_from_slice(&data[pos..pos + 64]);
-        Ok(Announce { tree_id, root, root_seq, path_cost, sender, signature })
+        pos += 64;
+        // depth is optional (backwards compat): default 0 if absent
+        let depth = if pos < data.len() {
+            let (d, _) = decode_uvarint(&data[pos..])?;
+            d as u32
+        } else {
+            0
+        };
+        Ok(Announce { tree_id, root, root_seq, path_cost, sender, signature, depth })
     }
 }
 
@@ -379,9 +392,7 @@ impl PathBroken {
         target.copy_from_slice(&data[0..32]);
         let mut source = [0u8; 32];
         source.copy_from_slice(&data[32..64]);
-        let mut pos = 64;
-        let (id, n) = decode_uvarint(&data[pos..])?;
-        let _ = n;
+        let (id, _) = decode_uvarint(&data[64..])?;
         Ok(PathBroken { target, source, id })
     }
 }
@@ -443,6 +454,37 @@ impl Traffic {
     }
 }
 
+/// Broadcast by each node: its hyperbolic coordinate + signed by its key.
+#[derive(Clone, Debug)]
+pub struct CoordAnnounce {
+    /// HypCoord::encode() output (16 bytes)
+    pub coord: [u8; 16],
+    /// Hop depth in Urd spanning tree
+    pub tree_depth: u32,
+    /// ed25519 signature over (coord || tree_depth as 4-byte LE)
+    pub sig: [u8; 64],
+}
+
+impl CoordAnnounce {
+    pub fn encode_into(&self, buf: &mut Vec<u8>) {
+        buf.extend_from_slice(&self.coord);
+        buf.extend_from_slice(&self.tree_depth.to_le_bytes());
+        buf.extend_from_slice(&self.sig);
+    }
+
+    pub fn decode(data: &[u8]) -> Result<Self> {
+        if data.len() < 16 + 4 + 64 {
+            bail!("CoordAnnounce too short: got {}", data.len());
+        }
+        let mut coord = [0u8; 16];
+        coord.copy_from_slice(&data[0..16]);
+        let tree_depth = u32::from_le_bytes(data[16..20].try_into().unwrap());
+        let mut sig = [0u8; 64];
+        sig.copy_from_slice(&data[20..84]);
+        Ok(CoordAnnounce { coord, tree_depth, sig })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -484,6 +526,7 @@ mod tests {
             path_cost: 1000,
             sender: [0xCDu8; 32],
             signature: [0u8; 64],
+            depth: 3,
         };
         let enc = ann.encode();
         // Strip the ANNOUNCE byte
@@ -492,5 +535,6 @@ mod tests {
         assert_eq!(dec.root, [0xABu8; 32]);
         assert_eq!(dec.root_seq, 42);
         assert_eq!(dec.path_cost, 1000);
+        assert_eq!(dec.depth, 3);
     }
 }
