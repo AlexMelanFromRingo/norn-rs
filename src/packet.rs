@@ -278,7 +278,7 @@ impl CuckooMsg {
     }
 
     pub fn decode(data: &[u8]) -> Result<Self> {
-        if data.len() < 1 {
+        if data.is_empty() {
             bail!("CuckooMsg too short");
         }
         let tree_id = data[0];

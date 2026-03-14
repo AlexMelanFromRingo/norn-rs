@@ -28,6 +28,12 @@ pub struct KeyStore {
     addr_to_key: HashMap<[u8; 16], [u8; 32]>,
 }
 
+impl Default for KeyStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl KeyStore {
     pub fn new() -> Self {
         KeyStore { addr_to_key: HashMap::new() }

@@ -50,7 +50,7 @@ impl CuckooFilter {
     fn bucket2(b1: usize, fp: u16) -> usize {
         let mut h: Blake2b<U8> = Blake2b::new();
         h.update(b"b2");
-        h.update(&fp.to_le_bytes());
+        h.update(fp.to_le_bytes());
         let result = h.finalize();
         let v = u64::from_le_bytes(result[..8].try_into().unwrap());
         let offset = (v as usize) % NUM_BUCKETS;
@@ -78,7 +78,7 @@ impl CuckooFilter {
     }
 
     fn contains_slot(bucket: &[u16; SLOTS_PER_BUCKET], fp: u16) -> bool {
-        bucket.iter().any(|&s| s == fp)
+        bucket.contains(&fp)
     }
 
     pub fn add(&mut self, key: &[u8]) -> bool {
@@ -101,9 +101,7 @@ impl CuckooFilter {
 
         for _ in 0..MAX_KICKS {
             let slot_idx = rng.gen_range(0..SLOTS_PER_BUCKET);
-            let evicted_fp = self.buckets[cur_bucket][slot_idx];
-            self.buckets[cur_bucket][slot_idx] = cur_fp;
-            cur_fp = evicted_fp;
+            std::mem::swap(&mut self.buckets[cur_bucket][slot_idx], &mut cur_fp);
             let alt = Self::bucket2(cur_bucket, cur_fp);
             cur_bucket = alt;
             if Self::insert_slot(&mut self.buckets[cur_bucket], cur_fp) {

@@ -53,9 +53,13 @@ pub struct SessionInfo {
     // Remote's most recently seen x25519 public key
     remote_x25519_pub: X25519PublicKey,
 
-    // Sequence numbers (for replay protection)
+    // Sequence numbers
     pub local_seq: u64,
-    pub remote_seq: u64,
+    // Anti-replay sliding window (64-slot).
+    // remote_seq_high: highest seq successfully decrypted.
+    // remote_seq_window: bitmask; bit i set → (remote_seq_high - i) was accepted.
+    pub remote_seq_high: u64,
+    remote_seq_window: u64,
 
     // Session is established (handshake complete)
     pub established: bool,
@@ -74,7 +78,8 @@ impl SessionInfo {
             local_x25519_pub,
             remote_x25519_pub,
             local_seq: 0,
-            remote_seq: 0,
+            remote_seq_high: 0,
+            remote_seq_window: 0,
             established: false,
         }
     }
@@ -159,14 +164,40 @@ impl SessionInfo {
         nonce_bytes[..8].copy_from_slice(&seq.to_le_bytes());
         let nonce = Nonce::from_slice(&nonce_bytes);
 
+        // Anti-replay sliding window (64 slots).
+        // Reject packets that are replays or older than the window.
+        const WINDOW: u64 = 64;
+        if seq + WINDOW <= self.remote_seq_high {
+            bail!("replay: seq {} too old (high={})", seq, self.remote_seq_high);
+        }
+        if seq <= self.remote_seq_high {
+            let offset = self.remote_seq_high - seq;
+            if self.remote_seq_window & (1u64 << offset) != 0 {
+                bail!("replay: seq {} already seen", seq);
+            }
+        }
+
         let mut buf = ciphertext[40..].to_vec();
         cipher
             .decrypt_in_place(nonce, &sender_x_pub_bytes, &mut buf)
             .map_err(|e| anyhow::anyhow!("decrypt error: {:?}", e))?;
 
+        // Update the sliding window after successful decryption.
+        if seq > self.remote_seq_high {
+            let shift = seq - self.remote_seq_high;
+            self.remote_seq_window = if shift >= WINDOW {
+                1 // window completely advanced
+            } else {
+                (self.remote_seq_window << shift) | 1
+            };
+            self.remote_seq_high = seq;
+        } else {
+            let offset = self.remote_seq_high - seq;
+            self.remote_seq_window |= 1u64 << offset;
+        }
+
         // Update remote_x25519_pub: use sender's latest pub for our next encrypt
         self.remote_x25519_pub = sender_x_pub;
-        self.remote_seq = seq + 1;
         Ok(buf)
     }
 }

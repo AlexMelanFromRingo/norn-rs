@@ -159,7 +159,7 @@ fn pad_payload(data: &[u8]) -> Vec<u8> {
     out.push((orig_len & 0xFF) as u8);
     out.push((orig_len >> 8) as u8);
     out.extend_from_slice(data);
-    let target = ((out.len() + PAD_BLOCK - 1) / PAD_BLOCK) * PAD_BLOCK;
+    let target = out.len().div_ceil(PAD_BLOCK) * PAD_BLOCK;
     out.resize(target, 0u8);
     out
 }
@@ -324,6 +324,11 @@ impl RouterState {
     }
 
     fn add_peer(&mut self, pub_key: PeerId, tx: mpsc::Sender<Vec<u8>>, priority: u8) {
+        // Guard against overwriting an existing peer (e.g. duplicate connection race).
+        if self.peers.contains_key(&pub_key) {
+            debug!("add_peer: {:?} already present, ignoring duplicate", &pub_key[..4]);
+            return;
+        }
         let peer = PeerData {
             pub_key,
             lag: Duration::from_millis(100),
@@ -443,11 +448,10 @@ impl RouterState {
             self.trees[tree_id].parent_cost = best_cost;
             if tree_id == 0 {
                 // Our depth = parent's depth + 1
-                if let Some(parent_key) = best_parent {
-                    if let Some(ann) = self.peers.get(&parent_key).and_then(|p| p.trees[0].as_ref()) {
+                if let Some(parent_key) = best_parent
+                    && let Some(ann) = self.peers.get(&parent_key).and_then(|p| p.trees[0].as_ref()) {
                         self.own_depth = ann.depth + 1;
                     }
-                }
             }
         }
     }
@@ -502,7 +506,7 @@ impl RouterState {
     /// Cuckoo filter maintenance for tree `tree_id`.
     fn cuckoo_do_maintenance(&mut self, tree_id: usize) {
         // Every CUCKOO_GEN_TICKS, advance our generation (evicts stale entries).
-        if self.tick % CUCKOO_GEN_TICKS == 0 && self.tick > 0 {
+        if self.tick.is_multiple_of(CUCKOO_GEN_TICKS) && self.tick > 0 {
             self.cuckoo_generation[tree_id] += 1;
         }
         let generation = self.cuckoo_generation[tree_id];
@@ -533,11 +537,10 @@ impl RouterState {
         // Send merged cuckoo to all non-parent peers
         let full_merged = {
             let mut fm = merged.clone();
-            if let Some(parent_key) = parent {
-                if let Some(peer) = self.peers.get(&parent_key) {
+            if let Some(parent_key) = parent
+                && let Some(peer) = self.peers.get(&parent_key) {
                     fm.merge(&peer.cuckoo[tree_id]);
                 }
-            }
             fm
         };
 
@@ -605,7 +608,7 @@ impl RouterState {
         }
         self.update_own_coord();
         self.broadcast_coord();
-        if self.tick % KEEPALIVE_TICKS == 0 {
+        if self.tick.is_multiple_of(KEEPALIVE_TICKS) {
             self.send_keepalives();
         }
         self.rotate_session_keys();
@@ -705,17 +708,39 @@ impl RouterState {
     }
 
     pub fn handle_sig_res(&mut self, from: PeerId, res: SigRes) {
+        // Verify the SigRes signature before using the timestamp for RTT measurement.
+        // Without this check an attacker could forge SigRes with a crafted timestamp_ms
+        // to manipulate our lag estimate and fool the parent-selection algorithm.
+        let vk = match VerifyingKey::from_bytes(&res.pub_key) {
+            Ok(v) => v,
+            Err(_) => { warn!("sig_res: invalid pub_key from {:?}", &from[..4]); return; }
+        };
+        let mut sign_data = vec![res.tree_id];
+        let mut tmp = Vec::new();
+        encode_uvarint(res.seq, &mut tmp);
+        sign_data.extend_from_slice(&tmp);
+        tmp.clear();
+        encode_uvarint(res.timestamp_ms, &mut tmp);
+        sign_data.extend_from_slice(&tmp);
+        // The responder signed over req.pub_key, which is OUR pub key (we sent it in the SigReq).
+        sign_data.extend_from_slice(&self.pub_key);
+        let sig = ed25519_dalek::Signature::from_bytes(&res.signature);
+        if vk.verify(&sign_data, &sig).is_err() {
+            warn!("sig_res: bad signature from {:?}", &from[..4]);
+            return;
+        }
+
         if let Some(peer) = self.peers.get_mut(&from) {
             peer.last_rx_time = Instant::now();
             // Measure RTT
-            if let Some((pending_seq, sent_time)) = peer.pending_sig_req_time.take() {
-                if pending_seq == res.seq {
+            if let Some((pending_seq, sent_time)) = peer.pending_sig_req_time.take()
+                && pending_seq == res.seq {
                     let rtt = Instant::now().duration_since(sent_time);
                     let new_lag = rtt / 2;
                     // Exponential moving average
                     let old_lag_us = peer.lag.as_micros() as i64;
                     let new_lag_us = new_lag.as_micros() as i64;
-                    let diff = (new_lag_us - old_lag_us).unsigned_abs() as u64;
+                    let diff = (new_lag_us - old_lag_us).unsigned_abs();
                     peer.jitter = Duration::from_micros(
                         (peer.jitter.as_micros() as u64 * 7 / 8) + diff / 8
                     );
@@ -723,7 +748,6 @@ impl RouterState {
                         (old_lag_us as u64 * 7 / 8) + new_lag_us as u64 / 8
                     );
                 }
-            }
         }
     }
 
@@ -868,12 +892,11 @@ impl RouterState {
             peer.last_rx_time = Instant::now();
         }
         // Forward towards source
-        if broken.source != self.pub_key {
-            if let Some(next_hop) = self.lookup(&broken.source) {
+        if broken.source != self.pub_key
+            && let Some(next_hop) = self.lookup(&broken.source) {
                 let encoded = broken.encode();
                 self.send_to_peer(&next_hop, encoded);
             }
-        }
     }
 
     pub fn handle_traffic(&mut self, from: PeerId, traffic: Traffic) {
@@ -897,13 +920,12 @@ impl RouterState {
                     };
                     if raw.first().copied() == Some(SESSION_INIT_MAGIC) {
                         let ack_opt = self.sessions.lock().unwrap().handle_init(&raw).ok();
-                        if let Some(ack_bytes) = ack_opt {
-                            if raw.len() >= 33 {
+                        if let Some(ack_bytes) = ack_opt
+                            && raw.len() >= 33 {
                                 let mut sender = [0u8; 32];
                                 sender.copy_from_slice(&raw[1..33]);
                                 self.send_traffic_to(&sender, ack_bytes);
                             }
-                        }
                     } else if raw.first().copied() == Some(SESSION_ACK_MAGIC) {
                         let _ = self.sessions.lock().unwrap().handle_ack(&raw);
                     }
@@ -1099,7 +1121,7 @@ impl RouterState {
             for tree_id in 0..K {
                 if peer.cuckoo[tree_id].contains(tag) {
                     let cost = peer.effective_cost();
-                    let better = best.map_or(true, |(_, bc)| cost < bc);
+                    let better = best.is_none_or(|(_, bc)| cost < bc);
                     if better {
                         best = Some((*peer_key, cost));
                     }
@@ -1283,22 +1305,27 @@ impl PacketConn {
     }
 
     /// Attach a new peer connection.
+    ///
+    /// This method **blocks** until the peer disconnects.  The caller (transport
+    /// layer) should `tokio::spawn` this future and can rely on the return to
+    /// know the connection lifetime has ended — no separate cleanup is needed.
     pub async fn handle_conn(
         &self,
         remote_pub_key: [u8; 32],
         mut reader: impl AsyncRead + Unpin + Send + 'static,
-        mut writer: impl AsyncWrite + Unpin + Send + 'static,
+        writer: impl AsyncWrite + Unpin + Send + 'static,
         priority: u8,
     ) {
         let (tx, mut rx) = mpsc::channel::<Vec<u8>>(256);
 
-        // Register peer
+        // Register peer (guarded against duplicates inside add_peer)
         self.inner.lock().unwrap().add_peer(remote_pub_key, tx, priority);
 
         let state = self.inner.clone();
 
-        // Writer task
+        // Writer task — runs independently; terminates when channel closes or IO fails.
         tokio::spawn(async move {
+            let mut writer = writer;
             while let Some(data) = rx.recv().await {
                 if write_frame(&mut writer, &data).await.is_err() {
                     break;
@@ -1306,31 +1333,30 @@ impl PacketConn {
             }
         });
 
-        // Reader task
-        let state_r = state.clone();
-        tokio::spawn(async move {
-            loop {
-                match read_frame(&mut reader).await {
-                    Ok(frame) => {
-                        dispatch(&state_r, remote_pub_key, frame);
-                    }
-                    Err(e) => {
-                        debug!("peer {:?} disconnected: {}", &remote_pub_key[..4], e);
-                        state_r.lock().unwrap().remove_peer(&remote_pub_key);
-                        break;
-                    }
-                }
-            }
-        });
-
-        // Initiate session exchange: wrap SessionInit in Traffic so it follows
-        // the same path as data and works correctly in multi-hop scenarios.
+        // Initiate session exchange before entering the read loop.
         let init_bytes = {
             let s = state.lock().unwrap();
             s.sessions.lock().unwrap().get_or_initiate_bytes(&remote_pub_key)
         };
         if let Some(init_data) = init_bytes {
             state.lock().unwrap().send_traffic_to(&remote_pub_key, init_data);
+        }
+
+        // Reader loop — runs inline so that handle_conn() only returns after the
+        // peer disconnects.  This ensures the transport layer's `connected` dedup
+        // set is not cleared too early (which would otherwise allow an immediate
+        // reconnect that overwrites the peer entry and kills the writer task).
+        loop {
+            match read_frame(&mut reader).await {
+                Ok(frame) => {
+                    dispatch(&state, remote_pub_key, frame);
+                }
+                Err(e) => {
+                    debug!("peer {:?} disconnected: {}", &remote_pub_key[..4], e);
+                    state.lock().unwrap().remove_peer(&remote_pub_key);
+                    break;
+                }
+            }
         }
     }
 

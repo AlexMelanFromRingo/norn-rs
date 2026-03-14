@@ -3,29 +3,34 @@
 use ed25519_dalek::SigningKey;
 use norn_rs::PacketConn;
 use rand::rngs::OsRng;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::duplex;
 use norn_rs::hyperbolic::HypCoord;
 
+/// Spawn handle_conn in the background (it now blocks until disconnect).
+fn spawn_conn(conn: Arc<PacketConn>, remote_pub: [u8; 32], reader: impl tokio::io::AsyncRead + Unpin + Send + 'static, writer: impl tokio::io::AsyncWrite + Unpin + Send + 'static) {
+    tokio::spawn(async move {
+        conn.handle_conn(remote_pub, reader, writer, 0).await;
+    });
+}
+
 /// Create a pair of connected PacketConns using tokio duplex pipes.
-async fn make_connected_pair() -> (PacketConn, PacketConn) {
+async fn make_connected_pair() -> (Arc<PacketConn>, Arc<PacketConn>) {
     let sk_a = SigningKey::generate(&mut OsRng);
     let sk_b = SigningKey::generate(&mut OsRng);
     let pub_a = sk_a.verifying_key().to_bytes();
     let pub_b = sk_b.verifying_key().to_bytes();
 
-    let conn_a = PacketConn::new(sk_a);
-    let conn_b = PacketConn::new(sk_b);
+    let conn_a = Arc::new(PacketConn::new(sk_a));
+    let conn_b = Arc::new(PacketConn::new(sk_b));
 
     // Create duplex pipes (A's write → B's read, B's write → A's read)
     let (a_to_b_reader, a_to_b_writer) = duplex(65536);
     let (b_to_a_reader, b_to_a_writer) = duplex(65536);
 
-    // A reads from b_to_a_reader, writes to a_to_b_writer
-    conn_a.handle_conn(pub_b, b_to_a_reader, a_to_b_writer, 0).await;
-
-    // B reads from a_to_b_reader, writes to b_to_a_writer
-    conn_b.handle_conn(pub_a, a_to_b_reader, b_to_a_writer, 0).await;
+    spawn_conn(conn_a.clone(), pub_b, b_to_a_reader, a_to_b_writer);
+    spawn_conn(conn_b.clone(), pub_a, a_to_b_reader, b_to_a_writer);
 
     (conn_a, conn_b)
 }
@@ -294,21 +299,21 @@ async fn three_nodes_forwarding() {
     let pub_b = sk_b.verifying_key().to_bytes();
     let pub_c = sk_c.verifying_key().to_bytes();
 
-    let conn_a = PacketConn::new(sk_a);
-    let conn_b = PacketConn::new(sk_b);
-    let conn_c = PacketConn::new(sk_c);
+    let conn_a = Arc::new(PacketConn::new(sk_a));
+    let conn_b = Arc::new(PacketConn::new(sk_b));
+    let conn_c = Arc::new(PacketConn::new(sk_c));
 
     // Connect A -- B
     let (a_to_b_r, a_to_b_w) = duplex(65536);
     let (b_to_a_r, b_to_a_w) = duplex(65536);
-    conn_a.handle_conn(pub_b, b_to_a_r, a_to_b_w, 0).await;
-    conn_b.handle_conn(pub_a, a_to_b_r, b_to_a_w, 0).await;
+    spawn_conn(conn_a.clone(), pub_b, b_to_a_r, a_to_b_w);
+    spawn_conn(conn_b.clone(), pub_a, a_to_b_r, b_to_a_w);
 
     // Connect B -- C
     let (b_to_c_r, b_to_c_w) = duplex(65536);
     let (c_to_b_r, c_to_b_w) = duplex(65536);
-    conn_b.handle_conn(pub_c, c_to_b_r, b_to_c_w, 0).await;
-    conn_c.handle_conn(pub_b, b_to_c_r, c_to_b_w, 0).await;
+    spawn_conn(conn_b.clone(), pub_c, c_to_b_r, b_to_c_w);
+    spawn_conn(conn_c.clone(), pub_b, b_to_c_r, c_to_b_w);
 
     // Wait for maintenance cycles: cuckoo filters propagate, coords exchanged
     // A's cuckoo must reach C via B, and C's cuckoo must reach A via B.
@@ -409,21 +414,21 @@ async fn onion_routing_via_relay() {
     let pub_b = sk_b.verifying_key().to_bytes();
     let pub_c = sk_c.verifying_key().to_bytes();
 
-    let conn_a = PacketConn::new(sk_a);
-    let conn_b = PacketConn::new(sk_b);
-    let conn_c = PacketConn::new(sk_c);
+    let conn_a = Arc::new(PacketConn::new(sk_a));
+    let conn_b = Arc::new(PacketConn::new(sk_b));
+    let conn_c = Arc::new(PacketConn::new(sk_c));
 
     // A ↔ B
     let (ab_r, ab_w) = duplex(65536);
     let (ba_r, ba_w) = duplex(65536);
-    conn_a.handle_conn(pub_b, ba_r, ab_w, 0).await;
-    conn_b.handle_conn(pub_a, ab_r, ba_w, 0).await;
+    spawn_conn(conn_a.clone(), pub_b, ba_r, ab_w);
+    spawn_conn(conn_b.clone(), pub_a, ab_r, ba_w);
 
     // B ↔ C
     let (bc_r, bc_w) = duplex(65536);
     let (cb_r, cb_w) = duplex(65536);
-    conn_b.handle_conn(pub_c, cb_r, bc_w, 0).await;
-    conn_c.handle_conn(pub_b, bc_r, cb_w, 0).await;
+    spawn_conn(conn_b.clone(), pub_c, cb_r, bc_w);
+    spawn_conn(conn_c.clone(), pub_b, bc_r, cb_w);
 
     // Wait for cuckoo filters to propagate so B and A can route to C
     tokio::time::sleep(Duration::from_secs(3)).await;
