@@ -1,0 +1,213 @@
+// TUN network interface adapter for norn-rs.
+//
+// Creates a TUN device (e.g. "norn0"), assigns the node's 0x02.../7 IPv6
+// address, then bridges IPv6 packets between the kernel and PacketConn:
+//
+//   TUN → norn: read IPv6 packet, look up dest pub key, conn.write_to()
+//   norn → TUN: conn.read_from(), write IPv6 packet to TUN
+//
+// Key store: maps 0x02.../7 IPv6 addresses to ed25519 pub keys.
+// Populated automatically when peers connect (their address is derived
+// deterministically from their pub key).
+//
+// Requires: Linux TUN/TAP support (CONFIG_TUN), root or CAP_NET_ADMIN.
+
+use anyhow::{Context, Result};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use tracing::{debug, info, warn};
+
+use crate::address::address_from_key;
+use crate::router::PacketConn;
+
+// ── KeyStore ─────────────────────────────────────────────────────────────
+
+/// Maps 0x02.../7 IPv6 address → ed25519 pub key.
+/// The reverse direction is always computable via address_from_key().
+pub struct KeyStore {
+    addr_to_key: HashMap<[u8; 16], [u8; 32]>,
+}
+
+impl KeyStore {
+    pub fn new() -> Self {
+        KeyStore { addr_to_key: HashMap::new() }
+    }
+
+    /// Register a pub key and its derived IPv6 address.
+    pub fn register(&mut self, pub_key: [u8; 32]) -> [u8; 16] {
+        let addr = address_from_key(&pub_key);
+        self.addr_to_key.insert(addr, pub_key);
+        addr
+    }
+
+    /// Look up the pub key for a given 0x02.../7 IPv6 address.
+    pub fn key_for_addr(&self, addr: &[u8; 16]) -> Option<[u8; 32]> {
+        self.addr_to_key.get(addr).copied()
+    }
+}
+
+pub type SharedKeyStore = Arc<Mutex<KeyStore>>;
+
+pub fn new_key_store() -> SharedKeyStore {
+    Arc::new(Mutex::new(KeyStore::new()))
+}
+
+// ── TUN adapter ───────────────────────────────────────────────────────────
+
+#[cfg(feature = "tun-support")]
+pub async fn start(
+    tun_name: &str,
+    conn: Arc<PacketConn>,
+    key_store: SharedKeyStore,
+) -> Result<()> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    // Register our own key so we know our own address
+    let our_addr = key_store.lock().unwrap().register(conn.pub_key);
+    let our_addr_str = ipv6_string(&our_addr);
+
+    // Create TUN device
+    let mut tun_config = tun2::Configuration::default();
+    tun_config.tun_name(tun_name).mtu(65535_u16);
+    let dev = tun2::create_as_async(&tun_config)
+        .with_context(|| format!("creating TUN device '{}' (need CAP_NET_ADMIN or root)", tun_name))?;
+
+    // Assign IPv6 address via `ip` command
+    configure_interface(tun_name, &our_addr_str)?;
+    info!("TUN interface {} up, address {}/7", tun_name, our_addr_str);
+
+    let (mut tun_reader, mut tun_writer) = tokio::io::split(dev);
+
+    // ── TUN → norn (outbound) ────────────────────────────────────────────
+    let conn_out = conn.clone();
+    let ks_out = key_store.clone();
+    tokio::spawn(async move {
+        let mut buf = vec![0u8; 65536 + 4]; // +4 for tun2 header on some platforms
+        loop {
+            let n = match tun_reader.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => n,
+            };
+
+            // tun2 may prepend a 4-byte PI header on Linux — detect and skip it.
+            // If byte 0 is 0x60 (IPv6 version nibble = 6), no header. Otherwise skip 4.
+            let pkt = if buf[0] >> 4 == 6 {
+                &buf[..n]
+            } else if n > 4 && buf[4] >> 4 == 6 {
+                &buf[4..n]
+            } else {
+                continue; // not IPv6, skip (e.g. IPv4 or ARP)
+            };
+
+            if pkt.len() < 40 {
+                continue; // IPv6 header is 40 bytes
+            }
+
+            let mut dest_addr = [0u8; 16];
+            dest_addr.copy_from_slice(&pkt[24..40]);
+
+            // Only route 0x02.../7 addresses (our address space)
+            if dest_addr[0] != 0x02 {
+                debug!("TUN: non-norn dest {:?}, dropping", &dest_addr[..2]);
+                continue;
+            }
+
+            let pub_key = ks_out.lock().unwrap().key_for_addr(&dest_addr);
+            match pub_key {
+                Some(key) => {
+                    if let Err(e) = conn_out.write_to(pkt, &key).await {
+                        debug!("TUN write_to: {}", e);
+                    }
+                }
+                None => {
+                    debug!("TUN: unknown dest {:?}, no key registered", &dest_addr[..4]);
+                    // Future: send PathLookup to discover the destination
+                }
+            }
+        }
+        warn!("TUN reader exited");
+    });
+
+    // ── norn → TUN (inbound) ────────────────────────────────────────────
+    tokio::spawn(async move {
+        loop {
+            let pkt = match conn.read_from().await {
+                Ok(p) => p,
+                Err(_) => break,
+            };
+
+            // Auto-register sender's pub key so we can route back to them
+            key_store.lock().unwrap().register(pkt.from);
+
+            // Write the raw IPv6 packet to TUN
+            if let Err(e) = tun_writer.write_all(&pkt.payload).await {
+                warn!("TUN write: {}", e);
+            }
+        }
+        warn!("norn→TUN reader exited");
+    });
+
+    Ok(())
+}
+
+#[cfg(not(feature = "tun-support"))]
+pub async fn start(
+    tun_name: &str,
+    _conn: Arc<PacketConn>,
+    _key_store: SharedKeyStore,
+) -> Result<()> {
+    anyhow::bail!(
+        "TUN support not compiled in (feature 'tun-support' required). \
+         Rebuild with: cargo build --features tun-support"
+    )
+}
+
+// ── Helpers ───────────────────────────────────────────────────────────────
+
+#[cfg(feature = "tun-support")]
+fn configure_interface(name: &str, ipv6_addr: &str) -> Result<()> {
+    use std::process::Command;
+
+    // Bring the interface up
+    let status = Command::new("ip")
+        .args(["link", "set", name, "up"])
+        .status()
+        .context("running 'ip link set up'")?;
+    if !status.success() {
+        warn!("'ip link set {} up' exited with {:?}", name, status.code());
+    }
+
+    // Assign IPv6 address with /7 prefix (same as Yggdrasil's 0200::/7 range)
+    let cidr = format!("{}/7", ipv6_addr);
+    let status = Command::new("ip")
+        .args(["addr", "add", &cidr, "dev", name])
+        .status()
+        .context("running 'ip addr add'")?;
+    if !status.success() {
+        // May already be set — not fatal
+        debug!("'ip addr add {}' exited with {:?}", cidr, status.code());
+    }
+
+    // Add a route for the whole 0200::/7 range via this interface
+    let status = Command::new("ip")
+        .args(["route", "add", "200::/7", "dev", name])
+        .status()
+        .context("running 'ip route add'")?;
+    if !status.success() {
+        debug!("'ip route add 200::/7' exited with {:?}", status.code());
+    }
+
+    Ok(())
+}
+
+fn ipv6_string(bytes: &[u8; 16]) -> String {
+    use std::net::Ipv6Addr;
+    let mut groups = [0u16; 8];
+    for (i, chunk) in bytes.chunks(2).enumerate() {
+        groups[i] = u16::from_be_bytes([chunk[0], chunk[1]]);
+    }
+    Ipv6Addr::new(
+        groups[0], groups[1], groups[2], groups[3],
+        groups[4], groups[5], groups[6], groups[7],
+    ).to_string()
+}

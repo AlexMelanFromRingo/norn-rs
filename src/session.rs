@@ -401,11 +401,14 @@ impl SessionManager {
         self.sessions.remove(remote_ed_pub);
     }
 
-    /// Returns init bytes if no established session exists yet.
-    /// If a session exists but is not established (handshake in-flight), re-sends init.
+    /// Returns init bytes only if no session record exists yet.
+    /// Does NOT re-initiate while a handshake is already in-flight — the
+    /// initial init from handle_conn is sufficient on reliable TCP transport.
+    /// Re-initiating while in-flight overwrites the local keypair, breaking
+    /// the DH shared secret that the remote side is trying to use.
     pub fn get_or_initiate_bytes(&mut self, remote_ed_pub: &[u8; 32]) -> Option<Vec<u8>> {
-        if self.is_established(remote_ed_pub) {
-            return None;
+        if self.sessions.contains_key(remote_ed_pub) {
+            return None; // already established or handshake in-flight — don't overwrite
         }
         Some(self.initiate(remote_ed_pub))
     }
