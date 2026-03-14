@@ -118,7 +118,25 @@ pub async fn start(
                 continue;
             }
 
-            let pub_key = ks_out.lock().unwrap().key_for_addr(&dest_addr);
+            // Look up dest pub key. If not in the store yet, scan connected peers
+            // (peers are registered lazily on first inbound packet; this fallback
+            // covers the outgoing direction before any inbound packet has arrived).
+            let pub_key = {
+                let cached = ks_out.lock().unwrap().key_for_addr(&dest_addr);
+                if cached.is_some() {
+                    cached
+                } else {
+                    conn_out.get_peer_stats().into_iter().find_map(|p| {
+                        let addr = address_from_key(&p.key);
+                        if addr == dest_addr {
+                            ks_out.lock().unwrap().register(p.key);
+                            Some(p.key)
+                        } else {
+                            None
+                        }
+                    })
+                }
+            };
             match pub_key {
                 Some(key) => {
                     if let Err(e) = conn_out.write_to(pkt, &key).await {
@@ -127,7 +145,6 @@ pub async fn start(
                 }
                 None => {
                     debug!("TUN: unknown dest {:?}, no key registered", &dest_addr[..4]);
-                    // Future: send PathLookup to discover the destination
                 }
             }
         }
