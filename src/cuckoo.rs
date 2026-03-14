@@ -56,10 +56,6 @@ impl CuckooFilter {
         (b1 ^ offset) % NUM_BUCKETS
     }
 
-    fn has_empty_slot(bucket: &[u8; SLOTS_PER_BUCKET]) -> bool {
-        bucket.iter().any(|&s| s == 0)
-    }
-
     fn insert_slot(bucket: &mut [u8; SLOTS_PER_BUCKET], fp: u8) -> bool {
         for slot in bucket.iter_mut() {
             if *slot == 0 {

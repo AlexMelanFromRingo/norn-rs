@@ -392,9 +392,7 @@ impl PathBroken {
         target.copy_from_slice(&data[0..32]);
         let mut source = [0u8; 32];
         source.copy_from_slice(&data[32..64]);
-        let mut pos = 64;
-        let (id, n) = decode_uvarint(&data[pos..])?;
-        let _ = n;
+        let (id, _) = decode_uvarint(&data[64..])?;
         Ok(PathBroken { target, source, id })
     }
 }

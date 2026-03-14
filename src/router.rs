@@ -31,10 +31,12 @@ pub const TREE_SEEDS: [[u8; 8]; 3] = [
 
 /// Announce expires after 30 seconds
 const ANNOUNCE_EXPIRY: Duration = Duration::from_secs(30);
-/// Keep-alive interval
-const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(5);
+/// Keep-alive interval: send ping every 5 maintenance ticks (5 seconds)
+const KEEPALIVE_TICKS: u32 = 5;
 /// Peer timeout
 const PEER_TIMEOUT: Duration = Duration::from_secs(60);
+/// Rotate session encryption key every N sends for forward secrecy
+const KEY_ROTATION_INTERVAL: u64 = 100;
 
 // ──────────────────────────────────────────────
 // Public types
@@ -68,16 +70,13 @@ pub struct PeerStats {
 #[derive(Clone, Debug)]
 struct TreeAnnounce {
     root: [u8; 32],
-    root_seq: u64,
     path_cost: u64,
-    sender: [u8; 32],
     received_at: Instant,
     /// Hop depth of the sender in this tree
     depth: u32,
 }
 
 struct TreeState {
-    id: u8,
     parent: Option<PeerId>,
     root: [u8; 32],
     root_seq: u64,
@@ -101,9 +100,6 @@ struct PeerData {
     // RTT tracking
     pending_sig_req_time: Option<(u64, Instant)>, // (seq, sent_time)
     sig_req_seq: u64,
-    // Loss tracking
-    rx_count: u64,
-    expected_count: u64,
 }
 
 impl PeerData {
@@ -121,13 +117,14 @@ struct RouterState {
     path_notify: Option<Arc<dyn Fn([u8; 32]) + Send + Sync>>,
     landmarks: HashSet<[u8; 32]>,
     traffic_tx: mpsc::Sender<InboundPacket>,
-    next_conn_id: ConnId,
     // Path lookup dedup: lookup_id -> sent_time
     pending_lookups: HashMap<u64, Instant>,
     // Hyperbolic coordinate routing
     coord_table: HashMap<[u8; 32], HypCoord>,
     own_coord: HypCoord,
     own_depth: u32,
+    // Maintenance tick counter (for rate-limiting keepalives)
+    tick: u32,
 }
 
 // ──────────────────────────────────────────────
@@ -164,8 +161,7 @@ impl RouterState {
         let pub_key = signing_key.verifying_key().to_bytes();
         let sessions = Arc::new(Mutex::new(SessionManager::new(signing_key.clone())));
 
-        let trees = std::array::from_fn(|i| TreeState {
-            id: i as u8,
+        let trees = std::array::from_fn(|_| TreeState {
             parent: None,
             root: pub_key,
             root_seq: 0,
@@ -185,11 +181,11 @@ impl RouterState {
             path_notify: None,
             landmarks: HashSet::new(),
             traffic_tx,
-            next_conn_id: 0,
             pending_lookups: HashMap::new(),
             coord_table,
             own_coord,
             own_depth: 0,
+            tick: 0,
         }
     }
 
@@ -210,8 +206,6 @@ impl RouterState {
             connected_at: Instant::now(),
             pending_sig_req_time: None,
             sig_req_seq: 0,
-            rx_count: 0,
-            expected_count: 0,
         };
         self.peers.insert(pub_key, peer);
         self.update_landmarks();
@@ -219,16 +213,14 @@ impl RouterState {
 
     fn remove_peer(&mut self, pub_key: &PeerId) {
         self.peers.remove(pub_key);
-        // Remove from our cuckoo filters
-        for tree in &mut self.trees {
-            let _ = tree; // Tree state doesn't hold cuckoo directly
-        }
+        self.coord_table.remove(pub_key);
         self.update_landmarks();
         // Reset tree parents that depended on this peer
+        let own_key = self.pub_key;
         for tree in &mut self.trees {
             if tree.parent.as_ref() == Some(pub_key) {
                 tree.parent = None;
-                tree.root = self.pub_key;
+                tree.root = own_key;
                 tree.parent_cost = 0;
             }
         }
@@ -236,12 +228,21 @@ impl RouterState {
 
     fn update_landmarks(&mut self) {
         self.landmarks.clear();
-        // A node is a landmark if it has >2 peers in our view
-        // Here we track which peers we've seen (simplified: if peer count > 2, mark self)
+        // Mark ourselves as a landmark if we have >2 peers
         if self.peers.len() > 2 {
             self.landmarks.insert(self.pub_key);
         }
-        // In a real implementation, we'd track landmarks from announces
+        // Mark peers that appear to be well-connected: if a peer's announce
+        // path_cost from root is low (close to root), treat it as a landmark.
+        // Heuristic: peer at depth 0 or 1 in any tree is a good landmark.
+        for (peer_key, peer) in &self.peers {
+            for ann in peer.trees.iter().flatten() {
+                if ann.depth <= 1 {
+                    self.landmarks.insert(*peer_key);
+                    break;
+                }
+            }
+        }
     }
 
     /// Select best parent for tree `tree_id`.
@@ -297,7 +298,7 @@ impl RouterState {
             self.trees[tree_id].parent = None;
             self.trees[tree_id].root = self.pub_key;
             self.trees[tree_id].parent_cost = 0;
-            // Increment root_seq to indicate we're claiming root
+            self.trees[tree_id].root_seq += 1;
             if tree_id == 0 {
                 self.own_depth = 0;
             }
@@ -453,6 +454,7 @@ impl RouterState {
 
     /// Main maintenance function, called every 1 second.
     pub fn do_maintenance(&mut self) {
+        self.tick += 1;
         self.expire_peers();
         for i in 0..K {
             self.fix_tree(i);
@@ -461,8 +463,21 @@ impl RouterState {
         }
         self.update_own_coord();
         self.broadcast_coord();
-        self.send_keepalives();
+        if self.tick % KEEPALIVE_TICKS == 0 {
+            self.send_keepalives();
+        }
+        self.rotate_session_keys();
         self.cleanup_stale_lookups();
+    }
+
+    /// Rotate x25519 keys for sessions that have sent many messages.
+    fn rotate_session_keys(&self) {
+        let mut sm = self.sessions.lock().unwrap();
+        for info in sm.sessions.values_mut() {
+            if info.established && info.local_seq > 0 && info.local_seq % KEY_ROTATION_INTERVAL == 0 {
+                info.rotate_local_key();
+            }
+        }
     }
 
     /// Recompute our own hyperbolic coordinate from current depth.
@@ -592,13 +607,12 @@ impl RouterState {
             peer.last_rx_time = Instant::now();
             peer.trees[tree_id] = Some(TreeAnnounce {
                 root: ann.root,
-                root_seq: ann.root_seq,
                 path_cost: ann.path_cost,
-                sender: ann.sender,
                 received_at: Instant::now(),
                 depth: ann.depth,
             });
         }
+        self.update_landmarks();
     }
 
     pub fn handle_cuckoo(&mut self, from: PeerId, msg: CuckooMsg) {
@@ -718,18 +732,26 @@ impl RouterState {
         }
 
         if traffic.dest == self.pub_key {
-            // Decrypt and deliver
+            // Session control messages are wrapped in Traffic so they get forwarded correctly.
+            if traffic.payload.first().copied() == Some(SESSION_INIT_MAGIC) {
+                let ack_opt = self.sessions.lock().unwrap().handle_init(&traffic.payload).ok();
+                if let Some(ack_bytes) = ack_opt {
+                    self.send_traffic_to(&traffic.source, ack_bytes);
+                }
+                return;
+            }
+            if traffic.payload.first().copied() == Some(SESSION_ACK_MAGIC) {
+                let _ = self.sessions.lock().unwrap().handle_ack(&traffic.payload);
+                return;
+            }
+
+            // Regular encrypted payload: decrypt and deliver.
             let decrypted = {
                 let mut sm = self.sessions.lock().unwrap();
                 match sm.decrypt(&traffic.source, &traffic.payload) {
                     Ok(d) => d,
                     Err(e) => {
                         debug!("decrypt failed from {:?}: {}", &traffic.source[..4], e);
-                        // Try to initiate session
-                        if let Some(init_bytes) = sm.get_or_initiate_bytes(&traffic.source) {
-                            drop(sm);
-                            self.send_to_peer(&from, init_bytes);
-                        }
                         return;
                     }
                 }
@@ -744,6 +766,23 @@ impl RouterState {
             } else {
                 debug!("no route to {:?}", &traffic.dest[..4]);
             }
+        }
+    }
+
+    /// Send a payload wrapped in a Traffic packet to `dst`, routing greedily.
+    fn send_traffic_to(&mut self, dst: &PeerId, payload: Vec<u8>) {
+        let src = self.pub_key;
+        let traffic = Traffic {
+            path: vec![],
+            from: src,
+            source: src,
+            dest: *dst,
+            watermark: 0,
+            payload,
+        };
+        let encoded = traffic.encode();
+        if let Some(next_hop) = self.lookup(dst) {
+            self.send_to_peer(&next_hop, encoded);
         }
     }
 
@@ -880,20 +919,6 @@ fn dispatch(state: &Arc<Mutex<RouterState>>, from: PeerId, frame: Vec<u8>) {
                 state.lock().unwrap().handle_coord_announce(from, ann);
             }
         }
-        t if t == SESSION_INIT_MAGIC => {
-            // Handle session init: pass full frame (includes magic byte)
-            let ack_opt = {
-                let state = state.lock().unwrap();
-                state.sessions.lock().unwrap().handle_init(&frame).ok()
-            };
-            if let Some(ack_bytes) = ack_opt {
-                state.lock().unwrap().send_to_peer(&from, ack_bytes);
-            }
-        }
-        t if t == SESSION_ACK_MAGIC => {
-            // Handle session ack: pass full frame (includes magic byte)
-            let _ = state.lock().unwrap().sessions.lock().unwrap().handle_ack(&frame);
-        }
         _ => {
             debug!("unknown packet type {} from {:?}", ptype, &from[..4]);
         }
@@ -976,13 +1001,14 @@ impl PacketConn {
             }
         });
 
-        // Initiate session exchange — send SessionInit to remote
+        // Initiate session exchange: wrap SessionInit in Traffic so it follows
+        // the same path as data and works correctly in multi-hop scenarios.
         let init_bytes = {
             let s = state.lock().unwrap();
             s.sessions.lock().unwrap().get_or_initiate_bytes(&remote_pub_key)
         };
         if let Some(init_data) = init_bytes {
-            state.lock().unwrap().send_to_peer(&remote_pub_key, init_data);
+            state.lock().unwrap().send_traffic_to(&remote_pub_key, init_data);
         }
     }
 
@@ -992,34 +1018,31 @@ impl PacketConn {
     }
 
     pub async fn write_to(&self, payload: &[u8], dst: &[u8; 32]) -> Result<()> {
-        // Ensure session exists
-        let init_bytes = {
-            let state = self.inner.lock().unwrap();
-            let mut sm = state.sessions.lock().unwrap();
-            sm.get_or_initiate_bytes(dst)
-        };
-
-        if let Some(init_data) = init_bytes {
-            // Need to send init first — find next hop
-            if let Some(next_hop) = self.inner.lock().unwrap().lookup(dst) {
-                self.inner.lock().unwrap().send_to_peer(&next_hop, init_data);
+        // If no established session, send SessionInit (wrapped in Traffic) and bail.
+        // Caller should retry; wait_for_session() in tests handles this.
+        {
+            let established = {
+                let state = self.inner.lock().unwrap();
+                let sm = state.sessions.lock().unwrap();
+                sm.is_established(dst)
+            };
+            if !established {
+                let init_data = {
+                    let state = self.inner.lock().unwrap();
+                    let mut sm = state.sessions.lock().unwrap();
+                    sm.get_or_initiate_bytes(dst).unwrap_or_default()
+                };
+                if !init_data.is_empty() {
+                    self.inner.lock().unwrap().send_traffic_to(dst, init_data);
+                }
+                bail!("session not established with {:?}", &dst[..4]);
             }
-            // Wait a moment for handshake
-            tokio::time::sleep(Duration::from_millis(50)).await;
         }
 
         let ciphertext = {
             let state = self.inner.lock().unwrap();
-            let mut sm = state.sessions.lock().unwrap();
-            if !sm.is_established(dst) {
-                bail!("session not established with {:?}", &dst[..4]);
-            }
-            sm.encrypt(dst, payload)?
+            state.sessions.lock().unwrap().encrypt(dst, payload)?
         };
-
-        let next_hop = self.inner.lock().unwrap().lookup(dst).ok_or_else(|| {
-            anyhow::anyhow!("no route to {:?}", &dst[..4])
-        })?;
 
         let pub_key = self.pub_key;
         let traffic = Traffic {
@@ -1031,7 +1054,16 @@ impl PacketConn {
             payload: ciphertext,
         };
         let encoded = traffic.encode();
-        self.inner.lock().unwrap().send_to_peer(&next_hop, encoded);
+        // Important: extract next_hop into a variable so the MutexGuard is
+        // dropped at the `;` before we try to lock again in send_to_peer.
+        // Rust extends temporary lifetimes in `if let` scrutinees to the end
+        // of the block, which would cause a deadlock with std::sync::Mutex.
+        let next_hop = self.inner.lock().unwrap().lookup(dst);
+        if let Some(next_hop) = next_hop {
+            self.inner.lock().unwrap().send_to_peer(&next_hop, encoded);
+        } else {
+            bail!("no route to {:?}", &dst[..4]);
+        }
         Ok(())
     }
 

@@ -261,6 +261,10 @@ async fn hyperbolic_routing_two_nodes() {
         assert_eq!(sent, recv, "message {} mismatch B→A", i);
     }
 
+    // Verify coord table is populated via get_peer_stats (indirect check)
+    let stats_a = conn_a.get_peer_stats();
+    assert!(!stats_a.is_empty(), "A should have peer stats after coord exchange");
+
     // Sanity-check the HypCoord distance function directly
     let origin = HypCoord::origin();
     let far = HypCoord { r: 0.9, theta: 1.0 };
@@ -274,4 +278,119 @@ async fn hyperbolic_routing_two_nodes() {
         (d_ab - d_ba).abs() < 1e-9,
         "distance should be symmetric"
     );
+}
+
+/// Three-node test: A -- B -- C (linear chain).
+/// A and C are NOT directly connected. Traffic A→C must be forwarded through B.
+/// This is the key test for hyperbolic/cuckoo routing: B must route correctly.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn three_nodes_forwarding() {
+    let _ = tracing_subscriber::fmt().with_env_filter("warn").try_init();
+
+    let sk_a = SigningKey::generate(&mut OsRng);
+    let sk_b = SigningKey::generate(&mut OsRng);
+    let sk_c = SigningKey::generate(&mut OsRng);
+    let pub_a = sk_a.verifying_key().to_bytes();
+    let pub_b = sk_b.verifying_key().to_bytes();
+    let pub_c = sk_c.verifying_key().to_bytes();
+
+    let conn_a = PacketConn::new(sk_a);
+    let conn_b = PacketConn::new(sk_b);
+    let conn_c = PacketConn::new(sk_c);
+
+    // Connect A -- B
+    let (a_to_b_r, a_to_b_w) = duplex(65536);
+    let (b_to_a_r, b_to_a_w) = duplex(65536);
+    conn_a.handle_conn(pub_b, b_to_a_r, a_to_b_w, 0).await;
+    conn_b.handle_conn(pub_a, a_to_b_r, b_to_a_w, 0).await;
+
+    // Connect B -- C
+    let (b_to_c_r, b_to_c_w) = duplex(65536);
+    let (c_to_b_r, c_to_b_w) = duplex(65536);
+    conn_b.handle_conn(pub_c, c_to_b_r, b_to_c_w, 0).await;
+    conn_c.handle_conn(pub_b, b_to_c_r, c_to_b_w, 0).await;
+
+    // Wait for maintenance cycles: cuckoo filters propagate, coords exchanged
+    // A's cuckoo must reach C via B, and C's cuckoo must reach A via B.
+    // This takes at least 2 maintenance ticks (1 hop × 1s + propagation).
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    // Establish A→C session (A sends init, B forwards to C, C acks back)
+    assert!(
+        wait_for_session(&conn_a, &pub_c).await,
+        "A→C session failed to establish (forwarded via B)"
+    );
+
+    // Drain warmup messages on C
+    let drain = Duration::from_millis(300);
+    loop {
+        match tokio::time::timeout(drain, conn_c.read_from()).await {
+            Ok(Ok(_)) => continue,
+            _ => break,
+        }
+    }
+
+    // Establish C→A session
+    assert!(
+        wait_for_session(&conn_c, &pub_a).await,
+        "C→A session failed to establish (forwarded via B)"
+    );
+
+    // Drain warmup on A
+    loop {
+        match tokio::time::timeout(drain, conn_a.read_from()).await {
+            Ok(Ok(_)) => continue,
+            _ => break,
+        }
+    }
+
+    // Send 5 messages A → C (must go through B)
+    let msgs: Vec<Vec<u8>> = (0..5)
+        .map(|i| format!("A_to_C_{}", i).into_bytes())
+        .collect();
+
+    for msg in &msgs {
+        conn_a.write_to(msg, &pub_c).await.expect("A→C write failed");
+    }
+
+    let recv_c = tokio::time::timeout(Duration::from_secs(5), async {
+        let mut out = Vec::new();
+        for _ in 0..5 {
+            let pkt = conn_c.read_from().await.expect("C read_from failed");
+            assert_eq!(pkt.from, pub_a, "wrong sender on C");
+            out.push(pkt.payload);
+        }
+        out
+    })
+    .await
+    .expect("timed out waiting for C to receive 5 messages via B");
+
+    for (sent, recv) in msgs.iter().zip(recv_c.iter()) {
+        assert_eq!(sent, recv, "message mismatch A→C");
+    }
+
+    // Send 5 messages C → A (must go through B)
+    let msgs_back: Vec<Vec<u8>> = (0..5)
+        .map(|i| format!("C_to_A_{}", i).into_bytes())
+        .collect();
+
+    for msg in &msgs_back {
+        conn_c.write_to(msg, &pub_a).await.expect("C→A write failed");
+    }
+
+    let recv_a = tokio::time::timeout(Duration::from_secs(5), async {
+        let mut out = Vec::new();
+        for _ in 0..5 {
+            let pkt = conn_a.read_from().await.expect("A read_from failed");
+            assert_eq!(pkt.from, pub_c, "wrong sender on A");
+            out.push(pkt.payload);
+        }
+        out
+    })
+    .await
+    .expect("timed out waiting for A to receive 5 messages via B");
+
+    for (sent, recv) in msgs_back.iter().zip(recv_a.iter()) {
+        assert_eq!(sent, recv, "message mismatch C→A");
+    }
 }

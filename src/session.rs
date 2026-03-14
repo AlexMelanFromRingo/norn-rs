@@ -298,56 +298,52 @@ impl SessionAck {
 // ──────────────────────────────────────────────
 
 pub struct SessionManager {
-    sessions: HashMap<[u8; 32], SessionInfo>,
+    pub sessions: HashMap<[u8; 32], SessionInfo>,
     our_signing_key: SigningKey,
-    // Our stable x25519 keypair (used as initial key in handshakes)
-    our_x25519_priv: StaticSecret,
-    our_x25519_pub: X25519PublicKey,
 }
 
 impl SessionManager {
     pub fn new(signing_key: SigningKey) -> Self {
-        let our_x25519_priv = StaticSecret::random_from_rng(OsRng);
-        let our_x25519_pub = X25519PublicKey::from(&our_x25519_priv);
         SessionManager {
             sessions: HashMap::new(),
             our_signing_key: signing_key,
-            our_x25519_priv,
-            our_x25519_pub,
         }
-    }
-
-    pub fn our_x25519_pub(&self) -> &X25519PublicKey {
-        &self.our_x25519_pub
     }
 
     pub fn our_signing_key(&self) -> &SigningKey {
         &self.our_signing_key
     }
 
-    /// Build a SessionInit packet advertising our x25519 pub key.
-    pub fn build_init(&self) -> Vec<u8> {
-        SessionInit::create(&self.our_signing_key, &self.our_x25519_pub).encode()
-    }
-
     /// Handle an incoming SessionInit from remote. Returns SessionAck bytes to send back.
-    /// Creates or updates session state.
+    ///
+    /// If we already have a session with this remote (e.g., simultaneous crossing inits),
+    /// we complete our own session using the remote's x25519 pub key from their init,
+    /// without overwriting our keypair. This resolves the crossing-init race condition:
+    /// both sides end up with matching DH shared secrets.
     pub fn handle_init(&mut self, data: &[u8]) -> Result<Vec<u8>> {
         let init = SessionInit::decode(data)?;
         init.verify()?;
 
         let remote_x25519_pub = X25519PublicKey::from(init.x25519_pub);
 
-        // Create session: our local key = our stable x25519 priv, remote = their x25519_pub
-        // (will be updated when they send first packet)
-        let local_priv_for_session = StaticSecret::random_from_rng(OsRng);
-        let local_pub_for_session = X25519PublicKey::from(&local_priv_for_session);
-        let mut info = SessionInfo::new(init.ed_pub, local_priv_for_session, remote_x25519_pub);
+        if let Some(existing) = self.sessions.get_mut(&init.ed_pub) {
+            // Session already exists (we initiated or they initiated before).
+            // Update remote pub and mark established — don't replace our keypair.
+            existing.remote_x25519_pub = remote_x25519_pub;
+            existing.established = true;
+            let local_pub = X25519PublicKey::from(&existing.local_x25519_priv);
+            let ack = SessionAck::create(&self.our_signing_key, &local_pub);
+            return Ok(ack.encode());
+        }
+
+        // No existing session: we are the responder.
+        let local_priv = StaticSecret::random_from_rng(OsRng);
+        let local_pub = X25519PublicKey::from(&local_priv);
+        let mut info = SessionInfo::new(init.ed_pub, local_priv, remote_x25519_pub);
         info.established = true;
         self.sessions.insert(init.ed_pub, info);
 
-        // Reply with an ACK advertising our x25519 pub for this session
-        let ack = SessionAck::create(&self.our_signing_key, &local_pub_for_session);
+        let ack = SessionAck::create(&self.our_signing_key, &local_pub);
         Ok(ack.encode())
     }
 
@@ -371,21 +367,14 @@ impl SessionManager {
 
     /// Initiate session with remote: creates local session state, returns SessionInit bytes.
     pub fn initiate(&mut self, remote_ed_pub: &[u8; 32]) -> Vec<u8> {
-        if !self.sessions.contains_key(remote_ed_pub) {
-            // Create session with a fresh local x25519 keypair
-            let local_priv = StaticSecret::random_from_rng(OsRng);
-            let local_pub = X25519PublicKey::from(&local_priv);
-            // remote_x25519_pub placeholder (will be updated from ACK)
-            let remote_x_placeholder = X25519PublicKey::from([0u8; 32]);
-            let info = SessionInfo::new(*remote_ed_pub, local_priv, remote_x_placeholder);
-            self.sessions.insert(*remote_ed_pub, info);
-
-            // Build init advertising our stable pub (so remote can compute DH)
-            SessionInit::create(&self.our_signing_key, &local_pub).encode()
-        } else {
-            // Already have session; re-send init with our current pub
-            self.build_init()
-        }
+        // Create (or re-create) session with a fresh local x25519 keypair
+        let local_priv = StaticSecret::random_from_rng(OsRng);
+        let local_pub = X25519PublicKey::from(&local_priv);
+        // remote_x25519_pub placeholder (will be updated from ACK)
+        let remote_x_placeholder = X25519PublicKey::from([0u8; 32]);
+        let info = SessionInfo::new(*remote_ed_pub, local_priv, remote_x_placeholder);
+        self.sessions.insert(*remote_ed_pub, info);
+        SessionInit::create(&self.our_signing_key, &local_pub).encode()
     }
 
     pub fn encrypt(&mut self, remote_ed_pub: &[u8; 32], plaintext: &[u8]) -> Result<Vec<u8>> {
@@ -412,9 +401,10 @@ impl SessionManager {
         self.sessions.remove(remote_ed_pub);
     }
 
-    /// Get init bytes if no session exists yet, otherwise None.
+    /// Returns init bytes if no established session exists yet.
+    /// If a session exists but is not established (handshake in-flight), re-sends init.
     pub fn get_or_initiate_bytes(&mut self, remote_ed_pub: &[u8; 32]) -> Option<Vec<u8>> {
-        if self.sessions.contains_key(remote_ed_pub) {
+        if self.is_established(remote_ed_pub) {
             return None;
         }
         Some(self.initiate(remote_ed_pub))
