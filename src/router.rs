@@ -3,18 +3,24 @@
 // Loss-aware routing cost, cuckoo filter gossip, landmark routing
 
 use anyhow::{bail, Result};
+use chacha20poly1305::{AeadInPlace, ChaCha20Poly1305, Key, KeyInit, Nonce};
 use ed25519_dalek::{SigningKey, Signer, VerifyingKey, Verifier};
+use rand::rngs::OsRng;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc;
 use tracing::{debug, warn};
+use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret};
 
 use crate::cuckoo::CuckooFilter;
 use crate::hyperbolic::HypCoord;
 use crate::packet::*;
-use crate::session::{SessionManager, SharedSessionManager, SESSION_INIT_MAGIC, SESSION_ACK_MAGIC};
+use crate::session::{
+    ed25519_priv_to_x25519, ed25519_pub_to_x25519,
+    SessionManager, SharedSessionManager, SESSION_INIT_MAGIC, SESSION_ACK_MAGIC,
+};
 
 // ──────────────────────────────────────────────
 // Constants
@@ -37,6 +43,8 @@ const KEEPALIVE_TICKS: u32 = 5;
 const PEER_TIMEOUT: Duration = Duration::from_secs(60);
 /// Rotate session encryption key every N sends for forward secrecy
 const KEY_ROTATION_INTERVAL: u64 = 100;
+/// Increment cuckoo generation every N ticks (~5 minutes at 1 tick/sec)
+const CUCKOO_GEN_TICKS: u32 = 300;
 
 // ──────────────────────────────────────────────
 // Public types
@@ -91,6 +99,9 @@ struct PeerData {
     last_rx_time: Instant,
     last_tx_time: Instant,
     cuckoo: [CuckooFilter; K],
+    /// Last cuckoo generation received from this peer (per tree).
+    /// When generation advances, we replace the stored filter entirely.
+    peer_cuckoo_gen: [u64; K],
     trees: [Option<TreeAnnounce>; K],
     tx: mpsc::Sender<Vec<u8>>,
     priority: u8,
@@ -125,6 +136,72 @@ struct RouterState {
     own_depth: u32,
     // Maintenance tick counter (for rate-limiting keepalives)
     tick: u32,
+    /// Own cuckoo generation counter (per tree). Incremented every CUCKOO_GEN_TICKS.
+    /// Included in outgoing CuckooMsg so receivers can detect staleness.
+    cuckoo_generation: [u64; K],
+}
+
+// ──────────────────────────────────────────────
+// Source privacy helpers
+// ──────────────────────────────────────────────
+
+/// Encrypt a sender's ed25519 pub key so only `dest_ed_pub` can read it.
+///
+/// Output: [epk: 32][ChaCha20Poly1305(source_ed_pub, aad=epk): 48] = 80 bytes
+/// The ephemeral X25519 keypair is discarded after use (forward secrecy).
+fn encrypt_source(source_ed_pub: &[u8; 32], dest_ed_pub: &[u8; 32]) -> [u8; 80] {
+    // Ephemeral X25519 keypair
+    let epk_priv = StaticSecret::random_from_rng(OsRng);
+    let epk_pub = X25519PublicKey::from(&epk_priv);
+
+    // Derive dest's X25519 pub key from its ed25519 pub key
+    let dest_x = match ed25519_pub_to_x25519(dest_ed_pub) {
+        Ok(k) => k,
+        Err(_) => return [0u8; 80],
+    };
+
+    // ECDH shared secret → ChaCha20Poly1305 key
+    let shared = epk_priv.diffie_hellman(&dest_x);
+    let key = Key::from_slice(shared.as_bytes());
+    let cipher = ChaCha20Poly1305::new(key);
+
+    // Nonce = 0 (safe because key is unique per ephemeral pair)
+    let nonce = Nonce::from([0u8; 12]);
+    let aad = epk_pub.as_bytes();
+
+    let mut buf = source_ed_pub.to_vec();
+    if cipher.encrypt_in_place(&nonce, aad, &mut buf).is_err() {
+        return [0u8; 80];
+    }
+    // buf is now 48 bytes (32 plaintext + 16 tag)
+
+    let mut out = [0u8; 80];
+    out[..32].copy_from_slice(epk_pub.as_bytes());
+    out[32..].copy_from_slice(&buf);
+    out
+}
+
+/// Decrypt enc_source using our ed25519 signing key.
+/// Returns the sender's ed25519 pub key, or None if decryption fails.
+fn decrypt_source(enc_source: &[u8; 80], my_signing_key: &SigningKey) -> Option<[u8; 32]> {
+    let epk_pub_bytes: [u8; 32] = enc_source[..32].try_into().ok()?;
+    let epk_pub = X25519PublicKey::from(epk_pub_bytes);
+    let ciphertext = &enc_source[32..]; // 48 bytes
+
+    // Convert our ed25519 priv to x25519 priv
+    let my_x_priv = ed25519_priv_to_x25519(&my_signing_key.to_bytes());
+
+    // ECDH shared secret
+    let shared = my_x_priv.diffie_hellman(&epk_pub);
+    let key = Key::from_slice(shared.as_bytes());
+    let cipher = ChaCha20Poly1305::new(key);
+
+    let nonce = Nonce::from([0u8; 12]);
+    let aad = &epk_pub_bytes;
+
+    let mut buf = ciphertext.to_vec();
+    cipher.decrypt_in_place(&nonce, aad, &mut buf).ok()?;
+    buf.try_into().ok()
 }
 
 // ──────────────────────────────────────────────
@@ -186,6 +263,7 @@ impl RouterState {
             own_coord,
             own_depth: 0,
             tick: 0,
+            cuckoo_generation: [0u64; K],
         }
     }
 
@@ -198,6 +276,7 @@ impl RouterState {
             last_rx_time: Instant::now(),
             last_tx_time: Instant::now(),
             cuckoo: std::array::from_fn(|_| CuckooFilter::new()),
+            peer_cuckoo_gen: [0u64; K],
             trees: std::array::from_fn(|_| None),
             tx,
             priority,
@@ -366,6 +445,12 @@ impl RouterState {
 
     /// Cuckoo filter maintenance for tree `tree_id`.
     fn cuckoo_do_maintenance(&mut self, tree_id: usize) {
+        // Every CUCKOO_GEN_TICKS, advance our generation (evicts stale entries).
+        if self.tick % CUCKOO_GEN_TICKS == 0 && self.tick > 0 {
+            self.cuckoo_generation[tree_id] += 1;
+        }
+        let generation = self.cuckoo_generation[tree_id];
+
         // Build merged cuckoo of all peers except parent
         let parent = self.trees[tree_id].parent;
         let mut merged = CuckooFilter::new();
@@ -383,7 +468,7 @@ impl RouterState {
 
         // Send to parent (upstream)
         if let Some(parent_key) = parent {
-            let msg = CuckooMsg { tree_id: tree_id as u8, data: merged.encode() };
+            let msg = CuckooMsg { tree_id: tree_id as u8, generation, data: merged.encode() };
             let encoded = msg.encode();
             self.send_to_peer(&parent_key, encoded);
         }
@@ -404,7 +489,7 @@ impl RouterState {
             if Some(peer_key) == parent {
                 continue;
             }
-            let msg = CuckooMsg { tree_id: tree_id as u8, data: full_merged.encode() };
+            let msg = CuckooMsg { tree_id: tree_id as u8, generation, data: full_merged.encode() };
             let encoded = msg.encode();
             self.send_to_peer(&peer_key, encoded);
         }
@@ -622,7 +707,15 @@ impl RouterState {
         }
         if let Some(peer) = self.peers.get_mut(&from) {
             peer.last_rx_time = Instant::now();
-            peer.cuckoo[tree_id] = CuckooFilter::decode(&msg.data);
+            if msg.generation > peer.peer_cuckoo_gen[tree_id] {
+                // New generation: replace filter entirely — evicts stale entries
+                // from nodes that have disconnected from the sender's side.
+                peer.peer_cuckoo_gen[tree_id] = msg.generation;
+                peer.cuckoo[tree_id] = CuckooFilter::decode(&msg.data);
+            } else {
+                // Same generation: replace with sender's current view.
+                peer.cuckoo[tree_id] = CuckooFilter::decode(&msg.data);
+            }
         }
     }
 
@@ -732,11 +825,18 @@ impl RouterState {
         }
 
         if traffic.dest == self.pub_key {
-            // Session control messages are wrapped in Traffic so they get forwarded correctly.
+            // Session control messages carry the sender's ed pub key inside the
+            // payload wire format ([magic:1][ed_pub:32]...) — no need to decrypt
+            // enc_source for routing the ACK.
             if traffic.payload.first().copied() == Some(SESSION_INIT_MAGIC) {
                 let ack_opt = self.sessions.lock().unwrap().handle_init(&traffic.payload).ok();
                 if let Some(ack_bytes) = ack_opt {
-                    self.send_traffic_to(&traffic.source, ack_bytes);
+                    // Extract sender's ed pub from payload (bytes 1..33)
+                    if traffic.payload.len() >= 33 {
+                        let mut sender = [0u8; 32];
+                        sender.copy_from_slice(&traffic.payload[1..33]);
+                        self.send_traffic_to(&sender, ack_bytes);
+                    }
                 }
                 return;
             }
@@ -745,21 +845,30 @@ impl RouterState {
                 return;
             }
 
-            // Regular encrypted payload: decrypt and deliver.
+            // Regular encrypted payload: decrypt enc_source to identify sender,
+            // then use the session key for that sender to decrypt the payload.
+            let source = match decrypt_source(&traffic.enc_source, &self.signing_key) {
+                Some(s) => s,
+                None => {
+                    debug!("failed to decrypt enc_source in Traffic from {:?}", &from[..4]);
+                    return;
+                }
+            };
+
             let decrypted = {
                 let mut sm = self.sessions.lock().unwrap();
-                match sm.decrypt(&traffic.source, &traffic.payload) {
+                match sm.decrypt(&source, &traffic.payload) {
                     Ok(d) => d,
                     Err(e) => {
-                        debug!("decrypt failed from {:?}: {}", &traffic.source[..4], e);
+                        debug!("decrypt failed from {:?}: {}", &source[..4], e);
                         return;
                     }
                 }
             };
-            let pkt = InboundPacket { from: traffic.source, payload: decrypted };
+            let pkt = InboundPacket { from: source, payload: decrypted };
             let _ = self.traffic_tx.try_send(pkt);
         } else {
-            // Forward using greedy routing
+            // Forward using greedy routing — enc_source is opaque to us
             if let Some(next_hop) = self.lookup(&traffic.dest) {
                 let encoded = traffic.encode();
                 self.send_to_peer(&next_hop, encoded);
@@ -772,10 +881,11 @@ impl RouterState {
     /// Send a payload wrapped in a Traffic packet to `dst`, routing greedily.
     fn send_traffic_to(&mut self, dst: &PeerId, payload: Vec<u8>) {
         let src = self.pub_key;
+        let enc_source = encrypt_source(&src, dst);
         let traffic = Traffic {
             path: vec![],
             from: src,
-            source: src,
+            enc_source,
             dest: *dst,
             watermark: 0,
             payload,
@@ -1045,10 +1155,11 @@ impl PacketConn {
         };
 
         let pub_key = self.pub_key;
+        let enc_source = encrypt_source(&pub_key, dst);
         let traffic = Traffic {
             path: vec![],
             from: pub_key,
-            source: pub_key,
+            enc_source,
             dest: *dst,
             watermark: 0,
             payload: ciphertext,

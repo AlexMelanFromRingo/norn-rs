@@ -50,7 +50,6 @@ pub fn decode_uvarint(data: &[u8]) -> Result<(u64, usize)> {
 
 /// Read a length-prefixed frame from an async reader.
 pub async fn read_frame<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Vec<u8>> {
-    // Read uvarint length byte by byte
     let mut len_buf = [0u8; 1];
     let mut len_bytes = Vec::with_capacity(10);
     loop {
@@ -88,17 +87,15 @@ pub async fn write_frame<W: AsyncWrite + Unpin>(writer: &mut W, data: &[u8]) -> 
 // Wire structs
 // ──────────────────────────────────────────────
 
-/// Encode a path as zero-terminated uvarints (sequence of hop indices).
 pub fn encode_path(path: &[u64]) -> Vec<u8> {
     let mut buf = Vec::new();
     for &hop in path {
-        encode_uvarint(hop + 1, &mut buf); // shift by 1 so 0 is terminator
+        encode_uvarint(hop + 1, &mut buf);
     }
-    buf.push(0); // terminator
+    buf.push(0);
     buf
 }
 
-/// Decode a zero-terminated uvarint path.
 pub fn decode_path(data: &[u8]) -> Result<(Vec<u64>, usize)> {
     let mut path = Vec::new();
     let mut pos = 0;
@@ -111,7 +108,7 @@ pub fn decode_path(data: &[u8]) -> Result<(Vec<u64>, usize)> {
         if val == 0 {
             break;
         }
-        path.push(val - 1); // undo shift
+        path.push(val - 1);
     }
     Ok((path, pos))
 }
@@ -121,7 +118,6 @@ pub struct SigReq {
     pub tree_id: u8,
     pub seq: u64,
     pub timestamp_ms: u64,
-    /// The sender's ed25519 public key
     pub pub_key: [u8; 32],
 }
 
@@ -135,7 +131,6 @@ impl SigReq {
     }
 
     pub fn decode(data: &[u8]) -> Result<Self> {
-        // data[0] = SIG_REQ already stripped by caller; data starts at tree_id
         if data.len() < 2 {
             bail!("SigReq too short");
         }
@@ -159,7 +154,6 @@ pub struct SigRes {
     pub tree_id: u8,
     pub seq: u64,
     pub timestamp_ms: u64,
-    /// ed25519 signature of (tree_id || seq || timestamp_ms || req_pub_key)
     pub signature: [u8; 64],
     pub pub_key: [u8; 32],
 }
@@ -196,19 +190,14 @@ impl SigRes {
     }
 }
 
-/// Spanning-tree announce, one per tree.
 #[derive(Clone, Debug)]
 pub struct Announce {
     pub tree_id: u8,
     pub root: [u8; 32],
     pub root_seq: u64,
-    /// Cumulative path cost (effective_ms) from root to sender
     pub path_cost: u64,
-    /// Sender's ed25519 public key
     pub sender: [u8; 32],
-    /// ed25519 signature over (tree_id || root || root_seq || path_cost || sender)
     pub signature: [u8; 64],
-    /// Hop depth from tree root (used for hyperbolic coord assignment)
     pub depth: u32,
 }
 
@@ -235,7 +224,6 @@ impl Announce {
     }
 
     pub fn decode(data: &[u8]) -> Result<Self> {
-        // data[0] = tree_id (ANNOUNCE byte already stripped)
         if data.len() < 1 + 32 {
             bail!("Announce too short");
         }
@@ -257,7 +245,6 @@ impl Announce {
         let mut signature = [0u8; 64];
         signature.copy_from_slice(&data[pos..pos + 64]);
         pos += 64;
-        // depth is optional (backwards compat): default 0 if absent
         let depth = if pos < data.len() {
             let (d, _) = decode_uvarint(&data[pos..])?;
             d as u32
@@ -269,39 +256,49 @@ impl Announce {
 }
 
 /// Cuckoo filter gossip message, one per tree.
+///
+/// `generation` increments every 300 maintenance ticks (~5 min).
+/// When a receiver sees a new generation, it discards its stored copy and
+/// applies the incoming filter fresh — evicting stale entries from nodes
+/// that have since disconnected.
 #[derive(Clone, Debug)]
 pub struct CuckooMsg {
     pub tree_id: u8,
-    pub data: [u8; 2048],
+    pub generation: u64,
+    pub data: [u8; crate::cuckoo::FILTER_BYTES],
 }
 
 impl CuckooMsg {
     pub fn encode(&self) -> Vec<u8> {
         let mut buf = vec![CUCKOO_FILTER, self.tree_id];
+        encode_uvarint(self.generation, &mut buf);
         buf.extend_from_slice(&self.data);
         buf
     }
 
     pub fn decode(data: &[u8]) -> Result<Self> {
-        if data.len() < 1 + 2048 {
-            bail!("CuckooMsg too short: got {}", data.len());
+        if data.len() < 1 {
+            bail!("CuckooMsg too short");
         }
         let tree_id = data[0];
-        let mut cdata = [0u8; 2048];
-        cdata.copy_from_slice(&data[1..1 + 2048]);
-        Ok(CuckooMsg { tree_id, data: cdata })
+        let mut pos = 1;
+        let (generation, n) = decode_uvarint(&data[pos..])?;
+        pos += n;
+        if data.len() < pos + crate::cuckoo::FILTER_BYTES {
+            bail!("CuckooMsg data too short: need {}, got {}", crate::cuckoo::FILTER_BYTES, data.len() - pos);
+        }
+        let cdata: [u8; crate::cuckoo::FILTER_BYTES] = data[pos..pos + crate::cuckoo::FILTER_BYTES]
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("CuckooMsg slice error"))?;
+        Ok(CuckooMsg { tree_id, generation, data: cdata })
     }
 }
 
 #[derive(Clone, Debug)]
 pub struct PathLookup {
-    /// Target public key (full 32 bytes)
     pub target: [u8; 32],
-    /// Source public key
     pub source: [u8; 32],
-    /// Lookup ID (random, for dedup)
     pub id: u64,
-    /// Path back to source (encoded)
     pub path: Vec<u64>,
 }
 
@@ -326,8 +323,7 @@ impl PathLookup {
         let mut pos = 64;
         let (id, n) = decode_uvarint(&data[pos..])?;
         pos += n;
-        let (path, path_len) = decode_path(&data[pos..])?;
-        let _ = path_len;
+        let (path, _) = decode_path(&data[pos..])?;
         Ok(PathLookup { target, source, id, path })
     }
 }
@@ -337,7 +333,6 @@ pub struct PathNotify {
     pub target: [u8; 32],
     pub source: [u8; 32],
     pub id: u64,
-    /// Path from source to target
     pub path: Vec<u64>,
 }
 
@@ -362,8 +357,7 @@ impl PathNotify {
         let mut pos = 64;
         let (id, n) = decode_uvarint(&data[pos..])?;
         pos += n;
-        let (path, path_len) = decode_path(&data[pos..])?;
-        let _ = path_len;
+        let (path, _) = decode_path(&data[pos..])?;
         Ok(PathNotify { target, source, id, path })
     }
 }
@@ -397,19 +391,36 @@ impl PathBroken {
     }
 }
 
+/// Traffic packet.
+///
+/// Source privacy: the sender's identity (`source`) is encrypted with the
+/// destination's X25519 public key (derived from its ed25519 key).
+/// Intermediate nodes forward `enc_source` opaquely — they cannot read who
+/// sent the packet, only where it is going (`dest`).
+///
+/// Wire: path | from(32) | enc_source(80) | dest(32) | watermark | payload
+///
+/// `enc_source` layout: [epk: 32][ChaCha20Poly1305(source_ed_pub)(48)]
+///   epk  = ephemeral X25519 pub key generated by sender per-packet
+///   key  = DH(epk_priv, dest_x25519_pub)
+///   aad  = epk (authenticated)
+///
+/// Intermediate nodes: leave enc_source untouched, route on `dest`.
+/// Destination: decrypt enc_source → source ed25519 pub key.
 #[derive(Clone, Debug)]
 pub struct Traffic {
     /// Source routing path (hop indices)
     pub path: Vec<u64>,
-    /// Sender's public key
+    /// Immediate sender's public key (direct peer, for keepalive tracking)
     pub from: [u8; 32],
-    /// Ultimate source (for session key lookup)
-    pub source: [u8; 32],
-    /// Ultimate destination
+    /// Encrypted source identity — only destination can decrypt.
+    /// 80 bytes: epk(32) + AEAD(source_ed_pub)(32+16)
+    pub enc_source: [u8; 80],
+    /// Ultimate destination public key (needed for routing, visible to all)
     pub dest: [u8; 32],
     /// Sequence watermark for replay protection
     pub watermark: u64,
-    /// Encrypted payload
+    /// Encrypted application payload
     pub payload: Vec<u8>,
 }
 
@@ -418,7 +429,7 @@ impl Traffic {
         let mut buf = vec![TRAFFIC];
         buf.extend_from_slice(&encode_path(&self.path));
         buf.extend_from_slice(&self.from);
-        buf.extend_from_slice(&self.source);
+        buf.extend_from_slice(&self.enc_source);
         buf.extend_from_slice(&self.dest);
         encode_uvarint(self.watermark, &mut buf);
         encode_uvarint(self.payload.len() as u64, &mut buf);
@@ -430,15 +441,16 @@ impl Traffic {
         let mut pos = 0;
         let (path, path_len) = decode_path(data)?;
         pos += path_len;
-        if data.len() < pos + 32 + 32 + 32 {
+        // from(32) + enc_source(80) + dest(32) = 144 bytes minimum
+        if data.len() < pos + 144 {
             bail!("Traffic too short");
         }
         let mut from = [0u8; 32];
         from.copy_from_slice(&data[pos..pos + 32]);
         pos += 32;
-        let mut source = [0u8; 32];
-        source.copy_from_slice(&data[pos..pos + 32]);
-        pos += 32;
+        let enc_source: [u8; 80] = data[pos..pos + 80].try_into()
+            .map_err(|_| anyhow::anyhow!("Traffic enc_source slice error"))?;
+        pos += 80;
         let mut dest = [0u8; 32];
         dest.copy_from_slice(&data[pos..pos + 32]);
         pos += 32;
@@ -450,18 +462,15 @@ impl Traffic {
             bail!("Traffic payload truncated");
         }
         let payload = data[pos..pos + payload_len as usize].to_vec();
-        Ok(Traffic { path, from, source, dest, watermark, payload })
+        Ok(Traffic { path, from, enc_source, dest, watermark, payload })
     }
 }
 
 /// Broadcast by each node: its hyperbolic coordinate + signed by its key.
 #[derive(Clone, Debug)]
 pub struct CoordAnnounce {
-    /// HypCoord::encode() output (16 bytes)
     pub coord: [u8; 16],
-    /// Hop depth in Urd spanning tree
     pub tree_depth: u32,
-    /// ed25519 signature over (coord || tree_depth as 4-byte LE)
     pub sig: [u8; 64],
 }
 
@@ -529,12 +538,22 @@ mod tests {
             depth: 3,
         };
         let enc = ann.encode();
-        // Strip the ANNOUNCE byte
         let dec = Announce::decode(&enc[1..]).unwrap();
         assert_eq!(dec.tree_id, 1);
         assert_eq!(dec.root, [0xABu8; 32]);
         assert_eq!(dec.root_seq, 42);
         assert_eq!(dec.path_cost, 1000);
         assert_eq!(dec.depth, 3);
+    }
+
+    #[test]
+    fn cuckoo_msg_roundtrip() {
+        let data = [0xABu8; crate::cuckoo::FILTER_BYTES];
+        let msg = CuckooMsg { tree_id: 2, generation: 42, data };
+        let enc = msg.encode();
+        let dec = CuckooMsg::decode(&enc[1..]).unwrap();
+        assert_eq!(dec.tree_id, 2);
+        assert_eq!(dec.generation, 42);
+        assert_eq!(dec.data, data);
     }
 }
