@@ -458,6 +458,7 @@ mod tests {
     use super::*;
     use ed25519_dalek::SigningKey;
     use rand::rngs::OsRng;
+    use x25519_dalek::StaticSecret;
 
     #[test]
     fn session_handshake_and_encrypt_decrypt() {
@@ -515,6 +516,360 @@ mod tests {
             let pt2 = mgr_a.decrypt(&pub_b, &ct2).unwrap();
             assert_eq!(pt2, msg);
         }
+    }
+
+    // ── compute_key ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn compute_key_differs_with_different_inputs() {
+        // If compute_key returned [0;32] or a constant, all keys would be equal
+        let priv1 = StaticSecret::random_from_rng(OsRng);
+        let priv2 = StaticSecret::random_from_rng(OsRng);
+        let pub1 = X25519PublicKey::from(&priv1);
+        let pub2 = X25519PublicKey::from(&priv2);
+        let k1 = SessionInfo::compute_key(&priv1, &pub2);
+        let k2 = SessionInfo::compute_key(&priv2, &pub1);
+        // DH is commutative: both sides compute the same shared secret
+        assert_eq!(k1, k2, "DH should be commutative");
+        // And non-zero
+        assert_ne!(k1, [0u8; 32], "shared key must not be zero");
+    }
+
+    #[test]
+    fn compute_key_different_remote_gives_different_key() {
+        let local_priv = StaticSecret::random_from_rng(OsRng);
+        let remote1 = X25519PublicKey::from(&StaticSecret::random_from_rng(OsRng));
+        let remote2 = X25519PublicKey::from(&StaticSecret::random_from_rng(OsRng));
+        let k1 = SessionInfo::compute_key(&local_priv, &remote1);
+        let k2 = SessionInfo::compute_key(&local_priv, &remote2);
+        assert_ne!(k1, k2, "different remotes must give different keys");
+    }
+
+    // ── wrong-key decryption fails ───────────────────────────────────────────
+
+    #[test]
+    fn decrypt_with_wrong_key_fails() {
+        let sk_a = SigningKey::generate(&mut OsRng);
+        let sk_b = SigningKey::generate(&mut OsRng);
+        let sk_c = SigningKey::generate(&mut OsRng);
+        let pub_b = sk_b.verifying_key().to_bytes();
+        let pub_a = sk_a.verifying_key().to_bytes();
+
+        let mut mgr_a = SessionManager::new(sk_a);
+        let mut mgr_b = SessionManager::new(sk_b.clone());
+        let mut mgr_c = SessionManager::new(sk_c);
+
+        let init = mgr_a.initiate(&pub_b);
+        let ack  = mgr_b.handle_init(&init).unwrap();
+        mgr_a.handle_ack(&ack).unwrap();
+
+        let ct = mgr_a.encrypt(&pub_b, b"secret").unwrap();
+
+        // mgr_c has a different signing key and different x25519 key → decrypt should fail
+        let pub_b2 = sk_b.verifying_key().to_bytes();
+        // Give C an established (but wrong-key) session by initiating separately
+        let init_c = mgr_c.initiate(&pub_b2);
+        let _ = mgr_b.handle_init(&init_c); // B creates a session for C too
+
+        // C tries to decrypt A's ciphertext using its own wrong session key → must fail
+        assert!(mgr_c.decrypt(&pub_a, &ct).is_err(),
+            "decryption with wrong key must fail");
+    }
+
+    // ── SessionInit / SessionAck signature verification ───────────────────────
+
+    #[test]
+    fn session_init_verify_rejects_tampered_signature() {
+        let sk_a = SigningKey::generate(&mut OsRng);
+        let sk_b = SigningKey::generate(&mut OsRng);
+        let pub_b = sk_b.verifying_key().to_bytes();
+        let mut mgr_a = SessionManager::new(sk_a);
+        let mut init_bytes = mgr_a.initiate(&pub_b);
+        // Corrupt the signature bytes (last 64 bytes of SessionInit)
+        let n = init_bytes.len();
+        init_bytes[n - 1] ^= 0xFF;
+        let mut mgr_b = SessionManager::new(sk_b);
+        assert!(mgr_b.handle_init(&init_bytes).is_err(),
+            "tampered SessionInit signature must be rejected");
+    }
+
+    #[test]
+    fn session_ack_verify_rejects_tampered_signature() {
+        let sk_a = SigningKey::generate(&mut OsRng);
+        let sk_b = SigningKey::generate(&mut OsRng);
+        let pub_b = sk_b.verifying_key().to_bytes();
+        let mut mgr_a = SessionManager::new(sk_a);
+        let mut mgr_b = SessionManager::new(sk_b);
+        let init = mgr_a.initiate(&pub_b);
+        let mut ack = mgr_b.handle_init(&init).unwrap();
+        // Corrupt ACK signature
+        let n = ack.len();
+        ack[n - 1] ^= 0xFF;
+        assert!(mgr_a.handle_ack(&ack).is_err(),
+            "tampered SessionAck signature must be rejected");
+    }
+
+    // ── Sliding window replay protection ─────────────────────────────────────
+
+    #[test]
+    fn replay_same_packet_rejected() {
+        let sk_a = SigningKey::generate(&mut OsRng);
+        let sk_b = SigningKey::generate(&mut OsRng);
+        let pub_b = sk_b.verifying_key().to_bytes();
+        let pub_a = sk_a.verifying_key().to_bytes();
+        let mut mgr_a = SessionManager::new(sk_a);
+        let mut mgr_b = SessionManager::new(sk_b);
+        let init = mgr_a.initiate(&pub_b);
+        let ack = mgr_b.handle_init(&init).unwrap();
+        mgr_a.handle_ack(&ack).unwrap();
+
+        let ct = mgr_a.encrypt(&pub_b, b"once").unwrap();
+        // First decrypt succeeds
+        assert!(mgr_b.decrypt(&pub_a, &ct).is_ok());
+        // Replay must fail
+        assert!(mgr_b.decrypt(&pub_a, &ct).is_err(),
+            "replayed packet must be rejected");
+    }
+
+    #[test]
+    fn old_packet_outside_window_rejected() {
+        let sk_a = SigningKey::generate(&mut OsRng);
+        let sk_b = SigningKey::generate(&mut OsRng);
+        let pub_b = sk_b.verifying_key().to_bytes();
+        let pub_a = sk_a.verifying_key().to_bytes();
+        let mut mgr_a = SessionManager::new(sk_a);
+        let mut mgr_b = SessionManager::new(sk_b);
+        let init = mgr_a.initiate(&pub_b);
+        let ack = mgr_b.handle_init(&init).unwrap();
+        mgr_a.handle_ack(&ack).unwrap();
+
+        // Send 65 packets to advance the window past seq=0
+        let old_ct = mgr_a.encrypt(&pub_b, b"old").unwrap();
+        for _ in 0..65 {
+            let ct = mgr_a.encrypt(&pub_b, b"x").unwrap();
+            let _ = mgr_b.decrypt(&pub_a, &ct);
+        }
+        // Now the window has advanced; seq=0 is too old
+        assert!(mgr_b.decrypt(&pub_a, &old_ct).is_err(),
+            "packet older than window must be rejected");
+    }
+
+    #[test]
+    fn out_of_order_within_window_accepted() {
+        let sk_a = SigningKey::generate(&mut OsRng);
+        let sk_b = SigningKey::generate(&mut OsRng);
+        let pub_b = sk_b.verifying_key().to_bytes();
+        let pub_a = sk_a.verifying_key().to_bytes();
+        let mut mgr_a = SessionManager::new(sk_a);
+        let mut mgr_b = SessionManager::new(sk_b);
+        let init = mgr_a.initiate(&pub_b);
+        let ack = mgr_b.handle_init(&init).unwrap();
+        mgr_a.handle_ack(&ack).unwrap();
+
+        // Encrypt two packets out of order
+        let ct0 = mgr_a.encrypt(&pub_b, b"zero").unwrap();
+        let ct1 = mgr_a.encrypt(&pub_b, b"one").unwrap();
+        // Deliver 1 before 0
+        assert!(mgr_b.decrypt(&pub_a, &ct1).is_ok(), "seq 1 should be accepted first");
+        assert!(mgr_b.decrypt(&pub_a, &ct0).is_ok(), "seq 0 within window should be accepted");
+    }
+
+    // ── rotate_local_key ─────────────────────────────────────────────────────
+
+    #[test]
+    fn rotate_local_key_changes_pub() {
+        let sk = SigningKey::generate(&mut OsRng);
+        let pub_b = [1u8; 32]; // placeholder
+        let x_priv = ed25519_priv_to_x25519(&sk.to_bytes());
+        let x_pub_before = X25519PublicKey::from(&x_priv);
+        let remote_pub = X25519PublicKey::from(&StaticSecret::random_from_rng(OsRng));
+        let mut info = SessionInfo::new([0u8; 32], x_priv, remote_pub);
+        let _ = pub_b; // suppress warning
+        let pub_before = *info.local_x25519_pub.as_bytes();
+        info.rotate_local_key();
+        let pub_after = *info.local_x25519_pub.as_bytes();
+        assert_ne!(pub_before, pub_after, "rotate_local_key must change the public key");
+        let _ = x_pub_before;
+    }
+
+    // ── SessionManager::remove ───────────────────────────────────────────────
+
+    #[test]
+    fn session_manager_remove_clears_session() {
+        let sk_a = SigningKey::generate(&mut OsRng);
+        let sk_b = SigningKey::generate(&mut OsRng);
+        let pub_b = sk_b.verifying_key().to_bytes();
+        let mut mgr_a = SessionManager::new(sk_a);
+        let mut mgr_b = SessionManager::new(sk_b);
+        let init = mgr_a.initiate(&pub_b);
+        let ack = mgr_b.handle_init(&init).unwrap();
+        mgr_a.handle_ack(&ack).unwrap();
+        assert!(mgr_a.is_established(&pub_b));
+        mgr_a.remove(&pub_b);
+        assert!(!mgr_a.is_established(&pub_b),
+            "session must be gone after remove()");
+    }
+
+    // ── decrypt truncation guard (exact boundary) ────────────────────────────
+
+    #[test]
+    fn decrypt_too_short_rejected() {
+        let sk_a = SigningKey::generate(&mut OsRng);
+        let sk_b = SigningKey::generate(&mut OsRng);
+        let pub_b = sk_b.verifying_key().to_bytes();
+        let pub_a = sk_a.verifying_key().to_bytes();
+        let mut mgr_a = SessionManager::new(sk_a);
+        let mut mgr_b = SessionManager::new(sk_b);
+        let init = mgr_a.initiate(&pub_b);
+        let ack = mgr_b.handle_init(&init).unwrap();
+        mgr_a.handle_ack(&ack).unwrap();
+        // Ciphertext shorter than 32+8+16=56 bytes must be rejected
+        assert!(mgr_b.decrypt(&pub_a, &[0u8; 55]).is_err(),
+            "55-byte ciphertext must be rejected");
+        assert!(mgr_b.decrypt(&pub_a, &[]).is_err());
+        // 56 bytes is the minimum valid size (empty plaintext encrypted)
+        // Encrypting b"" gives exactly 56 bytes; this must NOT be rejected by the length check
+        let ct_empty = mgr_a.encrypt(&pub_b, b"").unwrap();
+        assert_eq!(ct_empty.len(), 56, "empty plaintext must produce 56-byte ciphertext");
+        // The decrypt of a validly-formed 56-byte ct must succeed (not fail on length)
+        assert!(mgr_b.decrypt(&pub_a, &ct_empty).is_ok(),
+            "valid 56-byte ciphertext (empty plaintext) must succeed — catches < vs <=");
+    }
+
+    // ── sliding window arithmetic precision ──────────────────────────────────
+
+    #[test]
+    fn replay_at_nonzero_offset_rejected() {
+        // After receiving seq=0 and seq=1, replay of seq=0 should fail.
+        // This specifically tests that the bit at offset=1 is correctly set (1<<1),
+        // catching the mutation << → >> (1>>1 = 0 would miss the replay).
+        let sk_a = SigningKey::generate(&mut OsRng);
+        let sk_b = SigningKey::generate(&mut OsRng);
+        let pub_b = sk_b.verifying_key().to_bytes();
+        let pub_a = sk_a.verifying_key().to_bytes();
+        let mut mgr_a = SessionManager::new(sk_a);
+        let mut mgr_b = SessionManager::new(sk_b);
+        let init = mgr_a.initiate(&pub_b);
+        let ack = mgr_b.handle_init(&init).unwrap();
+        mgr_a.handle_ack(&ack).unwrap();
+
+        let ct0 = mgr_a.encrypt(&pub_b, b"zero").unwrap();
+        let ct1 = mgr_a.encrypt(&pub_b, b"one").unwrap();
+
+        // Receive both in order
+        assert!(mgr_b.decrypt(&pub_a, &ct0).is_ok());
+        assert!(mgr_b.decrypt(&pub_a, &ct1).is_ok());
+
+        // Replay seq=0 — remote_seq_high=1, offset=1, bit 1 should be set
+        assert!(mgr_b.decrypt(&pub_a, &ct0).is_err(),
+            "replay at offset=1 must be rejected (catches 1<<offset vs 1>>offset)");
+    }
+
+    #[test]
+    fn window_arithmetic_three_step_sequence() {
+        // Receive seq=0,1,2 then try to replay seq=1 (offset=1).
+        // Also verifies the window shifts correctly when seq advances by 2.
+        let sk_a = SigningKey::generate(&mut OsRng);
+        let sk_b = SigningKey::generate(&mut OsRng);
+        let pub_b = sk_b.verifying_key().to_bytes();
+        let pub_a = sk_a.verifying_key().to_bytes();
+        let mut mgr_a = SessionManager::new(sk_a);
+        let mut mgr_b = SessionManager::new(sk_b);
+        let init = mgr_a.initiate(&pub_b);
+        let ack = mgr_b.handle_init(&init).unwrap();
+        mgr_a.handle_ack(&ack).unwrap();
+
+        let cts: Vec<_> = (0..4).map(|i| mgr_a.encrypt(&pub_b, &[i]).unwrap()).collect();
+        // Receive 0,1,2,3 in order
+        for ct in &cts { assert!(mgr_b.decrypt(&pub_a, ct).is_ok()); }
+        // Replay each: all must fail
+        for (i, ct) in cts.iter().enumerate() {
+            assert!(mgr_b.decrypt(&pub_a, ct).is_err(),
+                "replay of seq={} must be rejected", i);
+        }
+    }
+
+    #[test]
+    fn window_advance_by_more_than_one() {
+        // Skip seq=1, receive seq=3. Then receive seq=1 (within window).
+        // This tests the shift arithmetic: shift = 3-0 = 3, window = (window<<3)|1 = 0b1001.
+        // Then seq=1: offset = 3-1 = 2, bit 2 is 0 → accepted.
+        // With mutated shift arithmetic the window would be wrong.
+        let sk_a = SigningKey::generate(&mut OsRng);
+        let sk_b = SigningKey::generate(&mut OsRng);
+        let pub_b = sk_b.verifying_key().to_bytes();
+        let pub_a = sk_a.verifying_key().to_bytes();
+        let mut mgr_a = SessionManager::new(sk_a);
+        let mut mgr_b = SessionManager::new(sk_b);
+        let init = mgr_a.initiate(&pub_b);
+        let ack = mgr_b.handle_init(&init).unwrap();
+        mgr_a.handle_ack(&ack).unwrap();
+
+        let ct0 = mgr_a.encrypt(&pub_b, b"seq0").unwrap();
+        let ct1 = mgr_a.encrypt(&pub_b, b"seq1").unwrap();
+        let ct2 = mgr_a.encrypt(&pub_b, b"seq2").unwrap();
+        let ct3 = mgr_a.encrypt(&pub_b, b"seq3").unwrap();
+
+        // Receive seq=0 (high=0, window=1)
+        assert!(mgr_b.decrypt(&pub_a, &ct0).is_ok());
+        // Skip seq=1,2 and receive seq=3 (shift=3, high=3, window=(1<<3)|1 = 9 = 0b1001)
+        assert!(mgr_b.decrypt(&pub_a, &ct3).is_ok());
+        // seq=1 is at offset=2, bit 2 of window 9 = 0 → should be accepted
+        assert!(mgr_b.decrypt(&pub_a, &ct1).is_ok(),
+            "seq=1 (offset=2 from high=3) must be accepted");
+        // seq=0 is at offset=3, bit 3 of window 9 = 1 → must be rejected (already seen)
+        assert!(mgr_b.decrypt(&pub_a, &ct0).is_err(),
+            "seq=0 (offset=3, already in window) must be rejected");
+        // seq=2 at offset=1, bit 1 of current window → must be accepted
+        assert!(mgr_b.decrypt(&pub_a, &ct2).is_ok(),
+            "seq=2 (offset=1 from high=3) must be accepted");
+    }
+
+    // ── SessionInit / SessionAck decode truncation ────────────────────────────
+
+    #[test]
+    fn session_init_decode_truncated_fails() {
+        // Must fail on empty data
+        assert!(SessionInit::decode(&[]).is_err());
+        // Must fail with wrong magic
+        let mut bad = vec![0xFF_u8; 1 + 32 + 64 + 32];
+        assert!(SessionInit::decode(&bad).is_err(), "wrong magic must fail");
+        // Must fail when too short (even with correct magic)
+        bad[0] = SESSION_INIT_MAGIC;
+        bad.truncate(32); // only 32 bytes instead of 129
+        assert!(SessionInit::decode(&bad).is_err(), "truncated SessionInit must fail");
+    }
+
+    #[test]
+    fn session_ack_decode_truncated_fails() {
+        assert!(SessionAck::decode(&[]).is_err());
+        let mut bad = vec![0xFF_u8; 1 + 32 + 64 + 32];
+        assert!(SessionAck::decode(&bad).is_err(), "wrong magic must fail");
+        bad[0] = SESSION_ACK_MAGIC;
+        bad.truncate(32);
+        assert!(SessionAck::decode(&bad).is_err(), "truncated SessionAck must fail");
+    }
+
+    #[test]
+    fn session_init_verify_wrong_body_fails() {
+        let sk = SigningKey::generate(&mut OsRng);
+        let sk2 = SigningKey::generate(&mut OsRng);
+        let x_priv = StaticSecret::random_from_rng(OsRng);
+        let x_pub = X25519PublicKey::from(&x_priv);
+        // Create valid SessionInit
+        let _ = sk2;
+        let init = SessionInit::create(&sk, &x_pub);
+        assert!(init.verify().is_ok(), "valid init must verify");
+        // Tamper with x25519_pub — signature no longer matches
+        let mut bad_init = SessionInit { x25519_pub: [0xFFu8; 32], ..init };
+        assert!(bad_init.verify().is_err(), "tampered x25519_pub must fail verify");
+        // Tamper with ed_pub — signature fails
+        bad_init = SessionInit {
+            x25519_pub: init.x25519_pub,
+            ed_pub: [0xEEu8; 32],
+            ..init
+        };
+        assert!(bad_init.verify().is_err(), "tampered ed_pub must fail verify");
     }
 
     #[test]

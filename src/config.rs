@@ -132,3 +132,137 @@ log_level = "info"
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── default values ────────────────────────────────────────────────────────
+
+    #[test]
+    fn default_listen_is_nonempty() {
+        let v = default_listen();
+        assert!(!v.is_empty(), "default_listen must return at least one address");
+        assert!(v[0].starts_with("tcp://"), "default listen must be a tcp URI");
+    }
+
+    #[test]
+    fn default_tun_name_is_some() {
+        let t = default_tun_name();
+        assert_eq!(t, Some("norn0".to_string()),
+            "default_tun_name must be Some(\"norn0\")");
+    }
+
+    #[test]
+    fn default_admin_socket_is_nonempty() {
+        let s = default_admin_socket();
+        assert_eq!(s, "/var/run/norn.sock",
+            "default_admin_socket must be /var/run/norn.sock");
+    }
+
+    #[test]
+    fn default_true_returns_true() {
+        assert!(default_true(), "default_true must return true, not false");
+    }
+
+    #[test]
+    fn default_multicast_port_nonzero() {
+        let p = default_multicast_port();
+        assert_ne!(p, 0, "multicast port must not be 0");
+        assert_eq!(p, 9001);
+    }
+
+    #[test]
+    fn default_log_level_is_nonempty() {
+        let l = default_log_level();
+        assert_eq!(l, "info", "default_log_level must be \"info\"");
+    }
+
+    // ── signing_key ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn signing_key_from_valid_hex() {
+        let sk = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        let hex = hex::encode(sk.to_bytes());
+        let cfg = NodeConfig { private_key: Some(hex), ..Default::default() };
+        let loaded = cfg.signing_key().unwrap();
+        assert_eq!(loaded.to_bytes(), sk.to_bytes(), "signing key must round-trip via hex");
+    }
+
+    #[test]
+    fn signing_key_invalid_hex_fails() {
+        let cfg = NodeConfig { private_key: Some("not_hex!".into()), ..Default::default() };
+        assert!(cfg.signing_key().is_err(), "invalid hex must fail");
+    }
+
+    #[test]
+    fn signing_key_wrong_length_fails() {
+        // 16 bytes (32 hex chars) — too short
+        let cfg = NodeConfig { private_key: Some("aabbccdd".repeat(4)), ..Default::default() };
+        assert!(cfg.signing_key().is_err(), "wrong-length key must fail");
+    }
+
+    #[test]
+    fn signing_key_none_generates_ephemeral() {
+        let cfg = NodeConfig { private_key: None, ..Default::default() };
+        // Should succeed without error (generates fresh key)
+        assert!(cfg.signing_key().is_ok(), "None private_key must use ephemeral key");
+    }
+
+    // ── tcp_listen_port ───────────────────────────────────────────────────────
+
+    #[test]
+    fn tcp_listen_port_extracts_correctly() {
+        let cfg = NodeConfig {
+            listen: vec!["tcp://0.0.0.0:9001".into()],
+            ..Default::default()
+        };
+        assert_eq!(cfg.tcp_listen_port(), Some(9001));
+    }
+
+    #[test]
+    fn tcp_listen_port_empty_listen_returns_none() {
+        let cfg = NodeConfig { listen: vec![], ..Default::default() };
+        assert_eq!(cfg.tcp_listen_port(), None);
+    }
+
+    #[test]
+    fn tcp_listen_port_non_tcp_returns_none() {
+        let cfg = NodeConfig { listen: vec!["invalid".into()], ..Default::default() };
+        assert_eq!(cfg.tcp_listen_port(), None);
+    }
+
+    // ── generate_toml ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn generate_toml_contains_private_key() {
+        let toml = NodeConfig::generate_toml();
+        assert!(toml.contains("private_key"), "generate_toml must include private_key field");
+        assert!(!toml.is_empty(), "generate_toml must not be empty");
+    }
+
+    #[test]
+    fn generate_toml_is_valid_toml() {
+        let toml_str = NodeConfig::generate_toml();
+        let parsed: Result<NodeConfig, _> = toml::from_str(&toml_str);
+        assert!(parsed.is_ok(), "generate_toml must produce valid TOML: {:?}", parsed);
+    }
+
+    // ── load from file ────────────────────────────────────────────────────────
+
+    #[test]
+    fn load_valid_config() {
+        use std::io::Write;
+        let toml_str = NodeConfig::generate_toml();
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        tmp.write_all(toml_str.as_bytes()).unwrap();
+        let cfg = NodeConfig::load(tmp.path()).unwrap();
+        assert!(cfg.private_key.is_some(), "loaded config must have private_key");
+    }
+
+    #[test]
+    fn load_nonexistent_file_fails() {
+        let result = NodeConfig::load(Path::new("/nonexistent/path/norn.toml"));
+        assert!(result.is_err(), "loading nonexistent file must fail");
+    }
+}

@@ -234,3 +234,96 @@ fn ipv6_string(bytes: &[u8; 16]) -> String {
         groups[4], groups[5], groups[6], groups[7],
     ).to_string()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ed25519_dalek::SigningKey;
+    use rand::rngs::OsRng;
+    use crate::address::address_from_key;
+
+    // ── KeyStore ──────────────────────────────────────────────────────────────
+
+    #[test]
+    fn keystore_register_returns_correct_address() {
+        let sk = SigningKey::generate(&mut OsRng);
+        let pub_key = sk.verifying_key().to_bytes();
+        let expected_addr = address_from_key(&pub_key);
+
+        let mut ks = KeyStore::new();
+        let addr = ks.register(pub_key);
+        assert_eq!(addr, expected_addr,
+            "register must return the address derived from the pub key");
+    }
+
+    #[test]
+    fn keystore_key_for_addr_returns_none_before_register() {
+        let ks = KeyStore::new();
+        let addr = [0u8; 16];
+        assert_eq!(ks.key_for_addr(&addr), None,
+            "unregistered address must return None");
+    }
+
+    #[test]
+    fn keystore_key_for_addr_returns_key_after_register() {
+        let sk = SigningKey::generate(&mut OsRng);
+        let pub_key = sk.verifying_key().to_bytes();
+
+        let mut ks = KeyStore::new();
+        let addr = ks.register(pub_key);
+        let retrieved = ks.key_for_addr(&addr);
+        assert_eq!(retrieved, Some(pub_key),
+            "key_for_addr must return the registered key");
+    }
+
+    #[test]
+    fn keystore_different_keys_different_addresses() {
+        let sk1 = SigningKey::generate(&mut OsRng);
+        let sk2 = SigningKey::generate(&mut OsRng);
+        let pk1 = sk1.verifying_key().to_bytes();
+        let pk2 = sk2.verifying_key().to_bytes();
+
+        let mut ks = KeyStore::new();
+        let addr1 = ks.register(pk1);
+        let addr2 = ks.register(pk2);
+        assert_ne!(addr1, addr2, "different keys must register different addresses");
+        assert_eq!(ks.key_for_addr(&addr1), Some(pk1));
+        assert_eq!(ks.key_for_addr(&addr2), Some(pk2));
+    }
+
+    #[test]
+    fn new_key_store_starts_empty() {
+        let ks = new_key_store();
+        let addr = [0u8; 16];
+        assert_eq!(ks.lock().unwrap().key_for_addr(&addr), None,
+            "new_key_store must start empty");
+    }
+
+    // ── ipv6_string ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn ipv6_string_known_vector() {
+        // All-zero address: ::
+        let zero = [0u8; 16];
+        let s = ipv6_string(&zero);
+        assert_eq!(s, "::", "all-zero address must format as '::'");
+    }
+
+    #[test]
+    fn ipv6_string_loopback() {
+        // ::1 → last byte is 1
+        let mut addr = [0u8; 16];
+        addr[15] = 1;
+        let s = ipv6_string(&addr);
+        assert_eq!(s, "::1");
+    }
+
+    #[test]
+    fn ipv6_string_deterministic() {
+        let addr = [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+        let s1 = ipv6_string(&addr);
+        let s2 = ipv6_string(&addr);
+        assert_eq!(s1, s2);
+        assert!(!s1.is_empty(), "ipv6_string must not return empty string");
+    }
+}

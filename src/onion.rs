@@ -281,4 +281,177 @@ mod tests {
         // Peel with wrong key should fail AEAD authentication
         assert!(packet.peel(&wrong_sk).is_err());
     }
+
+    // ── decode boundary tests (kills < vs == and < vs <= mutations) ───────────
+
+    #[test]
+    fn decode_47_bytes_fails() {
+        // Header = 16 (tag) + 32 (epk) = 48 bytes minimum.
+        // 47 bytes must fail. Mutation `< 48` → `== 48` would not trigger on 47.
+        assert!(OnionPacket::decode(&[0u8; 47]).is_err(),
+            "47 bytes must fail");
+    }
+
+    #[test]
+    fn decode_minimal_valid_packet() {
+        // 48 bytes header + uvarint(0) = 49 bytes for empty aead_payload.
+        let mut data = vec![0u8; 48]; // routing_tag + epk
+        data.push(0u8);               // uvarint(0): empty aead_payload
+        let result = OnionPacket::decode(&data);
+        assert!(result.is_ok(), "49-byte minimal packet must succeed: {:?}", result.err());
+        assert_eq!(result.unwrap().aead_payload.len(), 0);
+    }
+
+    // Kills `< 48 → <= 48` mutation on line 71.
+    // With `< 48`: 48 bytes passes the initial check, then decode_uvarint on empty
+    // slice fails (not "too short"). With `<= 48`: 48 bytes fails as "too short".
+    #[test]
+    fn decode_exactly_48_bytes_fails_at_uvarint_not_too_short() {
+        let data = [0u8; 48]; // exactly the header size, no uvarint byte
+        let err = OnionPacket::decode(&data).unwrap_err().to_string();
+        assert!(!err.contains("too short"),
+            "48-byte input must fail at uvarint parse, not 'too short'; got: {err}");
+    }
+
+    #[test]
+    fn decode_aead_truncated_fails() {
+        // Claims aead_len=100 but provides only 5. Tests inner truncation guard.
+        // Mutation `< pos+aead_len` → `> pos+aead_len` would accept truncated data.
+        let mut data = vec![0u8; 48]; // header
+        encode_uvarint(100, &mut data);
+        data.extend_from_slice(&[0u8; 5]); // only 5 of 100 claimed bytes
+        assert!(OnionPacket::decode(&data).is_err(), "truncated aead must fail");
+    }
+
+    // ── routing_tag must address correct recipient ─────────────────────────────
+
+    #[test]
+    fn build_onion_outer_tag_addresses_first_relay() {
+        let relay_sk = SigningKey::generate(&mut OsRng);
+        let dest_sk  = SigningKey::generate(&mut OsRng);
+        let relay_pub = relay_sk.verifying_key().to_bytes();
+        let dest_pub  = dest_sk.verifying_key().to_bytes();
+        let pkt = build_onion(&[relay_pub], &dest_pub, b"payload".to_vec()).unwrap();
+        assert_eq!(pkt.routing_tag, routing_tag(&relay_pub),
+            "outer routing_tag must address first relay, not destination");
+    }
+
+    #[test]
+    fn build_onion_no_relays_tag_addresses_dest() {
+        let dest_sk = SigningKey::generate(&mut OsRng);
+        let dest_pub = dest_sk.verifying_key().to_bytes();
+        let pkt = build_onion(&[], &dest_pub, b"data".to_vec()).unwrap();
+        assert_eq!(pkt.routing_tag, routing_tag(&dest_pub),
+            "with no relays, outer tag must address dest");
+    }
+
+    // ── peel correctness ──────────────────────────────────────────────────────
+
+    #[test]
+    fn peel_relay_returns_forward_not_deliver() {
+        let relay_sk = SigningKey::generate(&mut OsRng);
+        let dest_sk  = SigningKey::generate(&mut OsRng);
+        let relay_pub = relay_sk.verifying_key().to_bytes();
+        let dest_pub  = dest_sk.verifying_key().to_bytes();
+        let pkt = build_onion(&[relay_pub], &dest_pub, b"data".to_vec()).unwrap();
+        match pkt.peel(&relay_sk).unwrap() {
+            PeeledOnion::Forward(_) => {} // correct
+            PeeledOnion::Deliver(_) => panic!("relay must Forward, not Deliver"),
+        }
+    }
+
+    #[test]
+    fn peel_dest_returns_deliver_not_forward() {
+        let dest_sk  = SigningKey::generate(&mut OsRng);
+        let dest_pub = dest_sk.verifying_key().to_bytes();
+        let payload  = b"exact_payload_bytes".to_vec();
+        let pkt = build_onion(&[], &dest_pub, payload.clone()).unwrap();
+        match pkt.peel(&dest_sk).unwrap() {
+            PeeledOnion::Deliver(bytes) => {
+                assert_eq!(bytes, payload, "Deliver payload must match original");
+            }
+            PeeledOnion::Forward(_) => panic!("dest must Deliver, not Forward"),
+        }
+    }
+
+    // Helper: build an OnionPacket whose decrypted plaintext has `extra` bytes
+    // appended after the declared inner_len bytes. This gives buf.len() > end
+    // after peel(), which triggers the `< → >` mutation on lines 111/119 but
+    // not the original `< end` guard.
+    fn make_onion_with_extra_bytes(
+        receiver_sk: &SigningKey,
+        layer_type: u8,
+        declared_len: usize,
+        actual_content: &[u8],
+    ) -> OnionPacket {
+        let epk_priv = StaticSecret::random_from_rng(OsRng);
+        let epk_pub = X25519PublicKey::from(&epk_priv);
+        let dest_x = ed25519_pub_to_x25519(&receiver_sk.verifying_key().to_bytes()).unwrap();
+        let shared = epk_priv.diffie_hellman(&dest_x);
+
+        let cipher = ChaCha20Poly1305::new(Key::from_slice(shared.as_bytes()));
+        let nonce = Nonce::from([0u8; 12]);
+        let aad = epk_pub.as_bytes();
+
+        // Plaintext: [type | varint(declared_len) | actual_content]
+        // actual_content.len() > declared_len → buf.len() > end after decrypt
+        let mut plaintext = vec![layer_type];
+        encode_uvarint(declared_len as u64, &mut plaintext);
+        plaintext.extend_from_slice(actual_content);
+
+        cipher.encrypt_in_place(&nonce, aad, &mut plaintext).unwrap();
+        OnionPacket { routing_tag: [0u8; 16], epk: *epk_pub.as_bytes(), aead_payload: plaintext }
+    }
+
+    // Kills `< end → > end` mutation on line 111 (ONION_FORWARD branch).
+    // declared_len=5, actual_content=8 bytes → buf.len()=10, end=7 → buf.len() > end.
+    // Original `< end`: 10 < 7? No → OK → Forward(first 5 bytes).
+    // Mutation `> end`: 10 > 7? Yes → bail "truncated" → Err → test fails.
+    #[test]
+    fn peel_forward_with_trailing_bytes_succeeds() {
+        let sk = SigningKey::generate(&mut OsRng);
+        let pkt = make_onion_with_extra_bytes(
+            &sk, ONION_FORWARD, 5, &[0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08],
+        );
+        let result = pkt.peel(&sk);
+        assert!(result.is_ok(),
+            "peel FORWARD with extra trailing bytes must succeed: {:?}", result.err());
+        match result.unwrap() {
+            PeeledOnion::Forward(inner) => assert_eq!(inner.len(), 5,
+                "Forward inner must be exactly declared_len bytes, got {}", inner.len()),
+            PeeledOnion::Deliver(_) => panic!("expected Forward"),
+        }
+    }
+
+    // Kills `< end → > end` mutation on line 119 (ONION_DELIVER branch).
+    #[test]
+    fn peel_deliver_with_trailing_bytes_succeeds() {
+        let sk = SigningKey::generate(&mut OsRng);
+        let pkt = make_onion_with_extra_bytes(
+            &sk, ONION_DELIVER, 4, &[0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF],
+        );
+        let result = pkt.peel(&sk);
+        assert!(result.is_ok(),
+            "peel DELIVER with extra trailing bytes must succeed: {:?}", result.err());
+        match result.unwrap() {
+            PeeledOnion::Deliver(inner) => assert_eq!(inner.len(), 4,
+                "Deliver inner must be exactly declared_len bytes, got {}", inner.len()),
+            PeeledOnion::Forward(_) => panic!("expected Deliver"),
+        }
+    }
+
+    #[test]
+    fn encode_decode_onionpacket_roundtrip() {
+        let pkt = OnionPacket {
+            routing_tag: [0xABu8; 16],
+            epk: [0xCDu8; 32],
+            aead_payload: vec![1, 2, 3, 4, 5],
+        };
+        let enc = pkt.encode();
+        assert_eq!(enc[0], crate::packet::TYPE_ONION, "first byte must be TYPE_ONION");
+        let dec = OnionPacket::decode(&enc[1..]).unwrap();
+        assert_eq!(dec.routing_tag, pkt.routing_tag);
+        assert_eq!(dec.epk, pkt.epk);
+        assert_eq!(dec.aead_payload, pkt.aead_payload);
+    }
 }

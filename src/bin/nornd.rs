@@ -115,3 +115,47 @@ fn format_ipv6(bytes: &[u8; 16]) -> String {
         groups[4], groups[5], groups[6], groups[7],
     ).to_string()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn format_ipv6_loopback() {
+        let mut bytes = [0u8; 16];
+        bytes[15] = 1;
+        assert_eq!(format_ipv6(&bytes), "::1",
+            "loopback address must format as ::1");
+    }
+
+    #[test]
+    fn format_ipv6_all_bytes_set() {
+        // 2001:0db8:85a3:0000:0000:8a2e:0370:7334
+        let bytes: [u8; 16] = [
+            0x20, 0x01, 0x0d, 0xb8,
+            0x85, 0xa3, 0x00, 0x00,
+            0x00, 0x00, 0x8a, 0x2e,
+            0x03, 0x70, 0x73, 0x34,
+        ];
+        let s = format_ipv6(&bytes);
+        // Rust formats this with consecutive-zero compression
+        assert!(s.contains("2001") && s.contains("db8") && s.contains("7334"),
+            "format_ipv6 must return a non-empty IPv6 string, got {:?}", s);
+        assert!(!s.is_empty());
+        assert_ne!(s, "xyzzy", "must not return placeholder string");
+        assert_ne!(s, "", "must not return empty string");
+    }
+
+    #[test]
+    fn format_ipv6_known_address() {
+        // 0200:0000:0000:0000:0000:0000:0000:0001 = 200::1
+        let bytes: [u8; 16] = [
+            0x02, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x01,
+        ];
+        assert_eq!(format_ipv6(&bytes), "200::1",
+            "known address must format to 200::1");
+    }
+}

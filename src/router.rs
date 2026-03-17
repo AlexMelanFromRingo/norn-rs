@@ -1607,3 +1607,770 @@ impl PacketConn {
     }
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── PeerData::effective_cost (kills replace-with-0 and replace-with-1) ───
+
+    #[test]
+    fn peer_effective_cost_uses_lag_and_loss() {
+        let mut rs = make_router();
+        let key = [0xEEu8; 32];
+        add_dummy_peer(&mut rs, key);
+        rs.peers.get_mut(&key).unwrap().lag = Duration::from_micros(50_000); // 50ms
+        rs.peers.get_mut(&key).unwrap().loss_rate = 0.0;
+        let cost = rs.peers[&key].effective_cost();
+        assert_eq!(cost, 50_000,
+            "effective_cost with 0 loss must equal lag_us=50_000; got {} (mutation returns 0 or 1?)", cost);
+    }
+
+    #[test]
+    fn peer_effective_cost_reflects_loss_rate() {
+        let mut rs = make_router();
+        let key = [0xEFu8; 32];
+        add_dummy_peer(&mut rs, key);
+        rs.peers.get_mut(&key).unwrap().lag = Duration::from_millis(100); // 100ms
+        rs.peers.get_mut(&key).unwrap().loss_rate = 1.0;
+        let cost = rs.peers[&key].effective_cost();
+        // effective_cost = 100_000 * (1 + 9) = 1_000_000 µs
+        assert_eq!(cost, 1_000_000,
+            "full-loss effective_cost must be 10× lag; got {}", cost);
+    }
+
+    // ── tree_metric XOR arithmetic (kills ^= → |= and % → / mutations) ───────
+
+    #[test]
+    fn tree_metric_xor_not_or() {
+        // Use pub_key=[0xFF;32] and a seed with a known byte.
+        // XOR: 0xFF ^ seed_byte gives a different result than OR: 0xFF | seed_byte.
+        // XOR with 0xFF flips bits; OR with anything ≤ 0xFF leaves 0xFF unchanged.
+        let key = [0xFFu8; 32];
+        let seed = *b"Verdandi"; // [0x56, 0x65, ...]
+        let metric = tree_metric(&key, &seed);
+        // Correct: 0xFF ^ 0x56 = 0xA9, 0xFF ^ 0x65 = 0x9A
+        assert_eq!(metric[0], 0xFF ^ seed[0],
+            "byte 0: must XOR (not OR); got {:#04x}", metric[0]);
+        assert_eq!(metric[1], 0xFF ^ seed[1],
+            "byte 1: must XOR; got {:#04x}", metric[1]);
+        // |= mutation: 0xFF | 0x56 = 0xFF ≠ 0xA9 → kills mutation
+    }
+
+    #[test]
+    fn tree_metric_seed_index_uses_modulo() {
+        // seed[i % 8] vs seed[i / 8]:
+        // For i=1: %: seed[1], /: seed[0] → if seed[0] != seed[1], results differ.
+        let key = [0u8; 32];
+        let seed = *b"Verdandi"; // seed[0]=0x56, seed[1]=0x65
+        let metric = tree_metric(&key, &seed);
+        // Correct: metric[1] = 0 ^ seed[1] = 0x65
+        assert_eq!(metric[1], seed[1],
+            "byte 1 must use seed[1%8]=seed[1]={:#04x}, not seed[0]={:#04x}; got {:#04x}",
+            seed[1], seed[0], metric[1]);
+        // / mutation: metric[1] = 0 ^ seed[1/8] = 0 ^ seed[0] = 0x56 ≠ 0x65
+    }
+
+    // ── send_to_peer tx_bytes (kills += → *= mutation) ────────────────────────
+
+    #[test]
+    fn send_to_peer_increments_tx_bytes() {
+        let mut rs = make_router();
+        let peer_key = [0xF0u8; 32];
+        let (tx, _rx) = mpsc::channel(64);
+        rs.add_peer(peer_key, tx, 0);
+        assert_eq!(rs.peers[&peer_key].tx_bytes, 0, "tx_bytes starts at 0");
+        let payload = vec![0u8; 100];
+        rs.send_to_peer(&peer_key, payload);
+        assert_eq!(rs.peers[&peer_key].tx_bytes, 100,
+            "tx_bytes must increase by payload length; mutation *=100 gives 0*100=0");
+    }
+
+    // ── effective_cost ────────────────────────────────────────────────────────
+
+    #[test]
+    fn effective_cost_zero_loss_equals_lag() {
+        let lag = Duration::from_millis(50);
+        let cost = effective_cost(lag, 0.0);
+        assert_eq!(cost, lag.as_micros() as u64,
+            "zero loss: cost must equal lag in micros");
+    }
+
+    #[test]
+    fn effective_cost_increases_with_loss() {
+        let lag = Duration::from_millis(10);
+        let cost_no_loss   = effective_cost(lag, 0.0);
+        let cost_half_loss = effective_cost(lag, 0.5);
+        let cost_full_loss = effective_cost(lag, 1.0);
+        assert!(cost_half_loss > cost_no_loss,
+            "half-loss cost ({}) must exceed no-loss cost ({})", cost_half_loss, cost_no_loss);
+        assert!(cost_full_loss > cost_half_loss,
+            "full-loss cost ({}) must exceed half-loss cost ({})", cost_full_loss, cost_half_loss);
+    }
+
+    #[test]
+    fn effective_cost_full_loss_is_10x_lag() {
+        let lag = Duration::from_millis(100);
+        let cost = effective_cost(lag, 1.0);
+        // formula: lag_us * (1 + 1.0 * 9) = lag_us * 10
+        let expected = lag.as_micros() as u64 * 10;
+        assert_eq!(cost, expected, "full loss must give 10× base cost");
+    }
+
+    // ── metric_less ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn metric_less_orders_correctly() {
+        let low  = [0u8; 32];
+        let high = [0xFF_u8; 32];
+        assert!(metric_less(&low, &high), "low < high must be true");
+        assert!(!metric_less(&high, &low), "high < low must be false");
+        assert!(!metric_less(&low, &low), "equal values must not satisfy <");
+    }
+
+    // ── tree_metric ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn tree_metric_deterministic() {
+        let key  = [0xABu8; 32];
+        let seed = [0u8; 8];
+        assert_eq!(tree_metric(&key, &seed), tree_metric(&key, &seed));
+    }
+
+    #[test]
+    fn tree_metric_differs_with_seed() {
+        let key   = [0xABu8; 32];
+        let seed0 = [0u8; 8];
+        let seed1 = *b"Verdandi";
+        assert_ne!(tree_metric(&key, &seed0), tree_metric(&key, &seed1),
+            "different seeds must give different metrics");
+    }
+
+    #[test]
+    fn tree_metric_xor_identity_with_zero_seed() {
+        let key  = [0xABu8; 32];
+        let seed = [0u8; 8];
+        // XOR with all-zero seed is identity
+        assert_eq!(tree_metric(&key, &seed), key);
+    }
+
+    // ── pad_payload / unpad_payload ───────────────────────────────────────────
+
+    #[test]
+    fn pad_unpad_roundtrip() {
+        for len in [0, 1, 128, 255, 256, 257, 512, 1000] {
+            let data: Vec<u8> = (0..len).map(|i| i as u8).collect();
+            let padded = pad_payload(&data);
+            let unpadded = unpad_payload(&padded).expect("unpad must succeed");
+            assert_eq!(unpadded, data, "roundtrip failed for len={}", len);
+        }
+    }
+
+    #[test]
+    fn pad_payload_result_is_multiple_of_block() {
+        for len in [0usize, 1, 255, 256, 257] {
+            let data = vec![0u8; len];
+            let padded = pad_payload(&data);
+            assert_eq!(padded.len() % PAD_BLOCK, 0,
+                "padded length must be multiple of {}, got {} for input len {}", PAD_BLOCK, padded.len(), len);
+        }
+    }
+
+    #[test]
+    fn pad_payload_minimum_size() {
+        // Even empty input must produce at least PAD_BLOCK bytes
+        let padded = pad_payload(&[]);
+        assert_eq!(padded.len(), PAD_BLOCK);
+    }
+
+    #[test]
+    fn unpad_too_short_fails() {
+        assert!(unpad_payload(&[]).is_err());
+        assert!(unpad_payload(&[0u8]).is_err());
+        // Claims length 100 but only has 10 bytes total (2 header + 8 data)
+        let mut bad = vec![0u8, 100u8];
+        bad.extend_from_slice(&[0u8; 8]);
+        assert!(unpad_payload(&bad).is_err());
+    }
+
+    #[test]
+    fn unpad_exactly_two_bytes_succeeds_with_zero_len() {
+        // [0, 0] → orig_len=0, need padded.len() >= 2+0=2. Exactly satisfied.
+        // Mutation `< with <=` (line 189): `2 <= 2` → would wrongly fail this.
+        let result = unpad_payload(&[0u8, 0u8]);
+        assert!(result.is_ok(), "exactly 2 bytes (orig_len=0) must succeed: {:?}", result.err());
+        assert_eq!(result.unwrap(), Vec::<u8>::new());
+    }
+
+    #[test]
+    fn unpad_exactly_at_data_boundary_succeeds() {
+        // padded = [5, 0, A, B, C, D, E] — exactly 2 + 5 = 7 bytes.
+        // Mutation `< with <=` (line 193): `7 <= 2+5=7` → would wrongly fail.
+        let padded = vec![5u8, 0u8, 0xAu8, 0xBu8, 0xCu8, 0xDu8, 0xEu8];
+        let result = unpad_payload(&padded);
+        assert!(result.is_ok(), "exactly-at-boundary unpad must succeed: {:?}", result.err());
+        assert_eq!(result.unwrap(), vec![0xAu8, 0xBu8, 0xCu8, 0xDu8, 0xEu8]);
+    }
+
+    #[test]
+    fn unpad_one_byte_short_of_data_fails() {
+        // padded = [5, 0, A, B, C, D] — only 6 bytes but claims orig_len=5 (needs 7).
+        let padded = vec![5u8, 0u8, 0xAu8, 0xBu8, 0xCu8, 0xDu8];
+        assert!(unpad_payload(&padded).is_err(),
+            "one byte short of claimed data length must fail");
+    }
+
+    // ── pad_payload length encoding uses correct byte order ───────────────────
+
+    #[test]
+    fn pad_payload_encodes_length_le() {
+        let data = vec![0x42u8; 300];
+        let padded = pad_payload(&data);
+        // First 2 bytes: orig_len as LE u16
+        let encoded_len = (padded[0] as usize) | ((padded[1] as usize) << 8);
+        assert_eq!(encoded_len, 300, "length must be 300 in LE");
+    }
+
+    // ── Test helpers ─────────────────────────────────────────────────────────
+
+    fn make_router() -> RouterState {
+        let sk = SigningKey::generate(&mut OsRng);
+        let (tx, _rx) = mpsc::channel(32);
+        RouterState::new(sk, tx)
+    }
+
+    fn add_dummy_peer(rs: &mut RouterState, key: PeerId) {
+        let (tx, _rx) = mpsc::channel(32);
+        rs.add_peer(key, tx, 0);
+    }
+
+    fn make_valid_sig_res(
+        peer_sk: &SigningKey,
+        own_pub: &[u8; 32],
+        seq: u64,
+        timestamp_ms: u64,
+    ) -> SigRes {
+        use ed25519_dalek::Signer;
+        let mut sign_data = vec![0u8]; // tree_id = 0
+        let mut tmp = Vec::new();
+        encode_uvarint(seq, &mut tmp);
+        sign_data.extend_from_slice(&tmp);
+        tmp.clear();
+        encode_uvarint(timestamp_ms, &mut tmp);
+        sign_data.extend_from_slice(&tmp);
+        sign_data.extend_from_slice(own_pub);
+        let signature = peer_sk.sign(&sign_data).to_bytes();
+        SigRes {
+            tree_id: 0,
+            seq,
+            timestamp_ms,
+            signature,
+            pub_key: peer_sk.verifying_key().to_bytes(),
+        }
+    }
+
+    // ── update_landmarks ──────────────────────────────────────────────────────
+
+    #[test]
+    fn landmarks_self_not_set_with_two_peers() {
+        let mut rs = make_router();
+        add_dummy_peer(&mut rs, [1u8; 32]);
+        add_dummy_peer(&mut rs, [2u8; 32]);
+        rs.update_landmarks();
+        assert!(!rs.landmarks.contains(&rs.pub_key),
+            "self must NOT be a landmark with only 2 peers (need > 2)");
+    }
+
+    #[test]
+    fn landmarks_self_set_with_three_peers() {
+        let mut rs = make_router();
+        add_dummy_peer(&mut rs, [1u8; 32]);
+        add_dummy_peer(&mut rs, [2u8; 32]);
+        add_dummy_peer(&mut rs, [3u8; 32]);
+        rs.update_landmarks();
+        assert!(rs.landmarks.contains(&rs.pub_key),
+            "self must be a landmark with 3 peers (> 2)");
+    }
+
+    #[test]
+    fn landmarks_peer_at_depth_zero_marked() {
+        let mut rs = make_router();
+        let peer_key = [0xAAu8; 32];
+        add_dummy_peer(&mut rs, peer_key);
+        // Depth 0 → landmark
+        rs.peers.get_mut(&peer_key).unwrap().trees[0] = Some(TreeAnnounce {
+            root: [0u8; 32],
+            path_cost: 0,
+            received_at: Instant::now(),
+            depth: 0,
+        });
+        rs.update_landmarks();
+        assert!(rs.landmarks.contains(&peer_key), "depth-0 peer must become a landmark");
+    }
+
+    #[test]
+    fn landmarks_peer_at_depth_two_not_marked() {
+        let mut rs = make_router();
+        let peer_key = [0xBBu8; 32];
+        add_dummy_peer(&mut rs, peer_key);
+        // Depth 2 (> 1) → NOT a landmark by heuristic
+        rs.peers.get_mut(&peer_key).unwrap().trees[0] = Some(TreeAnnounce {
+            root: [0u8; 32],
+            path_cost: 0,
+            received_at: Instant::now(),
+            depth: 2,
+        });
+        rs.update_landmarks();
+        assert!(!rs.landmarks.contains(&peer_key), "depth-2 peer must NOT be a landmark");
+    }
+
+    // ── remove_peer clears tree parent ────────────────────────────────────────
+
+    #[test]
+    fn remove_peer_clears_tree_parent() {
+        let mut rs = make_router();
+        let peer_key = [42u8; 32];
+        add_dummy_peer(&mut rs, peer_key);
+        let own_key = rs.pub_key;
+        // Manually set all tree parents to the removed peer
+        for i in 0..K {
+            rs.trees[i].parent = Some(peer_key);
+            rs.trees[i].root = peer_key;
+            rs.trees[i].parent_cost = 1000;
+        }
+        rs.remove_peer(&peer_key);
+        for i in 0..K {
+            assert!(rs.trees[i].parent.is_none(), "tree[{}] parent must be cleared", i);
+            assert_eq!(rs.trees[i].root, own_key, "tree[{}] root must reset to self", i);
+            assert_eq!(rs.trees[i].parent_cost, 0, "tree[{}] parent_cost must reset to 0", i);
+        }
+        assert!(!rs.peers.contains_key(&peer_key));
+    }
+
+    #[test]
+    fn remove_peer_does_not_clear_unrelated_parent() {
+        let mut rs = make_router();
+        let peer_a = [10u8; 32];
+        let peer_b = [20u8; 32];
+        add_dummy_peer(&mut rs, peer_a);
+        add_dummy_peer(&mut rs, peer_b);
+        // Parent is peer_b; we remove peer_a
+        rs.trees[0].parent = Some(peer_b);
+        rs.trees[0].root = [0xBBu8; 32];
+        rs.trees[0].parent_cost = 500;
+        rs.remove_peer(&peer_a);
+        assert_eq!(rs.trees[0].parent, Some(peer_b), "unrelated parent must not be cleared");
+        assert_eq!(rs.trees[0].parent_cost, 500, "parent_cost must not change");
+    }
+
+    // ── fix_tree ──────────────────────────────────────────────────────────────
+
+    #[test]
+    fn fix_tree_is_own_root_with_no_peers() {
+        let mut rs = make_router();
+        let own_key = rs.pub_key;
+        rs.fix_tree(0);
+        assert!(rs.trees[0].parent.is_none(), "no peers: must have no parent");
+        assert_eq!(rs.trees[0].root, own_key, "no peers: root must be self");
+        assert_eq!(rs.trees[0].parent_cost, 0);
+    }
+
+    #[test]
+    fn fix_tree_selects_peer_with_lower_cost() {
+        let mut rs = make_router();
+        let peer_a = [0x11u8; 32];
+        let peer_b = [0x22u8; 32];
+        add_dummy_peer(&mut rs, peer_a);
+        add_dummy_peer(&mut rs, peer_b);
+        // Both announce the same root [0;32] (very small metric — beats any random pub_key)
+        let root = [0u8; 32];
+        rs.peers.get_mut(&peer_a).unwrap().trees[0] = Some(TreeAnnounce {
+            root,
+            path_cost: 10_000,
+            received_at: Instant::now(),
+            depth: 1,
+        });
+        rs.peers.get_mut(&peer_a).unwrap().lag = Duration::from_micros(10_000);
+        rs.peers.get_mut(&peer_b).unwrap().trees[0] = Some(TreeAnnounce {
+            root,
+            path_cost: 1_000,
+            received_at: Instant::now(),
+            depth: 1,
+        });
+        rs.peers.get_mut(&peer_b).unwrap().lag = Duration::from_micros(1_000);
+        // peer_a total = 10_000 + 10_000 = 20_000 µs
+        // peer_b total = 1_000 + 1_000 = 2_000 µs → winner
+        rs.fix_tree(0);
+        assert_eq!(rs.trees[0].parent, Some(peer_b), "must select lower-cost peer");
+        assert_eq!(rs.trees[0].root, root);
+    }
+
+    #[test]
+    fn fix_tree_adopts_peer_with_better_root_metric() {
+        let mut rs = make_router();
+        let peer_key = [0x55u8; 32];
+        add_dummy_peer(&mut rs, peer_key);
+        // Root [0;32] has metric [0;32] — minimum, beats any random pub_key
+        rs.peers.get_mut(&peer_key).unwrap().trees[0] = Some(TreeAnnounce {
+            root: [0u8; 32],
+            path_cost: 0,
+            received_at: Instant::now(),
+            depth: 1,
+        });
+        rs.peers.get_mut(&peer_key).unwrap().lag = Duration::from_micros(1_000);
+        rs.fix_tree(0);
+        // Our pub_key is almost certainly > [0;32], so we should adopt peer_key as parent
+        if rs.pub_key != [0u8; 32] {
+            assert_eq!(rs.trees[0].parent, Some(peer_key),
+                "peer with better root metric must be selected as parent");
+            assert_eq!(rs.trees[0].root, [0u8; 32]);
+        }
+    }
+
+    #[test]
+    fn fix_tree_ignores_expired_announces() {
+        let mut rs = make_router();
+        let peer_key = [0x77u8; 32];
+        add_dummy_peer(&mut rs, peer_key);
+        let own_key = rs.pub_key;
+        // Announce received far in the past (expired)
+        rs.peers.get_mut(&peer_key).unwrap().trees[0] = Some(TreeAnnounce {
+            root: [0u8; 32],
+            path_cost: 0,
+            received_at: Instant::now() - ANNOUNCE_EXPIRY - Duration::from_secs(1),
+            depth: 1,
+        });
+        rs.fix_tree(0);
+        // Expired announce must be ignored; we stay as own root
+        assert!(rs.trees[0].parent.is_none(), "expired announce must be ignored");
+        assert_eq!(rs.trees[0].root, own_key, "must remain own root");
+    }
+
+    // ── expire_peers ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn expire_peers_removes_timed_out_peer() {
+        let mut rs = make_router();
+        let peer_key = [5u8; 32];
+        add_dummy_peer(&mut rs, peer_key);
+        // Set last_rx_time past the timeout threshold
+        rs.peers.get_mut(&peer_key).unwrap().last_rx_time =
+            Instant::now() - PEER_TIMEOUT - Duration::from_secs(1);
+        rs.expire_peers();
+        assert!(!rs.peers.contains_key(&peer_key), "timed-out peer must be removed");
+    }
+
+    #[test]
+    fn expire_peers_keeps_active_peer() {
+        let mut rs = make_router();
+        let peer_key = [6u8; 32];
+        add_dummy_peer(&mut rs, peer_key);
+        // last_rx_time is Instant::now() by default
+        rs.expire_peers();
+        assert!(rs.peers.contains_key(&peer_key), "active peer must not be expired");
+    }
+
+    #[test]
+    fn expire_peers_boundary_just_before_timeout() {
+        let mut rs = make_router();
+        let peer_key = [11u8; 32];
+        add_dummy_peer(&mut rs, peer_key);
+        // One second before timeout → must NOT be removed
+        rs.peers.get_mut(&peer_key).unwrap().last_rx_time =
+            Instant::now() - PEER_TIMEOUT + Duration::from_secs(1);
+        rs.expire_peers();
+        assert!(rs.peers.contains_key(&peer_key), "peer just before timeout must not be removed");
+    }
+
+    // ── send_keepalives loss rate ──────────────────────────────────────────────
+
+    #[test]
+    fn keepalive_unanswered_increases_loss_rate_from_half() {
+        let mut rs = make_router();
+        let peer_key = [7u8; 32];
+        let (tx, _rx) = mpsc::channel(64);
+        rs.add_peer(peer_key, tx, 0);
+        rs.peers.get_mut(&peer_key).unwrap().loss_rate = 0.5;
+        // Simulate a pending unanswered request
+        rs.peers.get_mut(&peer_key).unwrap().pending_sig_req_time = Some((1, Instant::now()));
+        rs.send_keepalives();
+        let new_loss = rs.peers[&peer_key].loss_rate;
+        // Expected: 0.5 * 0.875 + 0.125 = 0.5625
+        assert!((new_loss - 0.5625_f32).abs() < 1e-5,
+            "unanswered keepalive from 0.5: expected 0.5625, got {}", new_loss);
+    }
+
+    #[test]
+    fn keepalive_first_unanswered_sets_loss_to_eighth() {
+        let mut rs = make_router();
+        let peer_key = [8u8; 32];
+        let (tx, _rx) = mpsc::channel(64);
+        rs.add_peer(peer_key, tx, 0);
+        // loss_rate starts at 0, pending request present
+        rs.peers.get_mut(&peer_key).unwrap().pending_sig_req_time = Some((1, Instant::now()));
+        rs.send_keepalives();
+        let new_loss = rs.peers[&peer_key].loss_rate;
+        // Expected: 0.0 * 0.875 + 0.125 = 0.125
+        assert!((new_loss - 0.125_f32).abs() < 1e-5,
+            "first unanswered: expected loss_rate 0.125, got {}", new_loss);
+    }
+
+    #[test]
+    fn keepalive_seq_increments() {
+        let mut rs = make_router();
+        let peer_key = [9u8; 32];
+        let (tx, _rx) = mpsc::channel(64);
+        rs.add_peer(peer_key, tx, 0);
+        let initial_seq = rs.peers[&peer_key].sig_req_seq;
+        rs.send_keepalives();
+        let new_seq = rs.peers[&peer_key].sig_req_seq;
+        assert_eq!(new_seq, initial_seq + 1, "sig_req_seq must increment by 1");
+    }
+
+    #[test]
+    fn keepalive_sets_pending_sig_req() {
+        let mut rs = make_router();
+        let peer_key = [12u8; 32];
+        let (tx, _rx) = mpsc::channel(64);
+        rs.add_peer(peer_key, tx, 0);
+        assert!(rs.peers[&peer_key].pending_sig_req_time.is_none());
+        rs.send_keepalives();
+        assert!(rs.peers[&peer_key].pending_sig_req_time.is_some(),
+            "pending_sig_req_time must be set after send_keepalives");
+    }
+
+    // ── handle_sig_res EWMA ───────────────────────────────────────────────────
+
+    #[test]
+    fn sig_res_decays_lag_ewma() {
+        let mut rs = make_router();
+        let peer_sk = SigningKey::generate(&mut OsRng);
+        let peer_key = peer_sk.verifying_key().to_bytes();
+        let (tx, _rx) = mpsc::channel(64);
+        rs.add_peer(peer_key, tx, 0);
+        let own_pub = rs.pub_key;
+        // Initial lag = 80ms, RTT near 0 → new_lag ≈ 0
+        rs.peers.get_mut(&peer_key).unwrap().lag = Duration::from_micros(80_000);
+        rs.peers.get_mut(&peer_key).unwrap().loss_rate = 0.5;
+        let seq = 1u64;
+        rs.peers.get_mut(&peer_key).unwrap().pending_sig_req_time = Some((seq, Instant::now()));
+        rs.peers.get_mut(&peer_key).unwrap().sig_req_seq = seq;
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let res = make_valid_sig_res(&peer_sk, &own_pub, seq, now_ms);
+        rs.handle_sig_res(peer_key, res);
+        let peer = &rs.peers[&peer_key];
+        // lag = old * 7/8 + new/8 ≈ 80_000 * 7/8 = 70_000 µs (new ≈ 0)
+        assert!(peer.lag < Duration::from_micros(80_000), "lag must decrease toward new measurement");
+        assert!(peer.lag > Duration::from_micros(50_000), "lag must not drop too fast");
+        // loss_rate must decay: 0.5 * 0.875 = 0.4375
+        assert!(peer.loss_rate < 0.5, "loss_rate must decay on successful ACK");
+        assert!(peer.loss_rate > 0.4, "loss_rate must not drop too fast");
+    }
+
+    #[test]
+    fn sig_res_loss_rate_decays_exactly() {
+        let mut rs = make_router();
+        let peer_sk = SigningKey::generate(&mut OsRng);
+        let peer_key = peer_sk.verifying_key().to_bytes();
+        let (tx, _rx) = mpsc::channel(64);
+        rs.add_peer(peer_key, tx, 0);
+        let own_pub = rs.pub_key;
+        rs.peers.get_mut(&peer_key).unwrap().loss_rate = 1.0;
+        let seq = 2u64;
+        rs.peers.get_mut(&peer_key).unwrap().pending_sig_req_time = Some((seq, Instant::now()));
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let res = make_valid_sig_res(&peer_sk, &own_pub, seq, now_ms);
+        rs.handle_sig_res(peer_key, res);
+        let new_loss = rs.peers[&peer_key].loss_rate;
+        // loss_rate *= 0.875: 1.0 * 0.875 = 0.875
+        assert!((new_loss - 0.875_f32).abs() < 1e-5,
+            "loss_rate after successful ACK from 1.0 must be 0.875, got {}", new_loss);
+    }
+
+    #[test]
+    fn sig_res_wrong_seq_does_not_update_lag() {
+        let mut rs = make_router();
+        let peer_sk = SigningKey::generate(&mut OsRng);
+        let peer_key = peer_sk.verifying_key().to_bytes();
+        let (tx, _rx) = mpsc::channel(64);
+        rs.add_peer(peer_key, tx, 0);
+        let own_pub = rs.pub_key;
+        rs.peers.get_mut(&peer_key).unwrap().lag = Duration::from_micros(80_000);
+        // pending seq = 5, response has seq = 6 → no match
+        rs.peers.get_mut(&peer_key).unwrap().pending_sig_req_time = Some((5, Instant::now()));
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let res = make_valid_sig_res(&peer_sk, &own_pub, 6, now_ms);
+        rs.handle_sig_res(peer_key, res);
+        assert_eq!(rs.peers[&peer_key].lag, Duration::from_micros(80_000),
+            "wrong-seq response must not update lag");
+    }
+
+    // ── cuckoo_do_maintenance generation ──────────────────────────────────────
+
+    #[test]
+    fn cuckoo_generation_increments_at_tick_multiple() {
+        let mut rs = make_router();
+        assert_eq!(rs.cuckoo_generation[0], 0);
+        rs.tick = CUCKOO_GEN_TICKS;
+        rs.cuckoo_do_maintenance(0);
+        assert_eq!(rs.cuckoo_generation[0], 1, "generation must increment at CUCKOO_GEN_TICKS");
+    }
+
+    #[test]
+    fn cuckoo_generation_does_not_increment_at_tick_zero() {
+        let mut rs = make_router();
+        rs.tick = 0;
+        rs.cuckoo_do_maintenance(0);
+        assert_eq!(rs.cuckoo_generation[0], 0, "tick=0 must NOT increment generation");
+    }
+
+    #[test]
+    fn cuckoo_generation_does_not_increment_at_non_multiple() {
+        let mut rs = make_router();
+        rs.tick = CUCKOO_GEN_TICKS - 1;
+        rs.cuckoo_do_maintenance(0);
+        assert_eq!(rs.cuckoo_generation[0], 0, "non-multiple tick must not increment generation");
+    }
+
+    #[test]
+    fn cuckoo_generation_increments_all_three_trees_independently() {
+        let mut rs = make_router();
+        rs.tick = CUCKOO_GEN_TICKS;
+        for i in 0..K {
+            rs.cuckoo_do_maintenance(i);
+        }
+        for i in 0..K {
+            assert_eq!(rs.cuckoo_generation[i], 1, "tree {} generation must be 1", i);
+        }
+    }
+
+    // ── handle_cuckoo generation tracking ────────────────────────────────────
+
+    #[test]
+    fn handle_cuckoo_advances_generation_on_newer_msg() {
+        let mut rs = make_router();
+        let peer_key = [0xC0u8; 32];
+        add_dummy_peer(&mut rs, peer_key);
+        assert_eq!(rs.peers[&peer_key].peer_cuckoo_gen[0], 0);
+        let data = [0u8; crate::cuckoo::FILTER_BYTES];
+        let msg = CuckooMsg { tree_id: 0, generation: 1, data };
+        rs.handle_cuckoo(peer_key, msg);
+        assert_eq!(rs.peers[&peer_key].peer_cuckoo_gen[0], 1,
+            "generation must advance when msg.generation > current");
+    }
+
+    #[test]
+    fn handle_cuckoo_does_not_regress_generation() {
+        let mut rs = make_router();
+        let peer_key = [0xC1u8; 32];
+        add_dummy_peer(&mut rs, peer_key);
+        rs.peers.get_mut(&peer_key).unwrap().peer_cuckoo_gen[0] = 5;
+        let data = [0u8; crate::cuckoo::FILTER_BYTES];
+        // Old generation msg
+        let msg = CuckooMsg { tree_id: 0, generation: 3, data };
+        rs.handle_cuckoo(peer_key, msg);
+        // Generation must NOT regress to 3
+        assert_eq!(rs.peers[&peer_key].peer_cuckoo_gen[0], 5,
+            "old generation message must not overwrite newer generation counter");
+    }
+
+    #[test]
+    fn handle_cuckoo_same_generation_does_not_advance() {
+        let mut rs = make_router();
+        let peer_key = [0xC2u8; 32];
+        add_dummy_peer(&mut rs, peer_key);
+        rs.peers.get_mut(&peer_key).unwrap().peer_cuckoo_gen[0] = 7;
+        let data = [0u8; crate::cuckoo::FILTER_BYTES];
+        let msg = CuckooMsg { tree_id: 0, generation: 7, data }; // same
+        rs.handle_cuckoo(peer_key, msg);
+        assert_eq!(rs.peers[&peer_key].peer_cuckoo_gen[0], 7,
+            "equal-generation message must not advance counter");
+    }
+
+    // ── cleanup_stale_lookups ─────────────────────────────────────────────────
+
+    #[test]
+    fn cleanup_stale_lookups_removes_old_entries() {
+        let mut rs = make_router();
+        rs.pending_lookups.insert(42u64, Instant::now() - Duration::from_secs(11));
+        rs.pending_lookups.insert(43u64, Instant::now());
+        rs.cleanup_stale_lookups();
+        assert!(!rs.pending_lookups.contains_key(&42), "entry older than 10s must be removed");
+        assert!(rs.pending_lookups.contains_key(&43), "fresh entry must be kept");
+    }
+
+    #[test]
+    fn cleanup_stale_lookups_keeps_boundary_entry() {
+        let mut rs = make_router();
+        // Exactly 9 seconds old → must be kept (< 10s)
+        rs.pending_lookups.insert(99u64, Instant::now() - Duration::from_secs(9));
+        rs.cleanup_stale_lookups();
+        assert!(rs.pending_lookups.contains_key(&99),
+            "entry 9s old (< 10s threshold) must be kept");
+    }
+
+    // ── lookup XOR fallback ───────────────────────────────────────────────────
+
+    #[test]
+    fn lookup_xor_fallback_returns_xor_closest_peer() {
+        let mut rs = make_router();
+        let dst = [0xFFu8; 32];
+        // peer_a XOR dst = [0xFE^0xFF; 32] = [0x01;32] — small distance
+        let peer_a = [0xFEu8; 32];
+        // peer_b XOR dst = [0x00^0xFF; 32] = [0xFF;32] — large distance
+        let peer_b = [0x00u8; 32];
+        add_dummy_peer(&mut rs, peer_a);
+        add_dummy_peer(&mut rs, peer_b);
+        // No coords, no cuckoo entries → falls through to XOR fallback
+        let result = rs.lookup(&dst);
+        assert_eq!(result, Some(peer_a), "XOR fallback must select closest peer");
+    }
+
+    #[test]
+    fn lookup_returns_none_with_no_peers() {
+        let rs = make_router();
+        assert!(rs.lookup(&[1u8; 32]).is_none(), "empty router must return None");
+    }
+
+    #[test]
+    fn lookup_cuckoo_filter_hit_routes_to_matching_peer() {
+        let mut rs = make_router();
+        let dst = [0x42u8; 32];
+        let peer_key = [0x10u8; 32];
+        add_dummy_peer(&mut rs, peer_key);
+        // Add dst routing_tag to peer's cuckoo filter
+        let tag = routing_tag(&dst);
+        rs.peers.get_mut(&peer_key).unwrap().cuckoo[0].add(&tag);
+        let result = rs.lookup(&dst);
+        assert_eq!(result, Some(peer_key), "cuckoo filter hit must route to matching peer");
+    }
+
+    // ── encrypt_header / decrypt_source round-trip ───────────────────────────
+
+    #[test]
+    fn encrypt_header_decrypt_source_roundtrip() {
+        let sk = SigningKey::generate(&mut OsRng);
+        let src = [0xAAu8; 32];
+        let dst = sk.verifying_key().to_bytes();
+        let (header, _tag) = encrypt_header(&src, &dst);
+        let recovered = decrypt_source_from_header(&header, &sk);
+        assert_eq!(recovered, Some(src), "decrypted source must match original");
+    }
+
+    #[test]
+    fn routing_tag_in_encrypt_header_matches_standalone() {
+        let src = [0x11u8; 32];
+        let dst = [0x22u8; 32];
+        let (_header, tag) = encrypt_header(&src, &dst);
+        assert_eq!(tag, routing_tag(&dst), "tag from encrypt_header must match routing_tag(dst)");
+    }
+}

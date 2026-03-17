@@ -129,3 +129,44 @@ pub async fn dial(uri: &str, conn: Arc<PacketConn>, connected: ConnectedPeers) {
         delay = (delay * 2).min(std::time::Duration::from_secs(60));
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── parse_tcp_uri ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn parse_tcp_uri_valid() {
+        let addr = parse_tcp_uri("tcp://1.2.3.4:9001").unwrap();
+        assert_eq!(addr, "1.2.3.4:9001", "must strip tcp:// prefix");
+    }
+
+    #[test]
+    fn parse_tcp_uri_ipv6() {
+        let addr = parse_tcp_uri("tcp://[::1]:9001").unwrap();
+        assert_eq!(addr, "[::1]:9001");
+    }
+
+    #[test]
+    fn parse_tcp_uri_wrong_scheme_fails() {
+        assert!(parse_tcp_uri("udp://1.2.3.4:9001").is_err(),
+            "non-tcp URI must fail");
+    }
+
+    #[test]
+    fn parse_tcp_uri_empty_fails() {
+        assert!(parse_tcp_uri("").is_err());
+    }
+
+    #[test]
+    fn parse_tcp_uri_no_scheme_fails() {
+        assert!(parse_tcp_uri("1.2.3.4:9001").is_err());
+    }
+
+    #[test]
+    fn parse_tcp_uri_preserves_hostname() {
+        let addr = parse_tcp_uri("tcp://peer.example.com:9001").unwrap();
+        assert_eq!(addr, "peer.example.com:9001");
+    }
+}

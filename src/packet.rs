@@ -626,4 +626,487 @@ mod tests {
         assert_eq!(dec.generation, 42);
         assert_eq!(dec.data, data);
     }
+
+    // ── SigReq ───────────────────────────────────────────────────────────────
+
+    #[test]
+    fn sigreq_roundtrip_all_fields() {
+        let req = SigReq {
+            tree_id: 2,
+            seq: 0xDEAD_BEEF,
+            timestamp_ms: 1_700_000_000_123,
+            pub_key: [0xABu8; 32],
+        };
+        let enc = req.encode();
+        assert_eq!(enc[0], SIG_REQ);
+        let dec = SigReq::decode(&enc[1..]).unwrap();
+        assert_eq!(dec.tree_id, req.tree_id);
+        assert_eq!(dec.seq, req.seq);
+        assert_eq!(dec.timestamp_ms, req.timestamp_ms);
+        assert_eq!(dec.pub_key, req.pub_key);
+    }
+
+    #[test]
+    fn sigreq_decode_truncated_fails() {
+        // Empty / too-short data must error
+        assert!(SigReq::decode(&[]).is_err());
+        assert!(SigReq::decode(&[0u8; 1]).is_err());
+        // tree_id byte present but no pub_key
+        assert!(SigReq::decode(&[0u8, 1, 1]).is_err());
+    }
+
+    // Kills `< 2 → <= 2` mutation on line 135.
+    // With original `< 2`: 2-byte input passes the initial check and fails later
+    // with "missing pub_key". With `<= 2`: 2-byte input fails at "too short".
+    // A 2-byte input [tree_id=0, seq_varint=0] fails either way, but the error
+    // message distinguishes the mutation.
+    #[test]
+    fn sigreq_decode_2_bytes_fails_at_pubkey_not_too_short() {
+        // [tree_id=0, seq_uvarint=0] → 2 bytes. Both seq and timestamp parse as 0
+        // (pos reaches 3 after parsing 1-byte seq and 1-byte timestamp from a 2-byte slice
+        // — actually with data=[0,0]: data[0]=tree_id, data[1..]=seq. seq=0 (n=1), pos=2.
+        // timestamp: data[2..] is empty → decode_uvarint on empty → error.
+        // Either way, error must NOT be "too short".
+        let err = SigReq::decode(&[0u8; 2]).unwrap_err().to_string();
+        assert!(!err.contains("too short"),
+            "2-byte SigReq must fail at seq/ts/pubkey parse, not 'too short'; got: {err}");
+    }
+
+    // ── SigRes ───────────────────────────────────────────────────────────────
+
+    #[test]
+    fn sigres_roundtrip_all_fields() {
+        let res = SigRes {
+            tree_id: 1,
+            seq: 999,
+            timestamp_ms: 42_000,
+            signature: [0x5Au8; 64],
+            pub_key: [0x3Cu8; 32],
+        };
+        let enc = res.encode();
+        assert_eq!(enc[0], SIG_RES);
+        let dec = SigRes::decode(&enc[1..]).unwrap();
+        assert_eq!(dec.tree_id, res.tree_id);
+        assert_eq!(dec.seq, res.seq);
+        assert_eq!(dec.timestamp_ms, res.timestamp_ms);
+        assert_eq!(dec.signature, res.signature);
+        assert_eq!(dec.pub_key, res.pub_key);
+    }
+
+    #[test]
+    fn sigres_decode_truncated_fails() {
+        assert!(SigRes::decode(&[]).is_err());
+        assert!(SigRes::decode(&[0u8, 1, 1]).is_err()); // missing sig + key
+    }
+
+    // Kills `< 2 → <= 2` mutation on line 173 (SigRes).
+    #[test]
+    fn sigres_decode_2_bytes_fails_at_parse_not_too_short() {
+        let err = SigRes::decode(&[0u8; 2]).unwrap_err().to_string();
+        assert!(!err.contains("too short"),
+            "2-byte SigRes must fail at seq/ts/sig parse, not 'too short'; got: {err}");
+    }
+
+    // Kills `64 + 32 → 64 - 32 = 32` mutation on line 182.
+    // With mutation: data.len() < pos + 32 instead of pos + 96. An input with
+    // exactly a signature (64 bytes) but no pub_key passes the mutated check
+    // and then panics on data[pos..pos+64] read. Original rejects it as
+    // "SigRes missing sig/key".
+    #[test]
+    fn sigres_decode_sig_only_missing_pubkey_fails() {
+        // [tree_id=0, seq=0 (1B), ts=0 (1B), sig=[0;64]] = 67 bytes, no pub_key
+        let mut data = vec![0u8]; // tree_id
+        data.push(0u8); // seq = 0
+        data.push(0u8); // timestamp_ms = 0
+        data.extend_from_slice(&[0x5Au8; 64]); // signature (64 bytes)
+        // NO pub_key: data.len() = 1+1+1+64 = 67, pos = 3 after parsing
+        // Original: 67 < 3 + 96 → true → bail "SigRes missing sig/key"
+        // Mutation: 67 < 3 + 32 → false → tries to read sig OK, then pub_key panics
+        assert!(SigRes::decode(&data).is_err(),
+            "SigRes with sig but no pub_key must fail");
+    }
+
+    // ── Announce::sign_bytes ─────────────────────────────────────────────────
+
+    #[test]
+    fn announce_sign_bytes_changes_with_fields() {
+        let base = Announce {
+            tree_id: 0, root: [0xAAu8; 32], root_seq: 1, path_cost: 100,
+            sender: [0xBBu8; 32], signature: [0u8; 64], depth: 1,
+        };
+        let mut changed_root = base.clone();
+        changed_root.root = [0xCCu8; 32];
+        let mut changed_seq = base.clone();
+        changed_seq.root_seq = 2;
+        let mut changed_cost = base.clone();
+        changed_cost.path_cost = 200;
+
+        assert_ne!(base.sign_bytes(), changed_root.sign_bytes(), "root change must affect sign_bytes");
+        assert_ne!(base.sign_bytes(), changed_seq.sign_bytes(), "seq change must affect sign_bytes");
+        assert_ne!(base.sign_bytes(), changed_cost.sign_bytes(), "cost change must affect sign_bytes");
+    }
+
+    #[test]
+    fn announce_decode_truncated_fails() {
+        assert!(Announce::decode(&[]).is_err());
+        assert!(Announce::decode(&[0u8; 5]).is_err());
+    }
+
+    // ── PathLookup / PathNotify / PathBroken ─────────────────────────────────
+
+    #[test]
+    fn path_lookup_roundtrip() {
+        let lookup = PathLookup {
+            target: [0x11u8; 32],
+            source: [0x22u8; 32],
+            id: 0xCAFE_BABE,
+            path: vec![1, 2, 3],
+        };
+        let enc = lookup.encode();
+        assert_eq!(enc[0], PATH_LOOKUP);
+        let dec = PathLookup::decode(&enc[1..]).unwrap();
+        assert_eq!(dec.target, lookup.target);
+        assert_eq!(dec.source, lookup.source);
+        assert_eq!(dec.id, lookup.id);
+        assert_eq!(dec.path, lookup.path);
+    }
+
+    #[test]
+    fn path_lookup_decode_truncated_fails() {
+        assert!(PathLookup::decode(&[]).is_err());
+        assert!(PathLookup::decode(&[0u8; 10]).is_err());
+    }
+
+    #[test]
+    fn path_notify_roundtrip() {
+        let notify = PathNotify {
+            target: [0x33u8; 32],
+            source: [0x44u8; 32],
+            id: 12345,
+            path: vec![4, 5, 6],
+        };
+        let enc = notify.encode();
+        assert_eq!(enc[0], PATH_NOTIFY);
+        let dec = PathNotify::decode(&enc[1..]).unwrap();
+        assert_eq!(dec.target, notify.target);
+        assert_eq!(dec.source, notify.source);
+        assert_eq!(dec.id, notify.id);
+        assert_eq!(dec.path, notify.path);
+    }
+
+    #[test]
+    fn path_notify_decode_truncated_fails() {
+        assert!(PathNotify::decode(&[]).is_err());
+        assert!(PathNotify::decode(&[0u8; 10]).is_err());
+    }
+
+    #[test]
+    fn path_broken_roundtrip() {
+        let broken = PathBroken {
+            target: [0x55u8; 32],
+            source: [0x66u8; 32],
+            id: 0xBEEF,
+        };
+        let enc = broken.encode();
+        assert_eq!(enc[0], PATH_BROKEN);
+        let dec = PathBroken::decode(&enc[1..]).unwrap();
+        assert_eq!(dec.target, broken.target);
+        assert_eq!(dec.source, broken.source);
+        assert_eq!(dec.id, broken.id);
+    }
+
+    #[test]
+    fn path_broken_decode_truncated_fails() {
+        assert!(PathBroken::decode(&[]).is_err());
+        assert!(PathBroken::decode(&[0u8; 31]).is_err()); // needs 64 bytes
+    }
+
+    // ── read_frame bounds ────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn read_frame_empty_fails() {
+        let buf: &[u8] = &[];
+        assert!(read_frame(&mut std::io::Cursor::new(buf)).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn read_frame_length_mismatch_fails() {
+        // Frame uses uvarint length prefix — claim 100 bytes but only provide 5
+        let mut buf = Vec::new();
+        encode_uvarint(100, &mut buf);
+        buf.extend_from_slice(&[1u8; 5]); // only 5 bytes, not 100
+        assert!(read_frame(&mut std::io::Cursor::new(buf)).await.is_err());
+    }
+
+    // ── uvarint edge cases ───────────────────────────────────────────────────
+
+    #[test]
+    fn uvarint_zero_and_max() {
+        for v in [0u64, 1, u64::MAX] {
+            let mut buf = Vec::new();
+            encode_uvarint(v, &mut buf);
+            let (decoded, used) = decode_uvarint(&buf).unwrap();
+            assert_eq!(decoded, v);
+            assert_eq!(used, buf.len());
+        }
+    }
+
+    #[test]
+    fn decode_uvarint_empty_fails() {
+        assert!(decode_uvarint(&[]).is_err());
+    }
+
+    // ── routing_tag uniqueness ────────────────────────────────────────────────
+
+    #[test]
+    fn routing_tag_differs_for_different_keys() {
+        let t1 = routing_tag(&[0u8; 32]);
+        let t2 = routing_tag(&[1u8; 32]);
+        assert_ne!(t1, t2, "different pub keys must give different routing tags");
+    }
+
+    // ── CoordAnnounce ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn coord_announce_roundtrip() {
+        let ann = CoordAnnounce {
+            coord: [0xABu8; 16],
+            tree_depth: 42,
+            sig: [0x5Cu8; 64],
+        };
+        let mut buf = Vec::new();
+        ann.encode_into(&mut buf);
+        let dec = CoordAnnounce::decode(&buf).unwrap();
+        assert_eq!(dec.coord, ann.coord);
+        assert_eq!(dec.tree_depth, ann.tree_depth);
+        assert_eq!(dec.sig, ann.sig);
+    }
+
+    #[test]
+    fn coord_announce_tree_depth_is_little_endian() {
+        let ann = CoordAnnounce {
+            coord: [0u8; 16],
+            tree_depth: 0x01020304,
+            sig: [0u8; 64],
+        };
+        let mut buf = Vec::new();
+        ann.encode_into(&mut buf);
+        // bytes 16..20 must be LE representation of 0x01020304
+        assert_eq!(buf[16], 0x04, "LE byte 0");
+        assert_eq!(buf[17], 0x03, "LE byte 1");
+        assert_eq!(buf[18], 0x02, "LE byte 2");
+        assert_eq!(buf[19], 0x01, "LE byte 3");
+        let dec = CoordAnnounce::decode(&buf).unwrap();
+        assert_eq!(dec.tree_depth, 0x01020304);
+    }
+
+    #[test]
+    fn coord_announce_decode_truncated_fails() {
+        // Needs exactly 16 + 4 + 64 = 84 bytes
+        assert!(CoordAnnounce::decode(&[0u8; 83]).is_err(), "83 bytes must fail");
+        assert!(CoordAnnounce::decode(&[0u8; 0]).is_err(), "empty must fail");
+        assert!(CoordAnnounce::decode(&[0u8; 84]).is_ok(), "84 bytes must succeed");
+    }
+
+    // ── Traffic decode boundary ───────────────────────────────────────────────
+
+    #[test]
+    fn traffic_decode_truncated_after_path_fails() {
+        // After empty path (zero terminator = 1 byte), need 177 bytes; provide only 176
+        let mut data = vec![0u8]; // empty path
+        data.extend_from_slice(&[0u8; 176]); // one short
+        assert!(Traffic::decode(&data).is_err(), "too-short traffic must fail");
+    }
+
+    #[test]
+    fn traffic_decode_minimal_succeeds() {
+        let mut data = vec![0u8]; // empty path (zero terminator)
+        data.extend_from_slice(&[0u8; 32]);  // from
+        data.extend_from_slice(&[0u8; 128]); // enc_header
+        data.extend_from_slice(&[0u8; 16]);  // routing_tag
+        data.push(0u8);                       // pkt_type
+        data.push(0u8);                       // watermark (uvarint 0)
+        data.push(0u8);                       // payload_len (uvarint 0)
+        let result = Traffic::decode(&data);
+        assert!(result.is_ok(), "minimal traffic must decode: {:?}", result.err());
+        let t = result.unwrap();
+        assert_eq!(t.path, Vec::<u64>::new());
+        assert_eq!(t.pkt_type, 0);
+        assert_eq!(t.payload, Vec::<u8>::new());
+    }
+
+    // ── encode_path / decode_path ─────────────────────────────────────────────
+
+    #[test]
+    fn empty_path_roundtrip() {
+        let path: Vec<u64> = vec![];
+        let encoded = encode_path(&path);
+        assert_eq!(encoded, vec![0u8], "empty path must encode as single zero byte");
+        let (decoded, consumed) = decode_path(&encoded).unwrap();
+        assert_eq!(decoded, path);
+        assert_eq!(consumed, 1);
+    }
+
+    #[test]
+    fn encode_path_hop_zero_encodes_as_one() {
+        // hop=0 must encode as 1 (not 0, which is the terminator)
+        let path = vec![0u64];
+        let encoded = encode_path(&path);
+        assert_ne!(encoded[0], 0, "hop=0 must encode as non-zero (hop+1=1)");
+        let (decoded, _) = decode_path(&encoded).unwrap();
+        assert_eq!(decoded, path);
+    }
+
+    #[test]
+    fn decode_path_not_terminated_fails() {
+        // A path with no zero terminator must fail
+        let mut buf = Vec::new();
+        encode_uvarint(5, &mut buf); // val=5, no terminator
+        assert!(decode_path(&buf).is_err(), "unterminated path must fail");
+    }
+
+    // ── uvarint multi-byte encoding ────────────────────────────────────────────
+
+    #[test]
+    fn uvarint_continuation_bit_correct() {
+        // Value 128 = 0x80 needs 2 bytes: [0x80, 0x01]
+        let mut buf = Vec::new();
+        encode_uvarint(128, &mut buf);
+        assert_eq!(buf.len(), 2, "128 needs 2 bytes");
+        assert_eq!(buf[0] & 0x80, 0x80, "first byte must have continuation bit set");
+        assert_eq!(buf[1] & 0x80, 0x00, "last byte must NOT have continuation bit");
+        let (val, n) = decode_uvarint(&buf).unwrap();
+        assert_eq!(val, 128);
+        assert_eq!(n, 2);
+    }
+
+    #[test]
+    fn uvarint_large_value_roundtrip() {
+        let v = 0x0FFF_FFFF_FFFF_FFFFu64;
+        let mut buf = Vec::new();
+        encode_uvarint(v, &mut buf);
+        let (decoded, _) = decode_uvarint(&buf).unwrap();
+        assert_eq!(decoded, v, "large uvarint must roundtrip");
+    }
+
+    #[test]
+    fn uvarint_7bit_shift_is_correct() {
+        // 0x3FFF = 0b_0011_1111_1111_1111 → 2 bytes
+        // If shift were << 6 instead of << 7, the high bits would be wrong.
+        let v = 0x3FFFu64;
+        let mut buf = Vec::new();
+        encode_uvarint(v, &mut buf);
+        assert_eq!(buf.len(), 2, "0x3FFF needs 2 bytes with 7-bit groups");
+        let (decoded, _) = decode_uvarint(&buf).unwrap();
+        assert_eq!(decoded, v, "shift=7 must be correct, got {:#x}", decoded);
+    }
+
+    // ── CuckooMsg ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn cuckoo_msg_generation_roundtrips_for_large_values() {
+        for g in [0u64, 1, 0xFFFF_FFFF, u64::MAX / 2] {
+            let data = [0u8; crate::cuckoo::FILTER_BYTES];
+            let msg = CuckooMsg { tree_id: 0, generation: g, data };
+            let enc = msg.encode();
+            let dec = CuckooMsg::decode(&enc[1..]).unwrap();
+            assert_eq!(dec.generation, g, "generation {} must roundtrip", g);
+        }
+    }
+
+    #[test]
+    fn cuckoo_msg_decode_truncated_fails() {
+        assert!(CuckooMsg::decode(&[]).is_err());
+        assert!(CuckooMsg::decode(&[0u8; 10]).is_err());
+    }
+
+    // ── read_frame size guard (kills > vs == and > vs >= mutations) ───────────
+
+    #[tokio::test]
+    async fn read_frame_exactly_1mb_passes_size_guard() {
+        // length = 1024*1024 must NOT trigger "frame too large" (condition is > 1MB, not >=).
+        // We only check that the error is NOT "frame too large" — it will be
+        // UnexpectedEof since we provide no payload bytes.
+        // Mutation `> with >=` would fail this with "frame too large".
+        let limit = 1024u64 * 1024;
+        let mut buf = Vec::new();
+        encode_uvarint(limit, &mut buf);
+        // No payload bytes — expect UnexpectedEof, not "frame too large"
+        let err = read_frame(&mut std::io::Cursor::new(buf)).await.unwrap_err();
+        assert!(!err.to_string().contains("too large"),
+            "exactly-1MB frame must pass size guard (not 'too large'), got: {}", err);
+    }
+
+    #[tokio::test]
+    async fn read_frame_over_1mb_fails_with_too_large() {
+        // length = 1024*1024+1 must fail with "frame too large".
+        // Mutation `> with ==` would NOT fail this (1MB+1 != 1MB).
+        let over = 1024u64 * 1024 + 1;
+        let mut buf = Vec::new();
+        encode_uvarint(over, &mut buf);
+        let err = read_frame(&mut std::io::Cursor::new(buf)).await.unwrap_err();
+        assert!(err.to_string().contains("too large"),
+            "1MB+1 frame must fail with 'too large', got: {}", err);
+    }
+
+    #[tokio::test]
+    async fn read_frame_overlong_varint_fails() {
+        // A length prefix with 10+ continuation bytes (all 0xFF) must be rejected
+        // by the `len_bytes.len() > 9` guard.
+        // Mutation `> with ==` would only reject exactly-10-bytes; 11 bytes would pass.
+        // Mutation `> with >=` would reject 9-byte prefixes (valid u64).
+        let buf = vec![0xFFu8; 11]; // 11 bytes all with continuation bit set
+        let err = read_frame(&mut std::io::Cursor::new(buf)).await.unwrap_err();
+        assert!(err.to_string().contains("too long") || err.to_string().contains("overflow"),
+            "overlong varint must be rejected, got: {}", err);
+    }
+
+    // ── varint length guard line 62: kills > → == and > → >= ─────────────────
+
+    // Kills `> 9 → >= 9` mutation.
+    // With original `> 9`: 9 continuation bytes + 1 terminal = valid 10-byte read (9
+    // bytes have continuation bit, 10th terminates). The guard fires when len > 9,
+    // i.e., after reading 10th byte (len=10 > 9). But the 10th byte terminates the loop
+    // BEFORE the guard is checked. So 9 cont + 1 terminal succeeds the guard!
+    // Wait — let me re-read: the guard is checked AFTER pushing each byte. For the
+    // 10th byte: push (len=10), check if terminal (yes → break before guard). The
+    // guard is only reached if the byte is NOT terminal. So for exactly 9 bytes all
+    // with continuation + 1 terminal byte, the guard is never triggered.
+    // With `>= 9`: after byte 9 (len=9, continuation), check 9>=9 → true → bail.
+    // This test checks that a 9-continuation + 1-terminal-byte sequence is rejected
+    // only by the frame size guard (the value encoded is huge), NOT by "too long".
+    #[tokio::test]
+    async fn read_frame_9_continuation_bytes_fails_at_size_not_too_long() {
+        // 9 bytes with continuation bit (0xFF) + 1 terminal byte with value 1.
+        // This encodes a huge value (bits 0-62 all set + bit 63 from terminal).
+        // The value exceeds 1MB → fails with "frame too large", not "too long".
+        // With `>= 9` mutation: after the 9th byte (len=9), bail "too long" → CAUGHT.
+        let mut buf = vec![0xFFu8; 9]; // 9 continuation bytes
+        buf.push(0x01u8);              // terminal byte: value bit 63 = 1
+        let err = read_frame(&mut std::io::Cursor::new(buf)).await.unwrap_err();
+        let msg = err.to_string();
+        assert!(!msg.contains("too long"),
+            "9 continuation bytes must NOT fail with 'too long' (guard is > 9, not >= 9); got: {msg}");
+        assert!(msg.contains("too large") || msg.contains("overflow"),
+            "9 cont bytes must fail at size guard or overflow, got: {msg}");
+    }
+
+    // Kills `> 9 → == 9` mutation.
+    // With `== 9`: the guard fires only at exactly 10 bytes; for 11 continuation
+    // bytes (len=10 after byte 10, check: 10 == 9? No → continue) it would NOT fire.
+    // 11 continuation bytes with no terminal → the reader would block on the 12th byte.
+    // Instead: use exactly 10 bytes to trigger the `> 9` guard.
+    // Actually simpler: 10 continuation bytes (buf=[0xFF;10]) → after 10th byte:
+    // len=10, not terminal, check 10 > 9? Yes → bail "too long" (original).
+    // With `== 9`: check 10 == 9? No → continue → reader blocks waiting for byte 11.
+    // Since Cursor has no byte 11, read_exact returns UnexpectedEof.
+    // So with `== 9` mutation: error is "UnexpectedEof" not "too long".
+    #[tokio::test]
+    async fn read_frame_10_continuation_bytes_fails_with_too_long() {
+        let buf = vec![0xFFu8; 10]; // 10 continuation bytes, no terminal
+        let err = read_frame(&mut std::io::Cursor::new(buf)).await.unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("too long"),
+            "10 continuation bytes must fail with 'too long' (len > 9); got: {msg}");
+    }
 }
