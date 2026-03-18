@@ -885,4 +885,104 @@ mod tests {
         // Both should give the same x25519 public key
         assert_eq!(x_pub_from_priv.as_bytes(), x_pub_from_pub.as_bytes());
     }
+
+    // ── decrypt boundary: catches `32 + 8 - 16 = 24` mutation ───────────────
+    // A 30-byte input: original rejects (30 < 56 = 32+8+16).
+    // With mutation `+→-` on second `+` the check becomes `len < 24`, so 30 passes,
+    // then `ciphertext[..32]` slices beyond end → panic (test fails = mutation caught).
+
+    #[test]
+    fn decrypt_30_byte_ciphertext_rejected() {
+        let sk_a = SigningKey::generate(&mut OsRng);
+        let sk_b = SigningKey::generate(&mut OsRng);
+        let pub_b = sk_b.verifying_key().to_bytes();
+        let pub_a = sk_a.verifying_key().to_bytes();
+        let mut mgr_a = SessionManager::new(sk_a);
+        let mut mgr_b = SessionManager::new(sk_b);
+        let init = mgr_a.initiate(&pub_b);
+        let ack = mgr_b.handle_init(&init).unwrap();
+        mgr_a.handle_ack(&ack).unwrap();
+        // 30 bytes is below 56 (=32+8+16): length check must fire.
+        // With the `+→-` mutation (check becomes < 24), 30 passes the check
+        // and the code tries ciphertext[..32] on a 30-byte slice → panic.
+        assert!(mgr_b.decrypt(&pub_a, &[0u8; 30]).is_err(),
+            "30-byte ciphertext must fail length check (catches `32+8-16=24` mutation)");
+    }
+
+    // ── out-of-order window SET: catches mutations on lines 200/201 ──────────
+    // Receive seq=3 (advances high to 3), then seq=1 out-of-order (sets bit at
+    // offset=2 in the else branch), then replay seq=1.
+    // Mutation `- → +` on line 200: offset=3+1=4, sets wrong bit; replay at
+    //   offset=2 is not set → wrongly accepted (caught).
+    // Mutation `<< → >>` on line 201: 1>>2=0, nothing set; replay accepted (caught).
+
+    #[test]
+    fn out_of_order_packet_replay_rejected() {
+        let sk_a = SigningKey::generate(&mut OsRng);
+        let sk_b = SigningKey::generate(&mut OsRng);
+        let pub_b = sk_b.verifying_key().to_bytes();
+        let pub_a = sk_a.verifying_key().to_bytes();
+        let mut mgr_a = SessionManager::new(sk_a);
+        let mut mgr_b = SessionManager::new(sk_b);
+        let init = mgr_a.initiate(&pub_b);
+        let ack = mgr_b.handle_init(&init).unwrap();
+        mgr_a.handle_ack(&ack).unwrap();
+
+        // Encrypt 4 packets in order
+        let ct0 = mgr_a.encrypt(&pub_b, b"seq0").unwrap();
+        let ct1 = mgr_a.encrypt(&pub_b, b"seq1").unwrap();
+        let ct2 = mgr_a.encrypt(&pub_b, b"seq2").unwrap();
+        let ct3 = mgr_a.encrypt(&pub_b, b"seq3").unwrap();
+
+        // Receive seq=3 first: advances high to 3, window=(1<<3)|1=9 (bit for seq=3 set)
+        assert!(mgr_b.decrypt(&pub_a, &ct3).is_ok(), "seq=3 must be accepted");
+
+        // Receive seq=1 out-of-order: offset = 3-1 = 2, window |= 1<<2 = 13
+        assert!(mgr_b.decrypt(&pub_a, &ct1).is_ok(), "seq=1 out-of-order must be accepted");
+
+        // Replay seq=1: offset=2, bit 2 of window should be set → rejected
+        // With `- → +` mutation: offset=3+1=4, lookup at bit 2 (not set) → accepted! (caught)
+        // With `<< → >>` mutation: 1>>2=0, bit 2 never set → accepted! (caught)
+        assert!(mgr_b.decrypt(&pub_a, &ct1).is_err(),
+            "replay of out-of-order seq=1 must be rejected (catches line 200/201 mutations)");
+
+        // seq=0 and seq=2 should still be receivable (not yet seen)
+        assert!(mgr_b.decrypt(&pub_a, &ct0).is_ok(), "seq=0 must be accepted");
+        assert!(mgr_b.decrypt(&pub_a, &ct2).is_ok(), "seq=2 must be accepted");
+    }
+
+    // ── SessionInit decode: 128-byte truncated input (one byte short) ─────────
+    // The full minimum is 1+32+64+32=129 bytes.
+    // With mutation `+→-` on any `+`, the check becomes e.g. `len < 65` or `len < 1`.
+    // A 128-byte input: original rejects ("too short"), mutated passes the check and
+    // then tries data[97..129] on a 128-byte slice → panic (caught).
+
+    #[test]
+    fn session_init_decode_128_bytes_rejected() {
+        // 128 bytes with correct magic: one byte short of the 129-byte minimum (1+32+64+32).
+        // With mutation `+→-` on any `+`, check becomes e.g. `len < 65` or `len < 1`,
+        // so 128 passes and data[97..129] panics (OOB) → test fails = mutation caught.
+        let mut data = vec![0u8; 128];
+        data[0] = SESSION_INIT_MAGIC;
+        let result = SessionInit::decode(&data);
+        assert!(result.is_err(),
+            "128-byte input (one short of minimum 129) must be rejected (catches +→- mutations)");
+        let msg = format!("{}", result.err().expect("just checked is_err"));
+        assert!(msg.contains("too short") || msg.contains("short"),
+            "error must mention 'too short'; got: {}", msg);
+    }
+
+    // ── SessionAck decode: 128-byte truncated input ───────────────────────────
+
+    #[test]
+    fn session_ack_decode_128_bytes_rejected() {
+        let mut data = vec![0u8; 128];
+        data[0] = SESSION_ACK_MAGIC;
+        let result = SessionAck::decode(&data);
+        assert!(result.is_err(),
+            "128-byte SessionAck (one short of minimum 129) must be rejected (catches +→- mutations)");
+        let msg = format!("{}", result.err().expect("just checked is_err"));
+        assert!(msg.contains("too short") || msg.contains("short"),
+            "error must mention 'too short'; got: {}", msg);
+    }
 }

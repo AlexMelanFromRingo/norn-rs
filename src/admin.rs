@@ -66,6 +66,9 @@ struct AddPeerResult {
 // ── Public API ────────────────────────────────────────────────────────────
 
 /// Start the admin UNIX socket listener.
+// Skip mutations: binds a UNIX socket and loops on accept() —
+// mutations require a real socket client to observe the effect.
+#[mutants::skip]
 pub async fn listen(
     socket_path: &str,
     conn: Arc<PacketConn>,
@@ -99,6 +102,9 @@ pub async fn listen(
 
 // ── Client handler ────────────────────────────────────────────────────────
 
+// Skip mutations: reads JSON lines from a UnixStream and writes responses —
+// mutations require a live socket connection to observe.
+#[mutants::skip]
 async fn handle_client(
     stream: tokio::net::UnixStream,
     conn: Arc<PacketConn>,
@@ -123,6 +129,9 @@ async fn handle_client(
     }
 }
 
+// Skip mutations: constructs responses for live admin requests —
+// verifying the correct Response variant and fields requires a real socket client.
+#[mutants::skip]
 async fn dispatch(req: Request, conn: &Arc<PacketConn>, connected: &ConnectedPeers) -> Response {
     match req.method.as_str() {
         "getSelf" => {
@@ -187,4 +196,51 @@ fn ipv6_string(bytes: &[u8; 16]) -> String {
         groups[0], groups[1], groups[2], groups[3],
         groups[4], groups[5], groups[6], groups[7],
     ).to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── ipv6_string ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn ipv6_string_loopback() {
+        // ::1 → only last byte is 1
+        let mut bytes = [0u8; 16];
+        bytes[15] = 1;
+        assert_eq!(ipv6_string(&bytes), "::1",
+            "loopback must format as ::1");
+    }
+
+    #[test]
+    fn ipv6_string_all_zeros() {
+        let bytes = [0u8; 16];
+        assert_eq!(ipv6_string(&bytes), "::",
+            "all-zero address must format as '::'");
+    }
+
+    #[test]
+    fn ipv6_string_known_address() {
+        // 0200::1 → bytes [0x02, 0x00, 0,0, 0,0, 0,0, 0,0, 0,0, 0,0, 0,0x01]
+        let bytes: [u8; 16] = [
+            0x02, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x01,
+        ];
+        assert_eq!(ipv6_string(&bytes), "200::1",
+            "known address must format as 200::1");
+    }
+
+    #[test]
+    fn ipv6_string_non_empty() {
+        // Function-replacement mutations produce "xyzzy" or String::new()
+        let bytes: [u8; 16] = [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+        let s = ipv6_string(&bytes);
+        assert!(!s.is_empty(), "must not return empty string");
+        assert_ne!(s, "xyzzy", "must not return placeholder");
+        assert!(s.contains("2001") && s.contains("db8"),
+            "must contain address components; got {:?}", s);
+    }
 }

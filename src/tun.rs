@@ -54,12 +54,18 @@ impl KeyStore {
 
 pub type SharedKeyStore = Arc<Mutex<KeyStore>>;
 
+// Skip mutations: Default::default() for Arc<Mutex<KeyStore>> is equivalent
+// (KeyStore::default() delegates to Self::new() which also returns an empty HashMap).
+#[mutants::skip]
 pub fn new_key_store() -> SharedKeyStore {
     Arc::new(Mutex::new(KeyStore::new()))
 }
 
 // ── TUN adapter ───────────────────────────────────────────────────────────
 
+// Skip mutations: creates a real TUN device (requires CAP_NET_ADMIN), configures
+// the interface, and runs an indefinite read/write loop — untestable in unit tests.
+#[mutants::skip]
 #[cfg(feature = "tun-support")]
 pub async fn start(
     tun_name: &str,
@@ -173,6 +179,7 @@ pub async fn start(
     Ok(())
 }
 
+#[mutants::skip]
 #[cfg(not(feature = "tun-support"))]
 pub async fn start(
     tun_name: &str,
@@ -187,6 +194,9 @@ pub async fn start(
 
 // ── Helpers ───────────────────────────────────────────────────────────────
 
+// Skip mutations: invokes `ip` system command — requires a real network
+// interface and root/CAP_NET_ADMIN to observe any effect.
+#[mutants::skip]
 #[cfg(feature = "tun-support")]
 fn configure_interface(name: &str, ipv6_addr: &str) -> Result<()> {
     use std::process::Command;

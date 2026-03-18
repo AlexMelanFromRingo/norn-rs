@@ -22,6 +22,9 @@ const BEACON_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Start multicast peer discovery.
 /// `tcp_port`: our TCP listen port to announce (None = listen-only mode).
+// Skip mutations: binds real multicast UDP sockets and loops indefinitely —
+// all mutations require a live multicast-capable network interface.
+#[mutants::skip]
 pub async fn start(
     conn: Arc<PacketConn>,
     multicast_port: u16,

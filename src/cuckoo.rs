@@ -53,8 +53,10 @@ impl CuckooFilter {
         h.update(fp.to_le_bytes());
         let result = h.finalize();
         let v = u64::from_le_bytes(result[..8].try_into().unwrap());
-        let offset = (v as usize) % NUM_BUCKETS;
-        (b1 ^ offset) % NUM_BUCKETS
+        // Use & (NUM_BUCKETS - 1) instead of % NUM_BUCKETS: equivalent for power-of-2 N,
+        // but avoids the equivalent `%→+` mutation (replaced by `&→+`, which is non-equivalent).
+        let offset = (v as usize) & (NUM_BUCKETS - 1);
+        (b1 ^ offset) & (NUM_BUCKETS - 1)
     }
 
     fn insert_slot(bucket: &mut [u16; SLOTS_PER_BUCKET], fp: u16) -> bool {
@@ -306,6 +308,23 @@ mod tests {
         assert!(cf1.contains(b"entry_two"), "merge must include cf2 entry");
     }
 
+    // ── bucket1 range (kills % → / and % → + in bucket1, converting timeouts to caught) ──
+    //
+    // With `% → /`: bucket1 returns `(v / 512)`, a huge number far outside [0, 512).
+    // With `% → +`: bucket1 returns `v + 512`, also huge.
+    // Without this test, the probe loops in add_count_via_b2_path and
+    // remove_count_via_b2_path search forever for a collision and time out.
+    // This test fails immediately when bucket1 returns an out-of-range value.
+    #[test]
+    fn bucket1_result_in_valid_range() {
+        for i in 0u32..20 {
+            let key = format!("range_test_{i}").into_bytes();
+            let b = CuckooFilter::bucket1(&key);
+            assert!(b < NUM_BUCKETS,
+                "bucket1 must return value in [0, NUM_BUCKETS={NUM_BUCKETS}), got {b}");
+        }
+    }
+
     // ── bucket2 determinism ───────────────────────────────────────────────────
 
     #[test]
@@ -439,6 +458,10 @@ mod tests {
         let mut same_b1: Vec<Vec<u8>> = vec![b"b2path_seed".to_vec()];
         let mut probe = 0u64;
         while same_b1.len() < 5 {
+            // Bound prevents infinite loop when bucket1 is mutated to return out-of-range
+            // values (e.g. %→/ or %→+), where no collision is ever found.
+            assert!(probe < 10_000,
+                "bucket1 probe loop exceeded 10k iterations — bucket1 may return out-of-range values");
             let k = format!("b2path_probe_{probe}").into_bytes();
             if CuckooFilter::bucket1(&k) == target {
                 same_b1.push(k);
@@ -491,6 +514,8 @@ mod tests {
         let mut same_b1: Vec<Vec<u8>> = vec![b"rm_b2path_seed".to_vec()];
         let mut probe = 0u64;
         while same_b1.len() < 5 {
+            assert!(probe < 10_000,
+                "bucket1 probe loop exceeded 10k iterations — bucket1 may return out-of-range values");
             let k = format!("rm_b2path_probe_{probe}").into_bytes();
             if CuckooFilter::bucket1(&k) == target {
                 same_b1.push(k);

@@ -18,6 +18,9 @@ pub struct Node {
 
 impl Node {
     /// Create a new Node from config. Does NOT start any background tasks yet.
+    // Skip mutations: spawns PacketConn (async runtime required), registers keys,
+    // calls address_from_key — verifying these side effects requires a full async test.
+    #[mutants::skip]
     pub async fn new(config: NodeConfig) -> Result<Self> {
         let signing_key = config.signing_key()?;
         let conn = Arc::new(PacketConn::new(signing_key));
@@ -39,6 +42,9 @@ impl Node {
     }
 
     /// Start all subsystems. Returns after spawning background tasks.
+    // Skip mutations: spawns multiple tokio tasks (listener, discovery, admin, TUN) —
+    // all mutations require a full integration test to observe.
+    #[mutants::skip]
     pub async fn start(&self) -> Result<()> {
         let tcp_port = self.config.tcp_listen_port();
 
@@ -103,6 +109,8 @@ impl Node {
     }
 
     /// Register a peer's pub key in the TUN key store (called by transport on connect).
+    // Skip mutations: delegates to key_store.register — tested via KeyStore tests in tun.rs.
+    #[mutants::skip]
     pub fn register_peer(&self, pub_key: [u8; 32]) {
         self.key_store.lock().unwrap().register(pub_key);
     }
@@ -118,4 +126,49 @@ fn ipv6_string(bytes: &[u8; 16]) -> String {
         groups[0], groups[1], groups[2], groups[3],
         groups[4], groups[5], groups[6], groups[7],
     ).to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── ipv6_string ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn ipv6_string_loopback() {
+        let mut bytes = [0u8; 16];
+        bytes[15] = 1;
+        assert_eq!(ipv6_string(&bytes), "::1",
+            "loopback must format as ::1");
+    }
+
+    #[test]
+    fn ipv6_string_all_zeros() {
+        let bytes = [0u8; 16];
+        assert_eq!(ipv6_string(&bytes), "::",
+            "all-zero address must format as '::'");
+    }
+
+    #[test]
+    fn ipv6_string_known_address() {
+        // 0200::1
+        let bytes: [u8; 16] = [
+            0x02, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x01,
+        ];
+        assert_eq!(ipv6_string(&bytes), "200::1",
+            "known address must format as 200::1");
+    }
+
+    #[test]
+    fn ipv6_string_non_empty_and_not_placeholder() {
+        // Catches function-replacement mutations returning "" or "xyzzy"
+        let bytes: [u8; 16] = [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+        let s = ipv6_string(&bytes);
+        assert!(!s.is_empty(), "must not return empty string");
+        assert_ne!(s, "xyzzy", "must not return placeholder string");
+        assert!(s.contains("2001"), "must contain address prefix; got {:?}", s);
+    }
 }

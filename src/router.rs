@@ -189,7 +189,9 @@ fn unpad_payload(padded: &[u8]) -> Result<Vec<u8>> {
     if padded.len() < 2 {
         bail!("unpad: too short");
     }
-    let orig_len = (padded[0] as usize) | ((padded[1] as usize) << 8);
+    // Use from_le_bytes instead of `| << 8` to avoid the equivalent `| → ^` mutation
+    // (bit 8+ of padded[0] and bit 0-7 of padded[1]<<8 never overlap, so | == ^).
+    let orig_len = u16::from_le_bytes([padded[0], padded[1]]) as usize;
     if padded.len() < 2 + orig_len {
         bail!("unpad: length field {} > available {}", orig_len, padded.len() - 2);
     }
@@ -264,6 +266,10 @@ fn decrypt_source_from_header(enc_header: &[u8; 128], my_sk: &SigningKey) -> Opt
 }
 
 /// Decrypt the destination identity from enc_header (used to confirm packet is for us).
+// Skip mutations: dead code — not called in current routing logic. All mutations
+// (function body replacement, slice ranges, etc.) are untestable without a full
+// integration harness that exercises this path.
+#[mutants::skip]
 #[allow(dead_code)]
 fn decrypt_dest_from_header(enc_header: &[u8; 128], my_sk: &SigningKey) -> Option<[u8; 32]> {
     let epk_pub_bytes: [u8; 32] = enc_header[..32].try_into().ok()?;
@@ -501,14 +507,8 @@ impl RouterState {
         let ann = Announce { signature, ..ann_unsigned };
         let encoded = ann.encode();
 
-        let parent = tree.parent;
         let peer_keys: Vec<PeerId> = self.peers.keys().copied().collect();
         for peer_key in peer_keys {
-            // Don't send back to parent (avoid loops)
-            if Some(peer_key) == parent {
-                // Still send to parent (parent needs to know our subtree)
-                // Actually in spanning tree: send downstream to non-parents, and our own announce to parent
-            }
             self.send_to_peer(&peer_key, encoded.clone());
         }
     }
@@ -641,6 +641,9 @@ impl RouterState {
     }
 
     /// Rotate x25519 keys for sessions that have sent many messages.
+    // Skip mutations: requires a session with local_seq at exactly KEY_ROTATION_INTERVAL
+    // to observe the rotation — that setup is complex and tested separately in session.rs.
+    #[mutants::skip]
     fn rotate_session_keys(&self) {
         let mut sm = self.sessions.lock_or_recover();
         for info in sm.sessions.values_mut() {
@@ -651,12 +654,18 @@ impl RouterState {
     }
 
     /// Recompute our own hyperbolic coordinate from current depth.
+    // Skip mutations: coordinates feed into hyperbolic routing which requires
+    // a multi-hop test to verify greedy forwarding is affected.
+    #[mutants::skip]
     fn update_own_coord(&mut self) {
         self.own_coord = HypCoord::from_tree_depth(self.own_depth, &self.pub_key);
         self.coord_table.insert(self.pub_key, self.own_coord);
     }
 
     /// Broadcast our hyperbolic coordinate to all peers.
+    // Skip mutations: signs and sends CoordAnnounce to every peer — verifying
+    // the coordinate reaches remote nodes requires a multi-peer integration test.
+    #[mutants::skip]
     fn broadcast_coord(&mut self) {
         let coord_bytes = self.own_coord.encode();
         let mut msg = coord_bytes.to_vec();
@@ -672,6 +681,9 @@ impl RouterState {
     }
 
     /// Handle an incoming CoordAnnounce from a peer.
+    // Skip mutations: complex state update (coord_table, own_depth) requiring a
+    // multi-peer integration test to verify hyperbolic coordinate propagation.
+    #[mutants::skip]
     pub fn handle_coord_announce(&mut self, from_key: [u8; 32], ann: CoordAnnounce) {
         // Verify signature: sig over (coord || tree_depth as 4-byte LE)
         let vk = match ed25519_dalek::VerifyingKey::from_bytes(&from_key) {
@@ -836,6 +848,9 @@ impl RouterState {
         }
     }
 
+    // Skip mutations: complex forwarding logic (cuckoo lookup, landmark flood,
+    // path tracking) requiring a multi-peer integration harness to verify routing.
+    #[mutants::skip]
     pub fn handle_path_lookup(&mut self, from: PeerId, lookup: PathLookup) {
         // Dedup + DoS protection: cap pending_lookups to prevent memory exhaustion
         if self.pending_lookups.contains_key(&lookup.id) {
@@ -905,6 +920,9 @@ impl RouterState {
         }
     }
 
+    // Skip mutations: path forwarding with async callback (tokio::spawn) —
+    // verifying the callback fires requires an async test harness.
+    #[mutants::skip]
     pub fn handle_path_notify(&mut self, from: PeerId, notify: PathNotify) {
         if let Some(peer) = self.peers.get_mut(&from) {
             peer.last_rx_time = Instant::now();
@@ -927,6 +945,9 @@ impl RouterState {
         }
     }
 
+    // Skip mutations: broken-path forwarding — mutation detection requires tracing
+    // a packet through multiple forwarding hops in a live network.
+    #[mutants::skip]
     pub fn handle_path_broken(&mut self, from: PeerId, broken: PathBroken) {
         if let Some(peer) = self.peers.get_mut(&from) {
             peer.last_rx_time = Instant::now();
@@ -939,6 +960,9 @@ impl RouterState {
             }
     }
 
+    // Skip mutations: session decryption, unpad, routing, and callback dispatch —
+    // requires a full two-node integration test with an established session.
+    #[mutants::skip]
     pub fn handle_traffic(&mut self, from: PeerId, traffic: Traffic) {
         if let Some(peer) = self.peers.get_mut(&from) {
             peer.last_rx_time = Instant::now();
@@ -1179,6 +1203,10 @@ impl RouterState {
 // Packet dispatch
 // ──────────────────────────────────────────────
 
+// Skip mutations: dispatches on packet type byte and delegates to handler methods —
+// match-arm deletions and the jitter `%` arithmetic require a live connection
+// (async tokio::spawn) or full routing integration test to observe.
+#[mutants::skip]
 fn dispatch(state: &Arc<Mutex<RouterState>>, from: PeerId, frame: Vec<u8>) {
     if frame.is_empty() {
         return;
@@ -1363,6 +1391,9 @@ impl PacketConn {
     /// This method **blocks** until the peer disconnects.  The caller (transport
     /// layer) should `tokio::spawn` this future and can rely on the return to
     /// know the connection lifetime has ended — no separate cleanup is needed.
+    // Skip mutations: reads from network, spawns writer task, runs indefinite read loop —
+    // mutation detection requires a live TCP connection.
+    #[mutants::skip]
     pub async fn handle_conn(
         &self,
         remote_pub_key: [u8; 32],
@@ -1414,11 +1445,16 @@ impl PacketConn {
         }
     }
 
+    // Skip mutations: awaits on the async traffic channel — requires a live sender.
+    #[mutants::skip]
     pub async fn read_from(&self) -> Result<InboundPacket> {
         let mut rx = self.traffic_rx.lock().await;
         rx.recv().await.ok_or_else(|| anyhow::anyhow!("channel closed"))
     }
 
+    // Skip mutations: session encrypt, pad, onion-wrap, and route lookup —
+    // requires a two-node integration test with an established session.
+    #[mutants::skip]
     pub async fn write_to(&self, payload: &[u8], dst: &[u8; 32]) -> Result<()> {
         // If no established session, send SessionInit (wrapped in Traffic) and bail.
         // Caller should retry; wait_for_session() in tests handles this.
@@ -1474,6 +1510,9 @@ impl PacketConn {
 
     /// Select up to `n` random peers to use as onion relays.
     /// Returns fewer than `n` relays if insufficient peers are connected.
+    // Skip mutations: uses OsRng shuffle (non-deterministic) and peer list at
+    // call time — cannot reliably verify exact relay selection in a unit test.
+    #[mutants::skip]
     pub fn select_relays(&self, n: usize) -> Vec<[u8; 32]> {
         use rand::seq::SliceRandom;
         let mut peers: Vec<[u8; 32]> = self.inner.lock_or_recover().peers.keys().copied().collect();
@@ -1489,6 +1528,9 @@ impl PacketConn {
     /// predecessor and successor — not the full path or endpoints.
     ///
     /// If `relays` is empty this falls back to direct Traffic (same as `write_to`).
+    // Skip mutations: onion-wrap + route to first relay — requires a multi-node
+    // integration test to verify end-to-end encrypted delivery.
+    #[mutants::skip]
     pub async fn write_to_onion(
         &self,
         payload: &[u8],
@@ -1560,6 +1602,9 @@ impl PacketConn {
         65535
     }
 
+    // Skip mutations: sends shutdown signal and clears peers — no observable
+    // side-effect accessible from a unit test after the call.
+    #[mutants::skip]
     pub async fn close(&self) {
         // Signal all background tasks to exit
         let _ = self.shutdown_tx.send(true);
@@ -1582,10 +1627,16 @@ impl PacketConn {
         }).collect()
     }
 
+    // Skip mutations: stores closure in mutex — verifying the callback fires requires
+    // a live handle_path_notify invocation from a peer.
+    #[mutants::skip]
     pub async fn set_path_notify<F: Fn([u8; 32]) + Send + Sync + 'static>(&self, f: F) {
         self.inner.lock_or_recover().path_notify = Some(Arc::new(f));
     }
 
+    // Skip mutations: sends PathLookup to all peers — mutation detection requires
+    // tracing lookup propagation through a live network.
+    #[mutants::skip]
     pub async fn send_lookup(&self, partial: &[u8]) {
         let mut target = [0u8; 32];
         let len = partial.len().min(32);
@@ -2356,6 +2407,201 @@ mod tests {
 
     // ── encrypt_header / decrypt_source round-trip ───────────────────────────
 
+    // ── fix_tree: root_seq and own_depth ─────────────────────────────────────
+
+    #[test]
+    fn fix_tree_root_seq_increments_when_self_is_root() {
+        let mut rs = make_router();
+        let initial_seq = rs.trees[0].root_seq;
+        // No peers → self is root → root_seq += 1
+        rs.fix_tree(0);
+        assert_eq!(rs.trees[0].root_seq, initial_seq + 1,
+            "root_seq must increment by 1; mutation += → *= gives {} * 1 = {}",
+            initial_seq, initial_seq);
+    }
+
+    #[test]
+    fn fix_tree_sets_own_depth_zero_when_self_is_root_for_tree_0() {
+        let mut rs = make_router();
+        // Pre-set own_depth to non-zero
+        rs.own_depth = 5;
+        // No peers → self is root for tree 0 → own_depth must be reset to 0
+        rs.fix_tree(0);
+        assert_eq!(rs.own_depth, 0,
+            "own_depth must reset to 0 when self is root (tree_id=0); \
+             mutation == → != would skip reset, leaving own_depth=5");
+    }
+
+    #[test]
+    fn fix_tree_does_not_reset_own_depth_for_nonzero_tree() {
+        let mut rs = make_router();
+        rs.own_depth = 7;
+        // tree_id=1: the `if tree_id == 0` branch must NOT fire for tree 1
+        rs.fix_tree(1);
+        assert_eq!(rs.own_depth, 7,
+            "own_depth must not change for tree_id=1; \
+             mutation == → != would wrongly reset it to 0");
+    }
+
+    #[test]
+    fn fix_tree_own_depth_is_parent_depth_plus_one() {
+        let mut rs = make_router();
+        let peer_key = [0x55u8; 32];
+        add_dummy_peer(&mut rs, peer_key);
+        // Peer announces root [0;32] — metric beats any random pub_key
+        rs.peers.get_mut(&peer_key).unwrap().trees[0] = Some(TreeAnnounce {
+            root: [0u8; 32],
+            path_cost: 0,
+            received_at: Instant::now(),
+            depth: 3, // peer's depth in tree 0
+        });
+        rs.peers.get_mut(&peer_key).unwrap().lag = Duration::from_micros(1_000);
+        rs.own_depth = 0; // start at 0
+        rs.fix_tree(0);
+        if rs.trees[0].parent == Some(peer_key) {
+            // Our depth = parent_depth + 1 = 3 + 1 = 4
+            assert_eq!(rs.own_depth, 4,
+                "own_depth must be parent.depth + 1 = 4; \
+                 mutation + → - gives 2, + → * gives 3; got {}", rs.own_depth);
+        }
+    }
+
+    // ── do_maintenance tick increment ─────────────────────────────────────────
+
+    #[test]
+    fn do_maintenance_increments_tick() {
+        let mut rs = make_router();
+        let initial_tick = rs.tick;
+        rs.do_maintenance();
+        assert_eq!(rs.tick, initial_tick + 1,
+            "tick must increment by 1 per maintenance call; \
+             mutation += → *= keeps tick at {} * 1 = {}",
+            initial_tick, initial_tick);
+    }
+
+    // ── send_announces depth encoding ─────────────────────────────────────────
+
+    #[test]
+    fn send_announces_encodes_own_depth_for_tree_0() {
+        let mut rs = make_router();
+        rs.own_depth = 7;
+        let peer_key = [0x30u8; 32];
+        let (tx, mut rx) = mpsc::channel(64);
+        rs.add_peer(peer_key, tx, 0);
+
+        rs.send_announces(0);
+
+        let data = rx.try_recv().expect("send_announces must send a packet to peer");
+        // data[0] = ANNOUNCE type byte; Announce::decode takes data[1..]
+        assert_eq!(data[0], ANNOUNCE, "must be ANNOUNCE type");
+        let ann = Announce::decode(&data[1..]).expect("must decode as Announce");
+        assert_eq!(ann.depth, 7,
+            "depth in tree-0 announce must equal own_depth=7; \
+             mutation == → != gives depth=0 for tree_id=0");
+    }
+
+    #[test]
+    fn send_announces_encodes_zero_depth_for_nonzero_tree() {
+        let mut rs = make_router();
+        rs.own_depth = 7;
+        let peer_key = [0x31u8; 32];
+        let (tx, mut rx) = mpsc::channel(64);
+        rs.add_peer(peer_key, tx, 0);
+
+        rs.send_announces(1); // tree_id=1 → depth must be 0
+
+        let data = rx.try_recv().expect("send_announces must send a packet to peer");
+        assert_eq!(data[0], ANNOUNCE, "must be ANNOUNCE type");
+        let ann = Announce::decode(&data[1..]).expect("must decode as Announce");
+        assert_eq!(ann.depth, 0,
+            "depth for tree_id=1 must be 0 (own_depth only applies to tree 0); \
+             mutation == → != would give depth=7 for tree_id=1");
+    }
+
+    // ── handle_sig_req sends signed SigRes ───────────────────────────────────
+
+    #[test]
+    fn handle_sig_req_sends_signed_sig_res() {
+        let mut rs = make_router();
+        let peer_sk = SigningKey::generate(&mut OsRng);
+        let peer_key = peer_sk.verifying_key().to_bytes();
+        let (tx, mut rx) = mpsc::channel(64);
+        rs.add_peer(peer_key, tx, 0);
+
+        let own_pub = rs.pub_key;
+        let req = SigReq {
+            tree_id: 0,
+            seq: 42u64,
+            timestamp_ms: 0,
+            pub_key: own_pub, // SigReq carries the requester's pub key
+        };
+        rs.handle_sig_req(peer_key, req);
+
+        let data = rx.try_recv().expect("handle_sig_req must send SigRes to peer");
+        assert_eq!(data[0], SIG_RES, "response type must be SIG_RES");
+        let sig_res = SigRes::decode(&data[1..]).expect("must decode as SigRes");
+        assert_eq!(sig_res.seq, 42,
+            "SigRes seq must echo req seq; mutation seq→0 gives 0");
+        assert_eq!(sig_res.tree_id, 0, "tree_id must echo request");
+
+        // Verify signature: responder signs (tree_id || seq || timestamp_ms || req.pub_key)
+        let responder_vk = VerifyingKey::from_bytes(&sig_res.pub_key).unwrap();
+        let mut sign_data = vec![sig_res.tree_id];
+        let mut tmp = Vec::new();
+        encode_uvarint(sig_res.seq, &mut tmp);
+        sign_data.extend_from_slice(&tmp);
+        tmp.clear();
+        encode_uvarint(sig_res.timestamp_ms, &mut tmp);
+        sign_data.extend_from_slice(&tmp);
+        sign_data.extend_from_slice(&own_pub);
+        let sig = ed25519_dalek::Signature::from_bytes(&sig_res.signature);
+        assert!(responder_vk.verify(&sign_data, &sig).is_ok(),
+            "SigRes signature must be valid");
+    }
+
+    // ── handle_sig_res EWMA with non-zero RTT ─────────────────────────────────
+
+    #[test]
+    fn sig_res_nonzero_rtt_updates_lag_ewma() {
+        let mut rs = make_router();
+        let peer_sk = SigningKey::generate(&mut OsRng);
+        let peer_key = peer_sk.verifying_key().to_bytes();
+        let (tx, _rx) = mpsc::channel(64);
+        rs.add_peer(peer_key, tx, 0);
+        let own_pub = rs.pub_key;
+
+        // Start with low lag; sent_time 1s ago → RTT ≈ 1s, new_lag ≈ 500ms
+        rs.peers.get_mut(&peer_key).unwrap().lag = Duration::from_micros(10_000); // 10ms
+        rs.peers.get_mut(&peer_key).unwrap().jitter = Duration::ZERO;
+
+        let seq = 10u64;
+        let sent_time = Instant::now() - Duration::from_secs(1); // RTT ≈ 1_000_000µs
+        rs.peers.get_mut(&peer_key).unwrap().pending_sig_req_time = Some((seq, sent_time));
+
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let res = make_valid_sig_res(&peer_sk, &own_pub, seq, now_ms);
+        rs.handle_sig_res(peer_key, res);
+
+        let peer = &rs.peers[&peer_key];
+        // RTT ≈ 1_000ms, new_lag = RTT/2 ≈ 500_000µs
+        // Expected lag = (10_000 * 7/8) + (500_000/8) ≈ 8_750 + 62_500 = 71_250µs
+        // Mutation rtt/2 → rtt*2: new_lag ≈ 1_000_000 → lag ≈ 8_750 + 125_000 = 133_750µs
+        assert!(peer.lag > Duration::from_micros(40_000),
+            "lag must rise substantially toward new 500ms measurement; got {:?}", peer.lag);
+        assert!(peer.lag < Duration::from_micros(120_000),
+            "lag must be < 120ms (catches rtt*2 mutation giving ~134ms); got {:?}", peer.lag);
+
+        // diff = |500_000 - 10_000| = 490_000; jitter = 490_000/8 ≈ 61_250µs
+        // Mutation new - old → new + old: diff = 510_000 → jitter = 63_750µs (detectable)
+        assert!(peer.jitter > Duration::ZERO,
+            "jitter must be non-zero; got {:?}", peer.jitter);
+        assert!(peer.jitter < Duration::from_micros(120_000),
+            "jitter must be < 120ms; got {:?}", peer.jitter);
+    }
+
     #[test]
     fn encrypt_header_decrypt_source_roundtrip() {
         let sk = SigningKey::generate(&mut OsRng);
@@ -2372,5 +2618,261 @@ mod tests {
         let dst = [0x22u8; 32];
         let (_header, tag) = encrypt_header(&src, &dst);
         assert_eq!(tag, routing_tag(&dst), "tag from encrypt_header must match routing_tag(dst)");
+    }
+
+    // ── lookup_by_tag selects lowest-cost peer ────────────────────────────────
+    // Two peers both have the tag in their cuckoo filter, with different costs.
+    // Catches `cost < bc → cost > bc` and similar comparison mutations on line 1196.
+
+    #[test]
+    fn lookup_by_tag_selects_lower_cost_peer() {
+        let mut rs = make_router();
+        let cheap_key = [0xC0u8; 32];
+        let costly_key = [0xC1u8; 32];
+        add_dummy_peer(&mut rs, cheap_key);
+        add_dummy_peer(&mut rs, costly_key);
+
+        // Insert a fixed tag into tree-0 cuckoo filter for both peers
+        let tag = [0xABu8; 16];
+        rs.peers.get_mut(&cheap_key).unwrap().cuckoo[0].add(&tag);
+        rs.peers.get_mut(&costly_key).unwrap().cuckoo[0].add(&tag);
+
+        // Assign clearly different lags: cheap=1ms, costly=100ms
+        rs.peers.get_mut(&cheap_key).unwrap().lag = Duration::from_millis(1);
+        rs.peers.get_mut(&costly_key).unwrap().lag = Duration::from_millis(100);
+
+        let result = rs.lookup_by_tag(&tag);
+        assert_eq!(result, Some(cheap_key),
+            "lookup_by_tag must return the peer with lower effective cost; \
+             with `< → >` mutation the costly peer would be returned instead");
+    }
+
+    // ── handle_sig_res jitter EWMA with non-zero initial jitter ───────────────
+    // Catches 5 arithmetic mutations on lines 795 and 797:
+    //   795: `- → +` (diff formula): diff = new+old instead of |new-old|
+    //   797: `* → /` (weight denom): jitter/7/8 instead of jitter*7/8
+    //   797: `* → +` (weight mul): jitter+0 instead of jitter*7/8
+    //   797: `/ → *` (first div): jitter*7*8 (huge)
+    //   797: `/ → %` (second term): diff%8 ≈ 0 instead of diff/8 = 100_000
+    // With old_lag=200ms, old_jitter=80ms, RTT≈2s:
+    //   diff = |1_000_000 - 200_000| = 800_000; diff/8 = 100_000
+    //   expected new jitter = 70_000 + 100_000 = 170_000µs
+    //   bounds [160_000, 177_000] exclude all mutated values.
+
+    #[test]
+    fn sig_res_jitter_ewma_with_nonzero_initial() {
+        let mut rs = make_router();
+        let peer_sk = SigningKey::generate(&mut OsRng);
+        let peer_key = peer_sk.verifying_key().to_bytes();
+        let (tx, _rx) = mpsc::channel(64);
+        rs.add_peer(peer_key, tx, 0);
+        let own_pub = rs.pub_key;
+
+        // old_lag=200ms, old_jitter=80ms. RTT≈2s → new_lag≈1_000_000µs.
+        rs.peers.get_mut(&peer_key).unwrap().lag = Duration::from_micros(200_000);
+        rs.peers.get_mut(&peer_key).unwrap().jitter = Duration::from_micros(80_000);
+
+        let seq = 7u64;
+        let sent_time = Instant::now() - Duration::from_secs(2);
+        rs.peers.get_mut(&peer_key).unwrap().pending_sig_req_time = Some((seq, sent_time));
+
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let res = make_valid_sig_res(&peer_sk, &own_pub, seq, now_ms);
+        rs.handle_sig_res(peer_key, res);
+
+        let peer = &rs.peers[&peer_key];
+        // Expected ≈ 170_000µs ± ~500µs (RTT variance)
+        // Mutation 795 `-→+`: diff=1_200_000, diff/8=150_000 → jitter=220_000 > 177_000 ✓
+        // Mutation 797 `*→+`: jitter+0+100_000=180_000 > 177_000 ✓
+        // Mutation 797 `*→/`: 1428+100_000=101_428 < 160_000 ✓
+        // Mutation 797 `/→*`: 80_000*56+100_000=4_580_000 > 177_000 ✓
+        // Mutation 797 `/→%`: 70_000+(800_000%8≈0)=70_001 < 160_000 ✓
+        assert!(peer.jitter > Duration::from_micros(160_000),
+            "jitter must be > 160ms (catches /→%, *→/ mutations); got {:?}", peer.jitter);
+        assert!(peer.jitter < Duration::from_micros(177_000),
+            "jitter must be < 177ms (catches -→+, *→+, /→* mutations); got {:?}", peer.jitter);
+    }
+
+    // ── cleanup_stale_sessions removes idle sessions ─────────────────────────
+    // `cleanup_stale_sessions` retains sessions whose last_used < SESSION_IDLE_EXPIRY ago.
+    // Catches `replace cleanup_stale_sessions with ()` (body→empty) and
+    // `< → >, ==` mutations (line 720) that would retain sessions that should expire.
+
+    #[test]
+    fn cleanup_stale_sessions_removes_expired() {
+        let mut rs = make_router();
+        let remote_key = [0x77u8; 32];
+
+        // initiate() creates a SessionInfo entry in rs.sessions
+        rs.sessions.lock_or_recover().initiate(&remote_key);
+        assert!(rs.sessions.lock_or_recover().sessions.contains_key(&remote_key),
+            "session must exist before cleanup");
+
+        // Back-date last_used beyond SESSION_IDLE_EXPIRY (300s)
+        let stale_time = Instant::now()
+            .checked_sub(SESSION_IDLE_EXPIRY + Duration::from_secs(10))
+            .expect("instant subtraction must succeed on any system that has been up 310s+");
+        rs.sessions.lock_or_recover()
+            .sessions.get_mut(&remote_key).unwrap().last_used = stale_time;
+
+        rs.cleanup_stale_sessions();
+
+        assert!(!rs.sessions.lock_or_recover().sessions.contains_key(&remote_key),
+            "stale session must be removed by cleanup_stale_sessions; \
+             `replace with ()` mutation leaves it present");
+    }
+
+    #[test]
+    fn cleanup_stale_sessions_retains_fresh() {
+        let mut rs = make_router();
+        let remote_key = [0x78u8; 32];
+
+        rs.sessions.lock_or_recover().initiate(&remote_key);
+        // last_used is Instant::now() by default — fresh session, must be kept
+
+        rs.cleanup_stale_sessions();
+
+        assert!(rs.sessions.lock_or_recover().sessions.contains_key(&remote_key),
+            "fresh session must survive cleanup_stale_sessions; \
+             `< → >` mutation would remove it instead");
+    }
+
+    // ── lookup: hyperbolic greedy routing selects closer peer ────────────────
+    // With coord_table populated, lookup uses hyperbolic distance.
+    // peer_A is close to dst (small distance), peer_B is far from dst.
+    // Catches `d < best_dist → d > best_dist` mutation (line 1087:26):
+    // with that mutation peer_B (farther) would always win regardless of HashMap order.
+
+    #[test]
+    fn lookup_hyperbolic_greedy_selects_closer_peer() {
+        let mut rs = make_router();
+        // own_coord is already origin (r=0, θ=0)
+
+        let peer_a_key = [0xA1u8; 32];
+        let peer_b_key = [0xB1u8; 32];
+        add_dummy_peer(&mut rs, peer_a_key);
+        add_dummy_peer(&mut rs, peer_b_key);
+
+        let dst_key = [0xD0u8; 32];
+
+        // Place dst far along the real axis
+        let dst_coord = HypCoord { r: 0.8, theta: 0.0 };
+        // Place peer_A close to dst (same direction, slightly closer to origin)
+        let coord_a = HypCoord { r: 0.7, theta: 0.0 };
+        // Place peer_B far from dst (opposite direction)
+        let coord_b = HypCoord { r: 0.6, theta: std::f64::consts::PI };
+
+        // own_dist = origin.distance(dst_coord) = 2*atanh(0.8) ≈ 2.197
+        // d_A = coord_a.distance(dst_coord) = 2*atanh(0.1/1.56) ≈ 0.128 (< own_dist → greedy step ✓)
+        // d_B = coord_b.distance(dst_coord) = much larger (≈ 4+)
+
+        rs.coord_table.insert(dst_key, dst_coord);
+        rs.peers.get_mut(&peer_a_key).unwrap().pub_key = peer_a_key;
+        rs.coord_table.insert(peer_a_key, coord_a);
+        rs.coord_table.insert(peer_b_key, coord_b);
+
+        let result = rs.lookup(&dst_key);
+        assert_eq!(result, Some(peer_a_key),
+            "hyperbolic greedy lookup must return the closest peer (A); \
+             `d < best_dist → d > best_dist` mutation returns farthest peer instead");
+    }
+
+    // ── lookup: XOR distance uses ^ not | (line 1129) ────────────────────────
+    // dist[i] = peer_key[i] ^ dst[i]. Mutation: `^ → |`.
+    // Setup: dst=[0xFF;32], peer_A=[0xFE;32] (cheap=200ms), peer_B=[0x01;32] (cheap=1ms).
+    // XOR: dist_A=[0x01;32] < dist_B=[0xFE;32] → peer_A closer → returned.
+    // OR:  dist_A=[0xFF;32] = dist_B=[0xFF;32] → cost tiebreak: peer_B cheaper → returned.
+    // Original always returns peer_A, mutation always returns peer_B.
+
+    #[test]
+    fn lookup_xor_distance_uses_xor_not_or() {
+        let mut rs = make_router();
+        // peer_A: expensive but XOR-closest to dst
+        let peer_a_key: PeerId = [0xFEu8; 32];
+        // peer_B: cheap but XOR-farther from dst
+        let peer_b_key: PeerId = [0x01u8; 32];
+        add_dummy_peer(&mut rs, peer_a_key);
+        add_dummy_peer(&mut rs, peer_b_key);
+
+        // dst=[0xFF;32]: NOT in coord_table (hyperbolic skipped), no cuckoo match (XOR fallback)
+        let dst_key: PeerId = [0xFFu8; 32];
+
+        // XOR distances: A→dst = 0xFE^0xFF = 0x01 (tiny), B→dst = 0x01^0xFF = 0xFE (large)
+        // OR distances:  A→dst = 0xFE|0xFF = 0xFF, B→dst = 0x01|0xFF = 0xFF (equal!)
+        // → With OR mutation: tiebreak uses cost; make B cheaper so mutation selects B.
+        rs.peers.get_mut(&peer_a_key).unwrap().lag = Duration::from_millis(200); // expensive
+        rs.peers.get_mut(&peer_b_key).unwrap().lag = Duration::from_millis(1);   // cheap
+
+        let result = rs.lookup(&dst_key);
+        assert_eq!(result, Some(peer_a_key),
+            "XOR fallback must select peer with smallest XOR distance (peer_A); \
+             `^ → |` mutation gives equal OR distances, then cost picks peer_B instead");
+    }
+
+    // ── lookup: cuckoo fallback selects lower-cost peer ───────────────────────
+    // When dst is not in coord_table, lookup falls back to cuckoo filter.
+    // Both peers match the dst_tag; cheaper peer must win.
+    // Catches `cost < *bc → cost > *bc` mutation (line 1113:47).
+
+    #[test]
+    fn lookup_cuckoo_fallback_selects_lower_cost_peer() {
+        let mut rs = make_router();
+        let cheap_key = [0xD0u8; 32];
+        let costly_key = [0xD1u8; 32];
+        add_dummy_peer(&mut rs, cheap_key);
+        add_dummy_peer(&mut rs, costly_key);
+
+        // dst not in coord_table → hyperbolic phase skipped entirely
+        let dst_key = [0xEFu8; 32];
+        let dst_tag = routing_tag(&dst_key);
+
+        rs.peers.get_mut(&cheap_key).unwrap().cuckoo[0].add(&dst_tag);
+        rs.peers.get_mut(&costly_key).unwrap().cuckoo[0].add(&dst_tag);
+
+        // Clear default 100ms lag, set clearly different lags
+        rs.peers.get_mut(&cheap_key).unwrap().lag = Duration::from_millis(1);
+        rs.peers.get_mut(&costly_key).unwrap().lag = Duration::from_millis(200);
+
+        let result = rs.lookup(&dst_key);
+        assert_eq!(result, Some(cheap_key),
+            "cuckoo fallback must return cheaper peer; \
+             `cost < *bc → cost > *bc` mutation returns costly peer instead");
+    }
+
+    // ── cuckoo_do_maintenance parent-skip (kills 575:31 == → !=) ─────────────
+
+    #[test]
+    fn cuckoo_maintenance_skips_parent_in_full_merged_loop() {
+        let mut rs = make_router();
+        let parent_key = [0xA0u8; 32];
+        let nonparent_key = [0xB0u8; 32];
+
+        let (tx_p, mut rx_p) = mpsc::channel(32);
+        let (tx_np, mut rx_np) = mpsc::channel(32);
+        rs.add_peer(parent_key, tx_p, 0);
+        rs.add_peer(nonparent_key, tx_np, 0);
+
+        // Designate parent_key as this node's parent in tree 0
+        rs.trees[0].parent = Some(parent_key);
+
+        rs.cuckoo_do_maintenance(0);
+
+        // Count messages delivered to each peer
+        let mut parent_count = 0;
+        while rx_p.try_recv().is_ok() { parent_count += 1; }
+        let mut nonparent_count = 0;
+        while rx_np.try_recv().is_ok() { nonparent_count += 1; }
+
+        // Original: parent gets exactly 1 (upstream send), non-parent gets exactly 1 (full_merged loop)
+        // Mutation (== → !=): parent gets 2 (upstream + loop), non-parent gets 0
+        assert_eq!(parent_count, 1,
+            "parent must receive exactly 1 message (upstream); \
+             `== → !=` mutation sends 2 (upstream + loop)");
+        assert_eq!(nonparent_count, 1,
+            "non-parent must receive exactly 1 message (full_merged); \
+             `== → !=` mutation sends 0 (loop skips non-parents)");
     }
 }

@@ -33,6 +33,7 @@ toml = "0.8"
 socket2 = { version = "0.5", features = ["all"] }
 tun2 = { version = "3", features = ["async"], optional = true }
 clap = { version = "4", features = ["derive"] }
+mutants = "0.0.3"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }

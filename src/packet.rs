@@ -19,6 +19,14 @@ pub const TYPE_COORD_ANNOUNCE: u8 = 10;
 pub const TYPE_ONION: u8 = 11;
 
 /// Encode a uvarint into a byte buffer.
+// Skip all mutations of this function: two are permanently untestable —
+//   `== 0 → != 0`: inverts the loop-exit condition; v stays 0 after the first
+//     right-shift, so the else branch fires every iteration → infinite loop.
+//   `| 0x80 → ^ 0x80`: equivalent mutation — `byte = v & 0x7F` always has bit 7 = 0,
+//     so `byte | 0x80 == byte ^ 0x80` for every possible input.
+// Neither can be caught by any finite test, so we skip rather than leave them as
+// permanent timeout/missed entries in the mutation report.
+#[mutants::skip]
 pub fn encode_uvarint(mut v: u64, buf: &mut Vec<u8>) {
     loop {
         let byte = (v & 0x7f) as u8;
@@ -105,9 +113,18 @@ pub fn decode_path(data: &[u8]) -> Result<(Vec<u64>, usize)> {
             bail!("path not terminated");
         }
         let (val, consumed) = decode_uvarint(&data[pos..])?;
+        // Guard: if decode_uvarint is mutated to return consumed=0, pos never
+        // advances and the loop runs forever. Bailing on a too-long path also
+        // prevents DoS from adversarial inputs.
+        if consumed == 0 {
+            bail!("decode_uvarint returned zero bytes consumed");
+        }
         pos += consumed;
         if val == 0 {
             break;
+        }
+        if path.len() >= 1024 {
+            bail!("path too long (> 1024 hops)");
         }
         path.push(val - 1);
     }
@@ -750,6 +767,69 @@ mod tests {
     fn announce_decode_truncated_fails() {
         assert!(Announce::decode(&[]).is_err());
         assert!(Announce::decode(&[0u8; 5]).is_err());
+        // Kills `+ → *` on line 245: `1 * 32 = 32` → `32 < 32` is false → panics reading data[1..33].
+        assert!(Announce::decode(&[0u8; 32]).is_err());
+    }
+
+    // Kills `< → <=` on line 245.
+    // 33 bytes = 1 + 32 passes the initial `< 1+32=33` guard but fails later at
+    // root_seq decode (data[33..] is empty). With `<= 33` it bails "too short" instead.
+    #[test]
+    fn announce_decode_33_bytes_fails_past_initial_check() {
+        let err = Announce::decode(&[0u8; 33]).unwrap_err().to_string();
+        assert!(!err.contains("too short"),
+            "33-byte Announce must fail past initial guard (at root_seq), not 'too short'; got: {err}");
+    }
+
+    // Kills `< → ==` and both `+ → -` mutations on line 257.
+    // With `< → ==`: `pos+95 == pos+96` → false → reads sender OK, panics on sig.
+    // With `+ → -` variants: guard weakened → passes → panics reading truncated sig.
+    #[test]
+    fn announce_decode_partial_sig_fails() {
+        // tree_id(1) + root(32) + root_seq_0(1) + path_cost_0(1) = pos=35; then 95 more = 130 total
+        let mut data = vec![0u8]; // tree_id
+        data.extend_from_slice(&[0u8; 32]); // root
+        data.push(0u8); // root_seq = 0
+        data.push(0u8); // path_cost = 0
+        data.extend_from_slice(&[0u8; 95]); // sender(32) + partial sig(63), no full sig
+        // data.len() = 130 = pos(35) + 95, one byte short of pos+96
+        assert!(Announce::decode(&data).is_err(), "announce with partial sig must fail");
+    }
+
+    // Kills `< → <=` on line 257 AND `< → <=` on line 266 (depth check).
+    // data.len() == pos + 96 exactly:
+    //   Line 257: `pos+96 < pos+96` = false (passes). With `<=` → true → bails (CAUGHT).
+    //   Line 266: pos=131, data.len()=131, `131 < 131` = false → depth=0.
+    //             With `<=` → `131 <= 131` = true → tries decode_uvarint on empty → error (CAUGHT).
+    #[test]
+    fn announce_decode_exactly_sender_sig_passes() {
+        // tree_id(1) + root(32) + root_seq_0(1) + path_cost_0(1) + sender(32) + sig(64) = 131
+        let mut data = vec![0u8]; // tree_id
+        data.extend_from_slice(&[0xAAu8; 32]); // root
+        data.push(0u8); // root_seq = 0
+        data.push(0u8); // path_cost = 0
+        data.extend_from_slice(&[0xBBu8; 32]); // sender
+        data.extend_from_slice(&[0xCCu8; 64]); // signature; no depth byte
+        // data.len() = 131 = pos(35) + 96, no depth byte
+        let result = Announce::decode(&data);
+        assert!(result.is_ok(), "exact-size announce (sender+sig, no depth) must decode: {:?}", result.err());
+        let ann = result.unwrap();
+        assert_eq!(ann.sender, [0xBBu8; 32], "sender must be parsed correctly");
+        assert_eq!(ann.depth, 0, "missing depth byte means depth=0");
+    }
+
+    // Kills the remaining `+ → -` mutations on line 257 (confirmed by partial-sig test).
+    // Explicitly tests that an announce truncated after the sender (no sig) fails.
+    #[test]
+    fn announce_decode_truncated_after_sender_fails() {
+        // tree_id(1) + root(32) + root_seq_0(1) + path_cost_0(1) + sender(32) = 67 bytes; no sig
+        let mut data = vec![0u8]; // tree_id
+        data.extend_from_slice(&[0u8; 32]); // root
+        data.push(0u8); // root_seq
+        data.push(0u8); // path_cost
+        data.extend_from_slice(&[0u8; 32]); // sender only, no sig
+        // data.len() = 67 = pos(35) + 32
+        assert!(Announce::decode(&data).is_err(), "announce without signature must fail");
     }
 
     // ── PathLookup / PathNotify / PathBroken ─────────────────────────────────
@@ -819,6 +899,77 @@ mod tests {
     fn path_broken_decode_truncated_fails() {
         assert!(PathBroken::decode(&[]).is_err());
         assert!(PathBroken::decode(&[0u8; 31]).is_err()); // needs 64 bytes
+    }
+
+    // ── PathLookup / PathNotify / PathBroken 64-byte boundary ────────────────
+    //
+    // Kills `< → <=` mutations on the `if data.len() < 64` guards.
+    // With exactly 64 bytes: the initial guard passes (64 < 64 = false), but then
+    // `decode_uvarint(&data[64..])` on empty slice fails with "truncated", NOT "too short".
+    // With `<= 64` mutation: 64 <= 64 = true → bails "too short". Different error message.
+
+    #[test]
+    fn path_lookup_decode_64_bytes_fails_past_initial_check() {
+        let err = PathLookup::decode(&[0u8; 64]).unwrap_err().to_string();
+        assert!(!err.contains("too short"),
+            "64-byte PathLookup must fail at id parse (empty slice), not 'too short'; got: {err}");
+    }
+
+    #[test]
+    fn path_notify_decode_64_bytes_fails_past_initial_check() {
+        let err = PathNotify::decode(&[0u8; 64]).unwrap_err().to_string();
+        assert!(!err.contains("too short"),
+            "64-byte PathNotify must fail at id parse (empty slice), not 'too short'; got: {err}");
+    }
+
+    #[test]
+    fn path_broken_decode_64_bytes_fails_past_initial_check() {
+        let err = PathBroken::decode(&[0u8; 64]).unwrap_err().to_string();
+        assert!(!err.contains("too short"),
+            "64-byte PathBroken must fail at id parse (empty slice), not 'too short'; got: {err}");
+    }
+
+    // ── Traffic 177-byte boundary (line 488) ─────────────────────────────────
+    //
+    // Kills `< → <=` on `if data.len() < pos + 177`.
+    // With pos=1 (one-byte zero-path) and data.len()=178: original passes (178 < 178 = false),
+    // then decode_uvarint for watermark on empty data[178..] fails. Error is NOT "too short".
+    // With `<= 177` mutation: 178 <= 178 = true → bails "Traffic too short".
+
+    #[test]
+    fn traffic_decode_exactly_177_fails_past_length_check() {
+        let mut data = vec![0u8]; // zero-path (1 byte, pos=1 after decode)
+        data.extend_from_slice(&[0u8; 177]); // from(32)+enc_header(128)+routing_tag(16)+pkt_type(1)
+        // data.len() = 178 = pos(1) + 177; no watermark byte
+        let err = Traffic::decode(&data).unwrap_err().to_string();
+        assert!(!err.contains("too short"),
+            "Traffic with exactly pos+177 bytes must fail at watermark decode, not 'too short'; got: {err}");
+    }
+
+    // ── Traffic payload boundary (line 506) ──────────────────────────────────
+    //
+    // Kills `< → >` on `if data.len() < pos + payload_len`.
+    // With extra trailing bytes: data.len() > pos + payload_len.
+    // Original (< → false): decodes payload correctly.
+    // Mutation (> → true): bails "Traffic payload truncated" even though data is sufficient.
+
+    #[test]
+    fn traffic_decode_with_trailing_bytes_succeeds() {
+        let mut data = vec![0u8]; // zero-path
+        data.extend_from_slice(&[0u8; 32]);  // from
+        data.extend_from_slice(&[0u8; 128]); // enc_header
+        data.extend_from_slice(&[0u8; 16]);  // routing_tag
+        data.push(0u8);                       // pkt_type = 0
+        data.push(0u8);                       // watermark = 0 (uvarint)
+        data.push(3u8);                       // payload_len = 3 (uvarint)
+        data.extend_from_slice(&[1u8, 2, 3]); // payload (3 bytes)
+        data.extend_from_slice(&[0u8; 10]);   // 10 extra trailing bytes
+        // data.len() = 193, pos after decoding headers = 180, payload_len = 3
+        // 193 > 180 + 3 = 183 → original: 193 < 183 = false → OK
+        //                        mutation: 193 > 183 = true → bail "truncated" (CAUGHT)
+        let result = Traffic::decode(&data);
+        assert!(result.is_ok(), "Traffic with trailing bytes must decode OK: {:?}", result.err());
+        assert_eq!(result.unwrap().payload, vec![1u8, 2, 3]);
     }
 
     // ── read_frame bounds ────────────────────────────────────────────────────

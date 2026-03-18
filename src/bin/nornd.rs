@@ -37,6 +37,10 @@ enum Command {
     Showaddr,
 }
 
+// Skip mutations of main: it is an integration entry point that calls tokio::signal::ctrl_c()
+// and network I/O that cannot be unit-tested. Any mutation here (e.g. replace with Ok(()))
+// would require a full end-to-end integration test to catch.
+#[mutants::skip]
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();

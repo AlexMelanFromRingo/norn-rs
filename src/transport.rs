@@ -26,6 +26,9 @@ pub fn parse_tcp_uri(uri: &str) -> Result<String> {
 }
 
 /// Exchange ed25519 pub keys — simple 32+32 byte framed handshake.
+// Skip mutations: reads/writes over a live TcpStream — requires a real TCP
+// connection to verify. All mutations affect I/O that cannot be unit-tested.
+#[mutants::skip]
 async fn handshake(stream: &mut TcpStream, our_pub: &[u8; 32]) -> Result<[u8; 32]> {
     // Send ours first, then read theirs (simultaneous send avoids deadlock).
     let (mut reader, mut writer) = stream.split();
@@ -42,6 +45,9 @@ async fn handshake(stream: &mut TcpStream, our_pub: &[u8; 32]) -> Result<[u8; 32
 }
 
 /// Start a TCP listener. Accepts peers, performs handshake, calls handle_conn.
+// Skip mutations: infinite accept loop over a real TcpListener — mutations
+// (early return, missing accept, etc.) require a live network to observe.
+#[mutants::skip]
 pub async fn listen(
     uri: &str,
     conn: Arc<PacketConn>,
@@ -86,6 +92,9 @@ pub async fn listen(
 }
 
 /// Dial a peer by URI with automatic reconnection (exponential backoff).
+// Skip mutations: retry loop with real TcpStream connect and backoff —
+// mutations to connection logic, dedup, and backoff require a live network.
+#[mutants::skip]
 pub async fn dial(uri: &str, conn: Arc<PacketConn>, connected: ConnectedPeers) {
     let addr = match parse_tcp_uri(uri) {
         Ok(a) => a,
