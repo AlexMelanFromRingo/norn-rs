@@ -61,6 +61,82 @@ pub fn new_key_store() -> SharedKeyStore {
     Arc::new(Mutex::new(KeyStore::new()))
 }
 
+// ── ICMPv6 helper ─────────────────────────────────────────────────────────
+
+/// Build an ICMPv6 Destination Unreachable (type 1, code 0 — no route) packet
+/// to send back via TUN when a norn destination address cannot be resolved.
+///
+/// Structure (RFC 4443):
+///   IPv6 header (40 bytes): src=our_addr, dst=orig_src, next_hdr=58, hop_limit=64
+///   ICMPv6 body: type(1) + code(1) + checksum(2) + unused(4) + original_pkt (truncated)
+///
+/// Total size is capped at 1280 bytes (IPv6 minimum MTU) per RFC 4443 §2.4.
+pub fn icmpv6_dest_unreachable(our_addr: &[u8; 16], orig_pkt: &[u8]) -> Option<Vec<u8>> {
+    if orig_pkt.len() < 40 {
+        return None; // cannot extract src address from a malformed packet
+    }
+    let orig_src = &orig_pkt[8..24]; // bytes 8-23 of IPv6 header = source address
+
+    // ICMPv6 payload = 4 bytes type/code/checksum + 4 bytes unused + original packet
+    // Total IPv6 packet capped at 1280 bytes (IPv6 min MTU).
+    const MAX_TOTAL: usize = 1280;
+    const IPV6_HDR: usize = 40;
+    const ICMP_OVERHEAD: usize = 8; // type(1)+code(1)+checksum(2)+unused(4)
+    let max_orig = MAX_TOTAL - IPV6_HDR - ICMP_OVERHEAD;
+    let orig_len = orig_pkt.len().min(max_orig);
+
+    let icmpv6_len = ICMP_OVERHEAD + orig_len;
+    let mut pkt = Vec::with_capacity(IPV6_HDR + icmpv6_len);
+
+    // ── IPv6 header ────────────────────────────────────────────────────────
+    pkt.push(0x60); // version=6, traffic class high nibble=0
+    pkt.extend_from_slice(&[0u8; 3]); // traffic class low + flow label
+    pkt.extend_from_slice(&(icmpv6_len as u16).to_be_bytes()); // payload length
+    pkt.push(58); // next header = ICMPv6
+    pkt.push(64); // hop limit
+    pkt.extend_from_slice(our_addr); // source
+    pkt.extend_from_slice(orig_src); // destination (original sender)
+
+    // ── ICMPv6 body (checksum = 0 placeholder) ────────────────────────────
+    let icmp_start = pkt.len();
+    pkt.push(1);   // type: Destination Unreachable
+    pkt.push(0);   // code: No route to destination
+    pkt.extend_from_slice(&[0u8; 2]); // checksum placeholder
+    pkt.extend_from_slice(&[0u8; 4]); // unused
+    pkt.extend_from_slice(&orig_pkt[..orig_len]);
+
+    // ── ICMPv6 checksum (RFC 4443 §2.3 — IPv6 pseudo-header) ──────────────
+    // Pseudo-header: src(16) + dst(16) + length(4) + zeros(3) + next_hdr(1)
+    let mut csum_buf = Vec::with_capacity(40 + icmpv6_len);
+    csum_buf.extend_from_slice(our_addr);
+    csum_buf.extend_from_slice(orig_src);
+    csum_buf.extend_from_slice(&(icmpv6_len as u32).to_be_bytes());
+    csum_buf.extend_from_slice(&[0u8, 0, 0, 58]); // zeros(3) + next_hdr=58
+    csum_buf.extend_from_slice(&pkt[icmp_start..]);
+
+    let checksum = internet_checksum(&csum_buf);
+    pkt[icmp_start + 2] = (checksum >> 8) as u8;
+    pkt[icmp_start + 3] = (checksum & 0xFF) as u8;
+
+    Some(pkt)
+}
+
+/// Internet checksum (RFC 1071): one's complement sum of 16-bit words.
+fn internet_checksum(data: &[u8]) -> u16 {
+    let mut sum: u32 = 0;
+    let mut chunks = data.chunks_exact(2);
+    for chunk in chunks.by_ref() {
+        sum += u16::from_be_bytes([chunk[0], chunk[1]]) as u32;
+    }
+    if let Some(&byte) = chunks.remainder().first() {
+        sum += (byte as u32) << 8;
+    }
+    while sum >> 16 != 0 {
+        sum = (sum & 0xFFFF) + (sum >> 16);
+    }
+    !(sum as u16)
+}
+
 // ── TUN adapter ───────────────────────────────────────────────────────────
 
 // Skip mutations: creates a real TUN device (requires CAP_NET_ADMIN), configures
@@ -72,15 +148,19 @@ pub async fn start(
     conn: Arc<PacketConn>,
     key_store: SharedKeyStore,
 ) -> Result<()> {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::io::AsyncReadExt;
 
     // Register our own key so we know our own address
     let our_addr = key_store.lock().unwrap().register(conn.pub_key);
     let our_addr_str = ipv6_string(&our_addr);
 
+    // TUN MTU: norn payload minus session overhead (ChaCha20 tag=16, length=2,
+    // padding up to 255 bytes worst-case). 65200 fits comfortably.
+    let tun_mtu = (conn.mtu() as u64).saturating_sub(300).max(1280) as u16;
+
     // Create TUN device
     let mut tun_config = tun2::Configuration::default();
-    tun_config.tun_name(tun_name).mtu(65535_u16);
+    tun_config.tun_name(tun_name).mtu(tun_mtu);
     let dev = tun2::create_as_async(&tun_config)
         .with_context(|| format!("creating TUN device '{}' (need CAP_NET_ADMIN or root)", tun_name))?;
 
@@ -88,13 +168,19 @@ pub async fn start(
     configure_interface(tun_name, &our_addr_str)?;
     info!("TUN interface {} up, address {}/7", tun_name, our_addr_str);
 
-    let (mut tun_reader, mut tun_writer) = tokio::io::split(dev);
+    // (split happens inside the outbound task setup above)
 
     // ── TUN → norn (outbound) ────────────────────────────────────────────
     let conn_out = conn.clone();
     let ks_out = key_store.clone();
+    // Clone writer half for ICMPv6 unreachable replies (shared via Arc<Mutex<>>)
+    let (tun_reader, tun_writer_raw) = tokio::io::split(dev);
+    let tun_writer = std::sync::Arc::new(tokio::sync::Mutex::new(tun_writer_raw));
+    let tun_writer_icmp = tun_writer.clone();
+
     tokio::spawn(async move {
         let mut buf = vec![0u8; 65536 + 4]; // +4 for tun2 header on some platforms
+        let mut tun_reader = tun_reader;
         loop {
             let n = match tun_reader.read(&mut buf).await {
                 Ok(0) | Err(_) => break,
@@ -150,7 +236,11 @@ pub async fn start(
                     }
                 }
                 None => {
-                    debug!("TUN: unknown dest {:?}, no key registered", &dest_addr[..4]);
+                    debug!("TUN: unknown dest {:?}, sending ICMPv6 unreachable", &dest_addr[..4]);
+                    if let Some(icmp) = icmpv6_dest_unreachable(&our_addr, pkt) {
+                        let mut w = tun_writer_icmp.lock().await;
+                        let _ = tokio::io::AsyncWriteExt::write_all(&mut *w, &icmp).await;
+                    }
                 }
             }
         }
@@ -169,7 +259,8 @@ pub async fn start(
             key_store.lock().unwrap().register(pkt.from);
 
             // Write the raw IPv6 packet to TUN
-            if let Err(e) = tun_writer.write_all(&pkt.payload).await {
+            let mut w = tun_writer.lock().await;
+            if let Err(e) = tokio::io::AsyncWriteExt::write_all(&mut *w, &pkt.payload).await {
                 warn!("TUN write: {}", e);
             }
         }

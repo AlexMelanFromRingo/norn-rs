@@ -8,6 +8,7 @@
 use anyhow::{Context, Result};
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tracing::{debug, info, warn};
@@ -16,6 +17,23 @@ use crate::router::PacketConn;
 
 /// Shared set of currently-connected peer pub keys (for dedup).
 pub type ConnectedPeers = Arc<Mutex<HashSet<[u8; 32]>>>;
+
+/// Apply TCP_NODELAY and SO_KEEPALIVE to a connected TcpStream.
+///
+/// Keepalive settings: first probe after 10s idle, retries every 3s, 3 retries.
+/// This detects silent peer failures (e.g. network partition, crashed process)
+/// within ~19 seconds without waiting for TCP's default 2-hour timeout.
+fn configure_socket(stream: &TcpStream) {
+    let _ = stream.set_nodelay(true);
+    let sock = socket2::SockRef::from(stream);
+    let ka = socket2::TcpKeepalive::new()
+        .with_time(Duration::from_secs(10))
+        .with_interval(Duration::from_secs(3))
+        .with_retries(3);
+    if let Err(e) = sock.set_tcp_keepalive(&ka) {
+        debug!("set_tcp_keepalive failed (non-fatal): {}", e);
+    }
+}
 
 /// Parse a peer URI and return the raw host:port string.
 /// Supported format: "tcp://host:port"
@@ -69,6 +87,7 @@ pub async fn listen(
         let connected = connected.clone();
         tokio::spawn(async move {
             let our_pub = conn.pub_key;
+            configure_socket(&stream);
             match handshake(&mut stream, &our_pub).await {
                 Ok(remote_pub) => {
                     // Dedup: skip if already connected
@@ -101,10 +120,11 @@ pub async fn dial(uri: &str, conn: Arc<PacketConn>, connected: ConnectedPeers) {
         Err(e) => { warn!("bad peer URI {}: {}", uri, e); return; }
     };
 
-    let mut delay = std::time::Duration::from_secs(1);
+    let mut delay = Duration::from_secs(1);
     loop {
         match TcpStream::connect(&addr).await {
             Ok(mut stream) => {
+                configure_socket(&stream);
                 let our_pub = conn.pub_key;
                 match handshake(&mut stream, &our_pub).await {
                     Ok(remote_pub) => {
@@ -112,7 +132,7 @@ pub async fn dial(uri: &str, conn: Arc<PacketConn>, connected: ConnectedPeers) {
                         let already = connected.lock().unwrap().contains(&remote_pub);
                         if already {
                             debug!("already connected to {:?}, not adding duplicate", &remote_pub[..4]);
-                            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                            tokio::time::sleep(Duration::from_secs(30)).await;
                             continue;
                         }
                         {
@@ -125,7 +145,7 @@ pub async fn dial(uri: &str, conn: Arc<PacketConn>, connected: ConnectedPeers) {
                         // The reader task calls remove_peer on disconnect.
                         connected.lock().unwrap().remove(&remote_pub);
                         // Reset backoff on successful connect
-                        delay = std::time::Duration::from_secs(5);
+                        delay = Duration::from_secs(5);
                     }
                     Err(e) => warn!("handshake with {} failed: {}", addr, e),
                 }
@@ -135,7 +155,10 @@ pub async fn dial(uri: &str, conn: Arc<PacketConn>, connected: ConnectedPeers) {
             }
         }
         tokio::time::sleep(delay).await;
-        delay = (delay * 2).min(std::time::Duration::from_secs(60));
+        // Exponential backoff with ±20% jitter to prevent thundering herd
+        let jitter = 0.8 + rand::random::<f64>() * 0.4;
+        delay = Duration::from_millis((delay.as_millis() as f64 * 2.0 * jitter) as u64)
+            .min(Duration::from_secs(60));
     }
 }
 

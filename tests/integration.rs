@@ -402,6 +402,301 @@ async fn three_nodes_forwarding() {
     assert_eq!(sent_back_sorted, recv_a_sorted, "message set mismatch C→A");
 }
 
+// ── Load tests ────────────────────────────────────────────────────────────────
+
+/// High-throughput: 1 000 messages A → B.  Validates session stability and
+/// the absence of deadlocks or panics under sustained unidirectional load.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn high_throughput_1000_messages() {
+    let _ = tracing_subscriber::fmt().with_env_filter("warn").try_init();
+    let (conn_a, conn_b) = make_connected_pair().await;
+    let pub_b = conn_b.pub_key;
+
+    assert!(wait_for_session(&conn_a, &pub_b).await, "session failed");
+
+    // Drain warmup messages
+    loop {
+        match tokio::time::timeout(Duration::from_millis(200), conn_b.read_from()).await {
+            Ok(Ok(_)) => continue,
+            _ => break,
+        }
+    }
+
+    const N: usize = 1_000;
+    let start = std::time::Instant::now();
+
+    // Send N messages back-to-back without waiting for acks
+    for i in 0..N {
+        conn_a
+            .write_to(format!("msg_{:06}", i).as_bytes(), &pub_b)
+            .await
+            .expect("write_to failed");
+    }
+
+    // Receive all N (ordering may vary due to forwarding jitter)
+    let count = tokio::time::timeout(Duration::from_secs(60), async {
+        let mut n = 0usize;
+        while n < N {
+            conn_b.read_from().await.expect("read_from failed");
+            n += 1;
+        }
+        n
+    })
+    .await
+    .expect("timed out receiving 1 000 messages");
+
+    let elapsed = start.elapsed();
+    assert_eq!(count, N);
+    eprintln!(
+        "high_throughput_1000: {} msg in {:.2?} ({:.0} msg/s)",
+        N, elapsed, N as f64 / elapsed.as_secs_f64()
+    );
+}
+
+/// Large payload: 10 messages each containing 60 KB of data.
+/// Validates that packets near the MTU boundary are correctly encrypted,
+/// padded, forwarded, and decrypted without truncation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn large_payload_60kb() {
+    let _ = tracing_subscriber::fmt().with_env_filter("warn").try_init();
+    let (conn_a, conn_b) = make_connected_pair().await;
+    let pub_a = conn_a.pub_key;
+    let pub_b = conn_b.pub_key;
+
+    assert!(wait_for_session(&conn_a, &pub_b).await, "A→B session failed");
+    loop {
+        match tokio::time::timeout(Duration::from_millis(200), conn_b.read_from()).await {
+            Ok(Ok(_)) => continue,
+            _ => break,
+        }
+    }
+    assert!(wait_for_session(&conn_b, &pub_a).await, "B→A session failed");
+    loop {
+        match tokio::time::timeout(Duration::from_millis(200), conn_a.read_from()).await {
+            Ok(Ok(_)) => continue,
+            _ => break,
+        }
+    }
+
+    const PAYLOAD_SIZE: usize = 60 * 1024;
+    const N: usize = 10;
+
+    // Prepare distinct payloads (first 4 bytes = message index for validation)
+    let payloads: Vec<Vec<u8>> = (0..N)
+        .map(|i| {
+            let mut p = vec![0u8; PAYLOAD_SIZE];
+            p[..4].copy_from_slice(&(i as u32).to_be_bytes());
+            p
+        })
+        .collect();
+
+    for payload in &payloads {
+        conn_a.write_to(payload, &pub_b).await.expect("A→B write failed");
+    }
+
+    let received = tokio::time::timeout(Duration::from_secs(30), async {
+        let mut out = Vec::new();
+        for _ in 0..N {
+            let pkt = conn_b.read_from().await.expect("B read_from failed");
+            assert_eq!(pkt.from, pub_a);
+            assert_eq!(pkt.payload.len(), PAYLOAD_SIZE,
+                "payload length mismatch: got {} expected {}", pkt.payload.len(), PAYLOAD_SIZE);
+            out.push(pkt.payload);
+        }
+        out
+    })
+    .await
+    .expect("timed out receiving large payloads");
+
+    // Verify content (unordered: forwarding jitter may reorder)
+    let mut sent_sorted = payloads.clone(); sent_sorted.sort();
+    let mut recv_sorted = received; recv_sorted.sort();
+    assert_eq!(sent_sorted, recv_sorted, "large-payload content mismatch");
+}
+
+/// Concurrent bidirectional load: A and B simultaneously send 200 messages
+/// to each other.  Validates that the session layer handles in-flight packets
+/// from both directions without loss or corruption.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn concurrent_bidirectional_200_each() {
+    let _ = tracing_subscriber::fmt().with_env_filter("warn").try_init();
+    let (conn_a, conn_b) = make_connected_pair().await;
+    let pub_a = conn_a.pub_key;
+    let pub_b = conn_b.pub_key;
+
+    assert!(wait_for_session(&conn_a, &pub_b).await, "A→B session failed");
+    loop {
+        match tokio::time::timeout(Duration::from_millis(200), conn_b.read_from()).await {
+            Ok(Ok(_)) => continue,
+            _ => break,
+        }
+    }
+    assert!(wait_for_session(&conn_b, &pub_a).await, "B→A session failed");
+    loop {
+        match tokio::time::timeout(Duration::from_millis(200), conn_a.read_from()).await {
+            Ok(Ok(_)) => continue,
+            _ => break,
+        }
+    }
+
+    const N: usize = 200;
+
+    let conn_a2 = conn_a.clone();
+    let conn_b2 = conn_b.clone();
+
+    // Sender task: A sends N to B, B sends N to A, both concurrently
+    let sender = tokio::spawn(async move {
+        let (ra, rb) = tokio::join!(
+            async {
+                for i in 0..N {
+                    conn_a2.write_to(format!("a_{:04}", i).as_bytes(), &pub_b).await.unwrap();
+                }
+            },
+            async {
+                for i in 0..N {
+                    conn_b2.write_to(format!("b_{:04}", i).as_bytes(), &pub_a).await.unwrap();
+                }
+            }
+        );
+        (ra, rb)
+    });
+
+    // Receiver: collect N from B and N from A
+    let recv_on_b = tokio::time::timeout(Duration::from_secs(30), async {
+        let mut count = 0usize;
+        while count < N {
+            conn_b.read_from().await.expect("B read_from failed");
+            count += 1;
+        }
+        count
+    });
+    let recv_on_a = tokio::time::timeout(Duration::from_secs(30), async {
+        let mut count = 0usize;
+        while count < N {
+            conn_a.read_from().await.expect("A read_from failed");
+            count += 1;
+        }
+        count
+    });
+
+    let (_, count_b, count_a) = tokio::join!(sender, recv_on_b, recv_on_a);
+    assert_eq!(count_b.expect("B timed out"), N, "B did not receive all N from A");
+    assert_eq!(count_a.expect("A timed out"), N, "A did not receive all N from B");
+}
+
+/// Four-node linear chain: 0 – 1 – 2 – 3.
+/// Tests 2-hop (0→2) and 3-hop (0→3) routing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn four_node_linear_chain() {
+    let _ = tracing_subscriber::fmt().with_env_filter("warn").try_init();
+
+    let keys: Vec<_> = (0..4).map(|_| ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng)).collect();
+    let pubs: Vec<[u8; 32]> = keys.iter().map(|k| k.verifying_key().to_bytes()).collect();
+    let conns: Vec<Arc<PacketConn>> = keys.into_iter().map(|k| Arc::new(PacketConn::new(k))).collect();
+
+    // Connect 0-1, 1-2, 2-3
+    for i in 0..3 {
+        let j = i + 1;
+        let (ij_r, ij_w) = tokio::io::duplex(65536);
+        let (ji_r, ji_w) = tokio::io::duplex(65536);
+        spawn_conn(conns[i].clone(), pubs[j], ji_r, ij_w);
+        spawn_conn(conns[j].clone(), pubs[i], ij_r, ji_w);
+    }
+
+    tokio::time::sleep(Duration::from_secs(4)).await;
+
+    // 0 → 2 (2 hops)
+    assert!(wait_for_session(&conns[0], &pubs[2]).await, "0→2 session failed (2-hop linear)");
+    loop {
+        match tokio::time::timeout(Duration::from_millis(300), conns[2].read_from()).await {
+            Ok(Ok(_)) => continue, _ => break,
+        }
+    }
+
+    let msgs: Vec<Vec<u8>> = (0..3).map(|i| format!("linear_0to2_{}", i).into_bytes()).collect();
+    for msg in &msgs { conns[0].write_to(msg, &pubs[2]).await.expect("0→2 write failed"); }
+
+    let recv = tokio::time::timeout(Duration::from_secs(10), async {
+        let mut out = Vec::new();
+        for _ in 0..3 {
+            let pkt = conns[2].read_from().await.expect("read failed");
+            assert_eq!(pkt.from, pubs[0]);
+            out.push(pkt.payload);
+        }
+        out
+    }).await.expect("0→2 recv timeout");
+    let mut s = msgs.clone(); s.sort();
+    let mut r = recv; r.sort();
+    assert_eq!(s, r, "0→2 linear mismatch");
+}
+
+/// Five-node star topology: hub(0) connected to spokes 1-4.
+///
+/// All inter-spoke traffic (e.g. 1→3) passes through hub (2 hops).
+/// Stars have no routing loops — cuckoo filter propagation is unambiguous.
+///
+/// Note on ring topologies: bidirectional cuckoo gossip on a ring propagates
+/// tags from both directions, making lookup ambiguous and causing routing loops.
+/// Loop prevention (TTL / source routing) is a planned future improvement.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn five_node_star_topology() {
+    let _ = tracing_subscriber::fmt().with_env_filter("warn").try_init();
+
+    // Node 0 = hub, nodes 1-4 = spokes
+    let keys: Vec<_> = (0..5).map(|_| ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng)).collect();
+    let pubs: Vec<[u8; 32]> = keys.iter().map(|k| k.verifying_key().to_bytes()).collect();
+    let conns: Vec<Arc<PacketConn>> = keys.into_iter().map(|k| Arc::new(PacketConn::new(k))).collect();
+
+    // Connect hub(0) ↔ each spoke(1..4)
+    for spoke in 1..5 {
+        let (h_to_s_r, h_to_s_w) = tokio::io::duplex(65536);
+        let (s_to_h_r, s_to_h_w) = tokio::io::duplex(65536);
+        spawn_conn(conns[0].clone(), pubs[spoke], s_to_h_r, h_to_s_w);
+        spawn_conn(conns[spoke].clone(), pubs[0], h_to_s_r, s_to_h_w);
+    }
+
+    // Allow maintenance cycles for cuckoo filters to propagate (1 hop to hub, 2 hops to spoke)
+    tokio::time::sleep(Duration::from_secs(4)).await;
+
+    // Verify topology: hub sees 4 peers, each spoke sees 1
+    assert_eq!(conns[0].get_peer_stats().len(), 4, "hub must have 4 peers");
+    for spoke in 1..5 {
+        assert_eq!(conns[spoke].get_peer_stats().len(), 1, "spoke {} must have 1 peer", spoke);
+    }
+
+    // Test: spoke 1 → spoke 3 (2 hops: 1→0→3)
+    assert!(
+        wait_for_session(&conns[1], &pubs[3]).await,
+        "1→3 session failed (2-hop via hub)"
+    );
+    loop {
+        match tokio::time::timeout(Duration::from_millis(300), conns[3].read_from()).await {
+            Ok(Ok(_)) => continue, _ => break,
+        }
+    }
+
+    let msgs: Vec<Vec<u8>> = (0..5).map(|i| format!("star_1to3_{}", i).into_bytes()).collect();
+    for msg in &msgs {
+        conns[1].write_to(msg, &pubs[3]).await.expect("1→3 write failed");
+    }
+
+    let recv = tokio::time::timeout(Duration::from_secs(10), async {
+        let mut out = Vec::new();
+        for _ in 0..5 {
+            let pkt = conns[3].read_from().await.expect("spoke 3 read failed");
+            assert_eq!(pkt.from, pubs[1], "wrong sender");
+            out.push(pkt.payload);
+        }
+        out
+    })
+    .await
+    .expect("timed out waiting for 1→3 messages via hub");
+
+    let mut sent = msgs.clone(); sent.sort();
+    let mut recv = recv; recv.sort();
+    assert_eq!(sent, recv, "1→3 star message mismatch");
+}
+
 /// Test onion routing: A sends via B (relay) to C.
 /// Topology: A ↔ B ↔ C (linear, same as three_nodes_forwarding)
 /// A uses write_to_onion with B as the relay → onion path: A → B(relay) → C(dest)

@@ -76,10 +76,14 @@ impl OnionPacket {
         let mut pos = 48;
         let (aead_len, n) = decode_uvarint(&data[pos..])?;
         pos += n;
-        if data.len() < pos + aead_len as usize {
+        let aead_len_usize = usize::try_from(aead_len)
+            .map_err(|_| anyhow::anyhow!("OnionPacket aead_len too large"))?;
+        let aead_end = pos.checked_add(aead_len_usize)
+            .ok_or_else(|| anyhow::anyhow!("OnionPacket aead_len overflow"))?;
+        if aead_end > data.len() {
             bail!("OnionPacket aead_payload truncated");
         }
-        let aead_payload = data[pos..pos + aead_len as usize].to_vec();
+        let aead_payload = data[pos..aead_end].to_vec();
         Ok(OnionPacket { routing_tag, epk, aead_payload })
     }
 

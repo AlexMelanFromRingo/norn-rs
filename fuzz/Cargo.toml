@@ -1,0 +1,35 @@
+[package]
+name = "norn-rs-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.norn-rs]
+path = ".."
+
+# Prevent this from interfering with workspace
+[workspace]
+
+[[bin]]
+name = "fuzz_packet_decode"
+path = "fuzz_targets/fuzz_packet_decode.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_session_decode"
+path = "fuzz_targets/fuzz_session_decode.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_uvarint"
+path = "fuzz_targets/fuzz_uvarint.rs"
+test = false
+doc = false

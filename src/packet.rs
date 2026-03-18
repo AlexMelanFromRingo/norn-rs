@@ -503,10 +503,14 @@ impl Traffic {
         pos += n;
         let (payload_len, n) = decode_uvarint(&data[pos..])?;
         pos += n;
-        if data.len() < pos + payload_len as usize {
-            bail!("Traffic payload truncated: need {}, got {}", payload_len, data.len() - pos);
+        let payload_len_usize = usize::try_from(payload_len)
+            .map_err(|_| anyhow::anyhow!("Traffic payload_len too large"))?;
+        let payload_end = pos.checked_add(payload_len_usize)
+            .ok_or_else(|| anyhow::anyhow!("Traffic payload_len overflow"))?;
+        if payload_end > data.len() {
+            bail!("Traffic payload truncated: need {}, got {}", payload_len_usize, data.len() - pos);
         }
-        let payload = data[pos..pos + payload_len as usize].to_vec();
+        let payload = data[pos..payload_end].to_vec();
         Ok(Traffic { path, from, enc_header, routing_tag, pkt_type, watermark, payload })
     }
 }
