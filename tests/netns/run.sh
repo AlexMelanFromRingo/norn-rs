@@ -111,15 +111,20 @@ write_config "$WORK/b" "${IP_B%/*}" "tcp://${IP_A%/*}:${PORT}" "$WORK/b/admin.so
 
 # ── start daemons ─────────────────────────────────────────────────────────
 echo "── starting daemons ──"
-ip netns exec "$NS_A" "$NORND" -c "$WORK/a/norn.toml" >"$WORK/a/log" 2>&1 &
+# RUST_LOG=info so the captured log shows handshake / session establishment
+# milestones — vital when the test fails in CI.
+ip netns exec "$NS_A" env RUST_LOG=norn_rs=info "$NORND" -c "$WORK/a/norn.toml" >"$WORK/a/log" 2>&1 &
 PID_A=$!
-ip netns exec "$NS_B" "$NORND" -c "$WORK/b/norn.toml" >"$WORK/b/log" 2>&1 &
+ip netns exec "$NS_B" env RUST_LOG=norn_rs=info "$NORND" -c "$WORK/b/norn.toml" >"$WORK/b/log" 2>&1 &
 PID_B=$!
 
 echo "PID_A=$PID_A  PID_B=$PID_B"
 
 # Wait for handshake + peer establishment.
-sleep 6
+# PQ-hybrid handshake adds ~80μs but the bigger cost is the cuckoo-filter
+# gossip propagation (needs ≥ 2 maintenance ticks @ 1 Hz) before write_to
+# can resolve the destination's routing tag. 15s gives comfortable margin.
+sleep 15
 
 # ── verify ────────────────────────────────────────────────────────────────
 get_addr() {
