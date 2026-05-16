@@ -20,6 +20,9 @@ allow = [
     "CC0-1.0",
     "MPL-2.0",
     "0BSD",
+    # WTFPL = "Do What The F*ck You Want To" — irrevocable, FSF-recognised
+    # as Free/Libre. Pulled in by `tun2` (only on the TUN-support path).
+    "WTFPL",
 ]
 confidence-threshold = 0.8
 

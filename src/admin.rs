@@ -7,7 +7,36 @@
 //   getPeers             — list of connected peers with stats
 //   addPeer {"uri":"tcp://host:port"}  — dial a new peer
 //   getRoutes            — hyperbolic coord table (debugging)
+//
+// UNIX-only. Windows binds need a different transport (named pipes); for now
+// a stub `listen` returns an error so the daemon can still compile and run
+// on Windows minus the admin socket.
 
+#[cfg(not(unix))]
+mod windows_stub {
+    use anyhow::{bail, Result};
+    use std::sync::Arc;
+    use crate::router::PacketConn;
+    use crate::transport::ConnectedPeers;
+
+    pub async fn listen(
+        _socket_path: &str,
+        _conn: Arc<PacketConn>,
+        _connected: ConnectedPeers,
+    ) -> Result<()> {
+        bail!("admin UNIX socket is not supported on Windows; \
+               compile on Unix or run a network-based admin endpoint instead");
+    }
+}
+
+#[cfg(not(unix))]
+pub use windows_stub::listen;
+
+#[cfg(unix)]
+pub use unix_impl::listen;
+
+#[cfg(unix)]
+mod unix_impl {
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -292,3 +321,5 @@ mod tests {
             "must contain address components; got {:?}", s);
     }
 }
+
+} // end mod unix_impl

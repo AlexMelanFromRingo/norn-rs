@@ -110,13 +110,12 @@ fn self_signed_cert() -> Result<(CertificateDer<'static>, PrivateKeyDer<'static>
     params.distinguished_name = rcgen::DistinguishedName::new();
     let cert = params.self_signed(&key).context("self-sign cert")?;
     let cert_der = CertificateDer::from(cert.der().to_vec());
+    // Decode the private key directly via rustls-pki-types' built-in PEM
+    // parsing — avoids the (unmaintained) rustls-pemfile crate.
+    use rustls_pki_types::pem::PemObject;
     let key_pem = key.serialize_pem();
-    let key_der: PrivateKeyDer<'static> = {
-        let mut reader = std::io::Cursor::new(key_pem.as_bytes());
-        rustls_pemfile::private_key(&mut reader)
-            .context("read PEM key")?
-            .ok_or_else(|| anyhow!("no key in PEM"))?
-    };
+    let key_der = PrivateKeyDer::from_pem_slice(key_pem.as_bytes())
+        .map_err(|e| anyhow!("rustls-pki-types pem decode: {e:?}"))?;
     Ok((cert_der, key_der))
 }
 

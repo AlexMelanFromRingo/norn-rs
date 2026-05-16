@@ -46,9 +46,8 @@ subtle = "2"
 mdns-sd = { version = "0.19", default-features = false, features = ["async"] }
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
-rustls-pki-types = "1"
+rustls-pki-types = { version = "1", features = ["std"] }
 rcgen = { version = "0.14", default-features = false, features = ["pem", "ring"] }
-rustls-pemfile = "2"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }

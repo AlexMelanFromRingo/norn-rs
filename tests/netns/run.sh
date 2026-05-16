@@ -117,7 +117,7 @@ sleep 6
 
 # ── verify ────────────────────────────────────────────────────────────────
 get_addr() {
-    "$NORND" showaddr -c "$1" | awk '/^address:/ {print $2}'
+    "$NORND" -c "$1" showaddr | awk '/^address:/ {print $2}'
 }
 
 ADDR_A=$(get_addr "$WORK/a/norn.toml")

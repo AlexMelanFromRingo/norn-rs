@@ -12,9 +12,12 @@
 //
 // Requires: Linux TUN/TAP support (CONFIG_TUN), root or CAP_NET_ADMIN.
 
-use anyhow::{Context, Result};
+use anyhow::Result;
+#[cfg(feature = "tun-support")]
+use anyhow::Context;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+#[cfg(feature = "tun-support")]
 use tracing::{debug, info, warn};
 
 use crate::address::address_from_key;
@@ -273,7 +276,7 @@ pub async fn start(
 #[mutants::skip]
 #[cfg(not(feature = "tun-support"))]
 pub async fn start(
-    tun_name: &str,
+    _tun_name: &str,
     _conn: Arc<PacketConn>,
     _key_store: SharedKeyStore,
 ) -> Result<()> {
@@ -324,6 +327,7 @@ fn configure_interface(name: &str, ipv6_addr: &str) -> Result<()> {
     Ok(())
 }
 
+#[cfg_attr(not(feature = "tun-support"), allow(dead_code))]
 fn ipv6_string(bytes: &[u8; 16]) -> String {
     use std::net::Ipv6Addr;
     let mut groups = [0u16; 8];

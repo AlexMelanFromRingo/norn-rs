@@ -41,10 +41,17 @@ pub type ConnectedPeers = Arc<Mutex<HashSet<[u8; 32]>>>;
 fn configure_socket(stream: &TcpStream) {
     let _ = stream.set_nodelay(true);
     let sock = socket2::SockRef::from(stream);
+    // .with_interval()/.with_retries() are only available on Unix targets in
+    // socket2 — Windows accepts only .with_time(). Gate accordingly so the
+    // crate builds on x86_64-pc-windows-msvc.
+    #[cfg(unix)]
     let ka = socket2::TcpKeepalive::new()
         .with_time(Duration::from_secs(10))
         .with_interval(Duration::from_secs(3))
         .with_retries(3);
+    #[cfg(not(unix))]
+    let ka = socket2::TcpKeepalive::new()
+        .with_time(Duration::from_secs(10));
     if let Err(e) = sock.set_tcp_keepalive(&ka) {
         debug!("set_tcp_keepalive failed (non-fatal): {}", e);
     }

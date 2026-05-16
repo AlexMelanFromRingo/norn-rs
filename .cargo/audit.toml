@@ -1,0 +1,16 @@
+# cargo-audit configuration.
+#
+# `cargo audit --deny warnings` (run in CI) treats unmaintained / unsound
+# advisories as hard failures. Override per-RUSTSEC with a written
+# justification so the auditor sees both that we know about the issue and
+# why we accept it.
+
+[advisories]
+ignore = [
+    # rand 0.8 is unsound IF you install a custom logger that calls
+    # `rand::rng()` from within `log::log!`. We have no `log` integration
+    # and our entire crate uses `OsRng` directly, never the global
+    # thread-local rng — we are not affected. Migrating to rand 0.9 is
+    # a multi-call-site API change planned for a future minor.
+    "RUSTSEC-2026-0097",
+]
