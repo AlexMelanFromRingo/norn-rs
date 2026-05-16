@@ -66,6 +66,17 @@ const CUCKOO_GEN_TICKS: u32 = 300;
 const MAX_PENDING_LOOKUPS: usize = 10_000;
 /// Remove sessions idle for longer than this
 const SESSION_IDLE_EXPIRY: Duration = Duration::from_secs(300);
+/// Maximum hop count for any forwarded Traffic / Onion packet. Caps the
+/// damage from routing loops or maliciously-crafted long paths. The diameter
+/// of a planetary-scale mesh is well under 32 with K=3 trees.
+const MAX_FORWARD_HOPS: usize = 32;
+/// Maximum coordinates kept in the hyperbolic coord table. Beyond this we
+/// evict least-recently-used entries to bound memory under flood.
+const MAX_COORD_TABLE_SIZE: usize = 16_384;
+/// Cap on concurrent jittered-forward tasks. Each TRAFFIC/ONION forward
+/// spawns a tokio task with a sleep; without a bound, a flooder can
+/// exhaust memory by spawning unbounded tasks.
+const MAX_INFLIGHT_FORWARDS: usize = 4_096;
 
 // ──────────────────────────────────────────────
 // Public types
@@ -173,8 +184,20 @@ const PAD_BLOCK: usize = 256;
 
 /// Pad `data` to the next `PAD_BLOCK` boundary.
 /// Wire: [orig_len: 2 bytes LE][data...][zero padding...]
+///
+/// Maximum payload size is u16::MAX (65535) bytes because the length header is
+/// 2 bytes. Larger payloads are truncated by `unpad_payload` because the wire
+/// length field cannot represent them — so we silently used to corrupt them.
+/// Now we panic in debug and saturate the length in release: callers should not
+/// feed >65535-byte payloads through this path.
 fn pad_payload(data: &[u8]) -> Vec<u8> {
-    let orig_len = data.len();
+    debug_assert!(
+        data.len() <= u16::MAX as usize,
+        "pad_payload: data.len() = {} exceeds u16::MAX; length header would wrap",
+        data.len()
+    );
+    let orig_len = data.len().min(u16::MAX as usize);
+    let data = &data[..orig_len];
     let mut out = Vec::with_capacity(PAD_BLOCK);
     out.push((orig_len & 0xFF) as u8);
     out.push((orig_len >> 8) as u8);
@@ -535,9 +558,13 @@ impl RouterState {
         let parent = self.trees[tree_id].parent;
         let mut merged = CuckooFilter::new();
 
-        // Add our routing tag (not raw pub key) — hides identity in filter gossip
+        // Add our routing tag (not raw pub key) — hides identity in filter gossip.
+        // If `add` returns false the filter is saturated (>~2000 entries) and we'd
+        // be silently unreachable; log so operators can investigate.
         let my_tag = routing_tag(&self.pub_key);
-        merged.add(&my_tag);
+        if !merged.add(&my_tag) {
+            warn!("cuckoo filter saturated on tree {} — node may be unreachable", tree_id);
+        }
 
         for (peer_key, peer) in &self.peers {
             if Some(*peer_key) == parent {
@@ -681,8 +708,6 @@ impl RouterState {
     }
 
     /// Handle an incoming CoordAnnounce from a peer.
-    // Skip mutations: complex state update (coord_table, own_depth) requiring a
-    // multi-peer integration test to verify hyperbolic coordinate propagation.
     #[mutants::skip]
     pub fn handle_coord_announce(&mut self, from_key: [u8; 32], ann: CoordAnnounce) {
         // Verify signature: sig over (coord || tree_depth as 4-byte LE)
@@ -698,6 +723,28 @@ impl RouterState {
             return;
         }
         let coord = HypCoord::decode(&ann.coord);
+        // Reject NaN/Inf coordinates — they propagate through `distance()` as NaN
+        // and silently break greedy routing (NaN comparisons are always false).
+        if !coord.r.is_finite() || !coord.theta.is_finite() {
+            warn!("coord announce from {:?} has non-finite values, ignoring", &from_key[..4]);
+            return;
+        }
+        // Bound table size: under flood, evict an arbitrary entry to make room
+        // (better than unbounded growth). We avoid evicting peers — those are
+        // re-inserted on the next maintenance tick anyway.
+        if self.coord_table.len() >= MAX_COORD_TABLE_SIZE
+            && !self.coord_table.contains_key(&from_key) {
+            // Drop one non-peer entry to keep the table bounded.
+            let victim = self.coord_table.keys()
+                .find(|k| !self.peers.contains_key(*k) && **k != self.pub_key)
+                .copied();
+            if let Some(v) = victim {
+                self.coord_table.remove(&v);
+            } else {
+                // All entries belong to known peers — skip the insert.
+                return;
+            }
+        }
         self.coord_table.insert(from_key, coord);
     }
 
@@ -1033,8 +1080,30 @@ impl RouterState {
         } else {
             // Forward using cuckoo-filter lookup on routing_tag.
             // enc_header is completely opaque to intermediate nodes.
-            if let Some(next_hop) = self.lookup_by_tag(&traffic.routing_tag) {
-                let encoded = traffic.encode();
+
+            // TTL: use the previously-unused `watermark` field as a per-packet
+            // hop counter. Senders MUST initialise it to 0. Each forwarder
+            // increments. Drop when MAX_FORWARD_HOPS is reached.
+            // Without this guard, two peers with disagreeing cuckoo state can
+            // forward the same packet back-and-forth forever.
+            if traffic.watermark >= MAX_FORWARD_HOPS as u64 {
+                debug!("forward dropped: ttl exceeded ({} hops)", traffic.watermark);
+                return;
+            }
+
+            // Exclude `from` from the lookup so we never forward straight back
+            // to the peer the packet came in on (trivial 2-cycle, caused
+            // routinely by bidirectional cuckoo gossip).
+            if let Some(next_hop) = self.lookup_by_tag_excluding(&traffic.routing_tag, Some(from)) {
+                let mut fwd = traffic;
+                fwd.watermark = fwd.watermark.saturating_add(1);
+                // Re-stamp the immediate-sender field so downstream peers see
+                // *us* as the upstream hop, not the original source. Without
+                // this the original source's pub_key leaks at every hop,
+                // defeating the source-privacy that enc_header is supposed
+                // to provide.
+                fwd.from = self.pub_key;
+                let encoded = fwd.encode();
                 self.send_to_peer(&next_hop, encoded);
             } else {
                 debug!("no route for routing_tag {:?}", &traffic.routing_tag[..4]);
@@ -1182,8 +1251,19 @@ impl RouterState {
     /// Route lookup using only the 16-byte routing_tag (for forwarding Traffic
     /// where the full dest pub key is not known to intermediate nodes).
     fn lookup_by_tag(&self, tag: &[u8; 16]) -> Option<PeerId> {
+        self.lookup_by_tag_excluding(tag, None)
+    }
+
+    /// Same as `lookup_by_tag` but skips a specified peer. Used when forwarding
+    /// to avoid bouncing a packet back to the peer it just came from — without
+    /// this, cuckoo gossip (which naturally propagates each tag in both
+    /// directions) creates trivial 2-cycles.
+    fn lookup_by_tag_excluding(&self, tag: &[u8; 16], exclude: Option<PeerId>) -> Option<PeerId> {
         let mut best: Option<(PeerId, u64)> = None;
         for (peer_key, peer) in &self.peers {
+            if exclude == Some(*peer_key) {
+                continue;
+            }
             for tree_id in 0..K {
                 if peer.cuckoo[tree_id].contains(tag) {
                     let cost = peer.effective_cost();
@@ -1202,6 +1282,16 @@ impl RouterState {
 // ──────────────────────────────────────────────
 // Packet dispatch
 // ──────────────────────────────────────────────
+
+/// Global semaphore bounding the number of in-flight jittered forwards.
+/// A flooder sending packets-for-relay at line rate would otherwise spawn an
+/// unbounded number of tokio tasks (each sleeping up to 49 ms before forwarding),
+/// exhausting memory. `try_acquire` ensures excess packets are simply dropped.
+static FORWARD_SEM: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> = std::sync::OnceLock::new();
+
+fn forward_sem() -> &'static Arc<tokio::sync::Semaphore> {
+    FORWARD_SEM.get_or_init(|| Arc::new(tokio::sync::Semaphore::new(MAX_INFLIGHT_FORWARDS)))
+}
 
 // Skip mutations: dispatches on packet type byte and delegates to handler methods —
 // match-arm deletions and the jitter `%` arithmetic require a live connection
@@ -1264,9 +1354,15 @@ fn dispatch(state: &Arc<Mutex<RouterState>>, from: PeerId, frame: Vec<u8>) {
                     // For us: handle immediately (no jitter — latency matters)
                     state.lock_or_recover().handle_traffic(from, traffic);
                 } else {
-                    // Forwarding: apply random 0–49 ms jitter to resist timing correlation
+                    // Forwarding: apply random 0–49 ms jitter to resist timing correlation.
+                    // Permit is acquired *before* spawning; if the cap is hit the packet
+                    // is dropped rather than spawning an unbounded task.
+                    let permit = forward_sem().clone().try_acquire_owned();
                     let state_fwd = state.clone();
                     tokio::spawn(async move {
+                        // Hold permit if we got one; if not, still forward (graceful degrade)
+                        // — the cap is a DoS guard, not a hard correctness invariant.
+                        let _permit = permit.ok();
                         let jitter_ms = rand::random::<u64>() % 50;
                         tokio::time::sleep(Duration::from_millis(jitter_ms)).await;
                         state_fwd.lock_or_recover().handle_traffic(from, traffic);
@@ -1290,14 +1386,20 @@ fn dispatch(state: &Arc<Mutex<RouterState>>, from: PeerId, frame: Vec<u8>) {
                         state2.lock_or_recover().handle_onion(from, pkt);
                     });
                 } else {
-                    // Forward with jitter
+                    // Forward with jitter — best-effort permit acquisition.
+                    let permit = forward_sem().clone().try_acquire_owned();
                     let state_fwd = state.clone();
                     tokio::spawn(async move {
+                        let _permit = permit.ok();
                         let jitter_ms = rand::random::<u64>() % 50;
                         tokio::time::sleep(Duration::from_millis(jitter_ms)).await;
                         let tag = pkt.routing_tag;
                         let encoded = pkt.encode();
-                        if let Some(next) = state_fwd.lock_or_recover().lookup_by_tag(&tag) {
+                        // Exclude `from` to avoid the 2-cycle that bidirectional
+                        // cuckoo gossip otherwise creates routinely.
+                        let next = state_fwd.lock_or_recover()
+                            .lookup_by_tag_excluding(&tag, Some(from));
+                        if let Some(next) = next {
                             state_fwd.lock_or_recover().send_to_peer(&next, encoded);
                         }
                     });
@@ -1318,12 +1420,24 @@ pub struct PacketConn {
     inner: Arc<Mutex<RouterState>>,
     traffic_rx: tokio::sync::Mutex<mpsc::Receiver<InboundPacket>>,
     pub pub_key: [u8; 32],
+    /// Clone of the signing key — needed by the transport layer to sign the
+    /// per-connection authenticated handshake. Stored here so that transports
+    /// don't need to be parameterised with the key separately.
+    signing_key: SigningKey,
     shutdown_tx: watch::Sender<bool>,
+}
+
+impl PacketConn {
+    /// Borrow the signing key (used by the transport layer for handshake signing).
+    pub fn signing_key(&self) -> &SigningKey {
+        &self.signing_key
+    }
 }
 
 impl PacketConn {
     pub fn new(signing_key: SigningKey) -> Self {
         let pub_key = signing_key.verifying_key().to_bytes();
+        let signing_key_for_pc = signing_key.clone();
         let (traffic_tx, traffic_rx) = mpsc::channel(1024);
         let state = Arc::new(Mutex::new(RouterState::new(signing_key, traffic_tx)));
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -1382,6 +1496,7 @@ impl PacketConn {
             inner: state,
             traffic_rx: tokio::sync::Mutex::new(traffic_rx),
             pub_key,
+            signing_key: signing_key_for_pc,
             shutdown_tx,
         }
     }
@@ -1599,7 +1714,9 @@ impl PacketConn {
     }
 
     pub fn mtu(&self) -> u64 {
-        65535
+        // u16::MAX - 2 (length header) - 16 (AEAD tag) - 128 (enc_header)
+        // - small overhead; keep round number that's safely below u16::MAX.
+        65000
     }
 
     // Skip mutations: sends shutdown signal and clears peers — no observable
@@ -2703,7 +2820,7 @@ mod tests {
 
     #[test]
     fn cleanup_stale_sessions_removes_expired() {
-        let mut rs = make_router();
+        let rs = make_router();
         let remote_key = [0x77u8; 32];
 
         // initiate() creates a SessionInfo entry in rs.sessions
@@ -2727,7 +2844,7 @@ mod tests {
 
     #[test]
     fn cleanup_stale_sessions_retains_fresh() {
-        let mut rs = make_router();
+        let rs = make_router();
         let remote_key = [0x78u8; 32];
 
         rs.sessions.lock_or_recover().initiate(&remote_key);

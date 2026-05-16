@@ -164,15 +164,50 @@ impl CuckooFilter {
         f
     }
 
-    /// OR-merge: union of two filters.
+    /// Merge `other` into `self` as a set union.
+    ///
+    /// A slot-wise OR isn't a set union — if both filters hold different
+    /// fingerprints at the same (bucket, slot) coordinate, one of them would
+    /// silently be lost. Instead we walk `other`'s fingerprints, check both
+    /// valid buckets in `self` for presence (dedup), and insert into the first
+    /// open slot of either valid bucket. If both buckets are full, a short
+    /// kick cascade relocates an existing item to make room — matching cuckoo
+    /// filter semantics.
     pub fn merge(&mut self, other: &CuckooFilter) {
         for i in 0..NUM_BUCKETS {
             for j in 0..SLOTS_PER_BUCKET {
-                let other_fp = other.buckets[i][j];
-                if other_fp != 0 && self.buckets[i][j] == 0 {
-                    self.buckets[i][j] = other_fp;
-                    self.count += 1;
+                let fp = other.buckets[i][j];
+                if fp == 0 { continue; }
+                let alt = Self::bucket2(i, fp);
+                if Self::contains_slot(&self.buckets[i], fp)
+                    || Self::contains_slot(&self.buckets[alt], fp) {
+                    continue;
                 }
+                if Self::insert_slot(&mut self.buckets[i], fp) {
+                    self.count += 1;
+                    continue;
+                }
+                if Self::insert_slot(&mut self.buckets[alt], fp) {
+                    self.count += 1;
+                    continue;
+                }
+                // Both buckets full — kick cascade with a small bound.
+                let mut cur_bucket = i;
+                let mut cur_fp = fp;
+                let mut rng = rand::thread_rng();
+                for _ in 0..32 {
+                    let slot = rng.gen_range(0..SLOTS_PER_BUCKET);
+                    std::mem::swap(&mut self.buckets[cur_bucket][slot], &mut cur_fp);
+                    let next = Self::bucket2(cur_bucket, cur_fp);
+                    if Self::insert_slot(&mut self.buckets[next], cur_fp) {
+                        self.count += 1;
+                        break;
+                    }
+                    cur_bucket = next;
+                }
+                // If kicks exhaust, `cur_fp` is lost; the filter's FPR degrades
+                // slightly but the cuckoo invariant (every fingerprint sits in
+                // one of its two valid buckets) is preserved.
             }
         }
     }

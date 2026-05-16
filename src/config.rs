@@ -5,6 +5,7 @@ use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
+use zeroize::Zeroize;
 
 #[derive(Deserialize, Serialize, Clone, Debug)]
 pub struct NodeConfig {
@@ -64,7 +65,26 @@ impl Default for NodeConfig {
 
 impl NodeConfig {
     /// Load config from a TOML file.
+    ///
+    /// Enforces 0o600 / no-group / no-other permissions on Unix because the file
+    /// contains the node's ed25519 private key. A world-readable config is a
+    /// configuration error, not a degraded mode — we refuse rather than warn.
     pub fn load(path: &Path) -> Result<Self> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let meta = std::fs::metadata(path)
+                .with_context(|| format!("stat'ing config {:?}", path))?;
+            // mode & 0o077 picks up the group + other bits. Any non-zero
+            // means readable/writable by someone other than the owner.
+            let mode = meta.mode() & 0o777;
+            if mode & 0o077 != 0 {
+                anyhow::bail!(
+                    "refusing to load config {path:?} with mode {mode:o}: \
+                     it contains the private key. Run: chmod 600 {path:?}"
+                );
+            }
+        }
         let text = std::fs::read_to_string(path)
             .with_context(|| format!("reading config {:?}", path))?;
         toml::from_str(&text).context("parsing TOML config")
@@ -105,19 +125,36 @@ log_level = "info"
     }
 
     /// Parse the private key from config, or generate a fresh ephemeral one.
+    ///
+    /// Private-key bytes are zeroized after the SigningKey is constructed —
+    /// SigningKey itself zeroizes on drop (via `zeroize` in ed25519-dalek 2.x).
     pub fn signing_key(&self) -> Result<SigningKey> {
         match &self.private_key {
             Some(hex_key) => {
-                let bytes = hex::decode(hex_key).context("decoding private_key hex")?;
+                let mut bytes = hex::decode(hex_key).context("decoding private_key hex")?;
                 if bytes.len() != 32 {
+                    bytes.zeroize();
                     anyhow::bail!("private_key must be 32 bytes (64 hex chars), got {}", bytes.len());
                 }
                 let mut arr = [0u8; 32];
                 arr.copy_from_slice(&bytes);
-                Ok(SigningKey::from_bytes(&arr))
+                bytes.zeroize();
+                let sk = SigningKey::from_bytes(&arr);
+                arr.zeroize();
+                Ok(sk)
             }
             None => {
-                tracing::warn!("no private_key in config, using ephemeral key (identity will change on restart)");
+                // Ephemeral keys are useful for testing but actively dangerous in
+                // production: the node's address changes every restart, peers
+                // re-pin nothing, and any operator-side audit log of "node X did Y"
+                // becomes worthless. Refuse unless an env var explicitly opts in.
+                if std::env::var("NORN_ALLOW_EPHEMERAL_KEY").is_err() {
+                    anyhow::bail!(
+                        "no private_key in config and NORN_ALLOW_EPHEMERAL_KEY is not set. \
+                         Run `nornd genconfig > norn.toml && chmod 600 norn.toml` for a stable identity."
+                    );
+                }
+                tracing::warn!("using ephemeral key (NORN_ALLOW_EPHEMERAL_KEY set) — identity will change on restart");
                 Ok(SigningKey::generate(&mut OsRng))
             }
         }
@@ -202,11 +239,22 @@ mod tests {
         assert!(cfg.signing_key().is_err(), "wrong-length key must fail");
     }
 
+    // Both ephemeral-key checks live in one test because they manipulate a
+    // process-global env var; running them in parallel would race.
     #[test]
-    fn signing_key_none_generates_ephemeral() {
+    fn signing_key_none_requires_explicit_opt_in() {
         let cfg = NodeConfig { private_key: None, ..Default::default() };
-        // Should succeed without error (generates fresh key)
-        assert!(cfg.signing_key().is_ok(), "None private_key must use ephemeral key");
+
+        // Phase 1: without the env var, must refuse.
+        unsafe { std::env::remove_var("NORN_ALLOW_EPHEMERAL_KEY"); }
+        assert!(cfg.signing_key().is_err(),
+            "ephemeral key must require explicit opt-in via NORN_ALLOW_EPHEMERAL_KEY");
+
+        // Phase 2: with the env var, must succeed.
+        unsafe { std::env::set_var("NORN_ALLOW_EPHEMERAL_KEY", "1"); }
+        let result = cfg.signing_key();
+        unsafe { std::env::remove_var("NORN_ALLOW_EPHEMERAL_KEY"); }
+        assert!(result.is_ok(), "explicit opt-in must allow ephemeral key");
     }
 
     // ── tcp_listen_port ───────────────────────────────────────────────────────
@@ -256,6 +304,12 @@ mod tests {
         let toml_str = NodeConfig::generate_toml();
         let mut tmp = tempfile::NamedTempFile::new().unwrap();
         tmp.write_all(toml_str.as_bytes()).unwrap();
+        // Lock down permissions before load() — load() refuses world-readable configs.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
         let cfg = NodeConfig::load(tmp.path()).unwrap();
         assert!(cfg.private_key.is_some(), "loaded config must have private_key");
     }
@@ -264,5 +318,20 @@ mod tests {
     fn load_nonexistent_file_fails() {
         let result = NodeConfig::load(Path::new("/nonexistent/path/norn.toml"));
         assert!(result.is_err(), "loading nonexistent file must fail");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn load_refuses_world_readable_config() {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+        let toml_str = NodeConfig::generate_toml();
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        tmp.write_all(toml_str.as_bytes()).unwrap();
+        // Deliberately permissive.
+        std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o644)).unwrap();
+        let err = NodeConfig::load(tmp.path()).unwrap_err().to_string();
+        assert!(err.contains("mode") || err.contains("600"),
+            "must reject world-readable config; got: {err}");
     }
 }

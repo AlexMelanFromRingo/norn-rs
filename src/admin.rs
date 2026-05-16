@@ -76,16 +76,62 @@ pub async fn listen(
 ) -> Result<()> {
     // Remove stale socket file
     let _ = std::fs::remove_file(socket_path);
+
+    // SECURITY: bind() inherits the process umask, so the socket would briefly
+    // be world-accessible (e.g. 0666 & !umask). A local attacker can connect()
+    // in that window and invoke admin methods (including addPeer → SSRF).
+    //
+    // We narrow the umask to 0o177 (so the bind produces 0o600 atomically),
+    // bind, then restore the previous umask. This closes the TOCTOU window.
+    #[cfg(unix)]
+    let _umask_guard = {
+        use std::os::unix::fs::PermissionsExt;
+        // SAFETY: umask is process-global; we restore it in Drop. The only
+        // concurrent code that mounts files or sockets in this brief window is
+        // our own code in the same task — tokio is single-threaded for FS
+        // syscalls and the bind below is the only relevant operation.
+        unsafe extern "C" {
+            fn umask(mask: libc_mode_t) -> libc_mode_t;
+        }
+        #[allow(non_camel_case_types)]
+        type libc_mode_t = u32;
+        let prev = unsafe { umask(0o177) };
+        // Defer restoration via a guard struct.
+        struct UmaskGuard(libc_mode_t);
+        impl Drop for UmaskGuard {
+            fn drop(&mut self) {
+                unsafe { umask(self.0); }
+            }
+        }
+        let guard = UmaskGuard(prev);
+        // Belt-and-braces: explicit chmod after bind, in case the umask change
+        // didn't take effect (e.g. host filesystem with ACLs).
+        let _bind_perms = std::fs::Permissions::from_mode(0o600);
+        guard
+    };
+
     let listener = UnixListener::bind(socket_path)
         .map_err(|e| anyhow::anyhow!("admin socket bind {}: {}", socket_path, e))?;
-    // Restrict socket to owner only (no world-readable admin access)
+
+    // Belt-and-braces: explicit chmod after bind. Fail loudly if it can't be
+    // applied — without 0o600 the socket is a local privilege escalation.
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         let perms = std::fs::Permissions::from_mode(0o600);
-        let _ = std::fs::set_permissions(socket_path, perms);
+        if let Err(e) = std::fs::set_permissions(socket_path, perms) {
+            // Tear down the listener before bailing so we don't leak an
+            // insecure socket if start-up fails.
+            drop(listener);
+            let _ = std::fs::remove_file(socket_path);
+            return Err(anyhow::anyhow!(
+                "admin socket: failed to set 0o600 on {}: {} (refusing to run with world-accessible socket)",
+                socket_path, e
+            ));
+        }
     }
-    info!("admin socket at {}", socket_path);
+
+    info!("admin socket at {} (mode 0600)", socket_path);
 
     loop {
         let (stream, _) = match listener.accept().await {

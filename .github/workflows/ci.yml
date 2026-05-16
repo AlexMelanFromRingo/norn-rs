@@ -1,0 +1,86 @@
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -Dwarnings
+
+jobs:
+  test:
+    name: Test (${{ matrix.os }}, Rust ${{ matrix.rust }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest]
+        rust: [stable, beta]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.rust }}
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
+      - name: Build
+        run: cargo build --all-features --all-targets
+
+      - name: Unit tests
+        run: cargo test --lib --all-features
+
+      - name: Integration tests
+        run: cargo test --test integration --all-features
+        env:
+          # Integration tests use mock streams; ephemeral keys are acceptable here.
+          NORN_ALLOW_EPHEMERAL_KEY: "1"
+
+      - name: Clippy
+        run: cargo clippy --all-features --all-targets -- -D warnings
+
+      - name: Format check
+        run: cargo fmt --all -- --check
+        continue-on-error: true   # advisory until the repo adopts rustfmt
+
+  audit:
+    name: cargo-audit (advisories)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-audit
+        run: cargo install --locked cargo-audit
+      - name: Audit
+        run: cargo audit --deny warnings
+
+  deny:
+    name: cargo-deny (licenses, bans, sources)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check bans licenses sources
+
+  fuzz-smoke:
+    name: Fuzz smoke (60s per target)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-fuzz
+        run: cargo install --locked cargo-fuzz
+      - name: Fuzz uvarint
+        run: cargo +nightly fuzz run fuzz_uvarint -- -max_total_time=60
+      - name: Fuzz packet decode
+        run: cargo +nightly fuzz run fuzz_packet_decode -- -max_total_time=60
+      - name: Fuzz session decode
+        run: cargo +nightly fuzz run fuzz_session_decode -- -max_total_time=60

@@ -731,7 +731,7 @@ dependencies = [
 
 [[package]]
 name = "norn-rs"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "blake2",
@@ -754,6 +754,7 @@ dependencies = [
  "tracing-subscriber",
  "tun2",
  "x25519-dalek",
+ "zeroize",
 ]
 
 [[package]]

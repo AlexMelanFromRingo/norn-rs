@@ -53,10 +53,17 @@ impl HypCoord {
     pub fn decode(data: &[u8; 16]) -> Self {
         let r = f64::from_le_bytes(data[..8].try_into().unwrap());
         let theta = f64::from_le_bytes(data[8..].try_into().unwrap());
-        Self {
-            r: r.clamp(0.0, 1.0 - 1e-10),
-            theta: theta % (2.0 * PI),
-        }
+        // Sanitise non-finite values — NaN/Inf would otherwise propagate through
+        // `distance()` and silently poison greedy routing (NaN comparisons are
+        // always false, so a NaN-coord node is effectively never closer/farther).
+        let r = if r.is_finite() { r.clamp(0.0, 1.0 - 1e-10) } else { 0.0 };
+        let theta = if theta.is_finite() {
+            // Use rem_euclid for a canonical [0, 2π) result regardless of sign.
+            theta.rem_euclid(2.0 * PI)
+        } else {
+            0.0
+        };
+        Self { r, theta }
     }
 
     /// Derive a deterministic θ from an ed25519 public key.
@@ -183,7 +190,7 @@ mod tests {
     fn angle_from_key_in_range() {
         let key = [0u8; 32];
         let angle = HypCoord::angle_from_key(&key);
-        assert!(angle >= 0.0 && angle < 2.0 * PI,
+        assert!((0.0..2.0 * PI).contains(&angle),
             "angle must be in [0, 2π), got {}", angle);
     }
 
@@ -339,8 +346,8 @@ mod tests {
         let angle_a = HypCoord::angle_from_key(&[0x00u8; 32]);
         let angle_b = HypCoord::angle_from_key(&[0xFFu8; 32]);
         // Both must be in [0, 2π)
-        assert!(angle_a >= 0.0 && angle_a < 2.0 * PI);
-        assert!(angle_b >= 0.0 && angle_b < 2.0 * PI);
+        assert!((0.0..2.0 * PI).contains(&angle_a));
+        assert!((0.0..2.0 * PI).contains(&angle_b));
         // They must differ (different keys → different hashes)
         assert_ne!(angle_a, angle_b, "all-0 and all-FF keys must produce different angles");
         // Maximum possible angle must be strictly < 2π (val/u64::MAX * 2π < 2π)
@@ -425,7 +432,7 @@ mod tests {
     fn angle_from_key_pinned_exact_value() {
         use blake2::{Blake2b512, Digest};
         let key = [0x42u8; 32];
-        let hash = Blake2b512::digest(&key);
+        let hash = Blake2b512::digest(key);
         let val = u64::from_le_bytes(hash[..8].try_into().unwrap());
         // Expected: (val / u64::MAX) * 2.0 * PI
         let expected = (val as f64 / u64::MAX as f64) * 2.0 * PI;

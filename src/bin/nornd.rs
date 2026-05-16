@@ -50,9 +50,27 @@ async fn main() -> Result<()> {
             let toml = NodeConfig::generate_toml();
             match output {
                 Some(path) => {
-                    std::fs::write(path, &toml)
-                        .with_context(|| format!("writing config to {:?}", path))?;
-                    eprintln!("config written to {:?}", path);
+                    // Write with 0o600 atomically: open with O_CREAT|O_EXCL|O_WRONLY
+                    // and a restrictive mode so the secret never exists with looser perms.
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::OpenOptionsExt;
+                        use std::io::Write;
+                        let mut f = std::fs::OpenOptions::new()
+                            .create_new(true)
+                            .write(true)
+                            .mode(0o600)
+                            .open(path)
+                            .with_context(|| format!("creating {:?} (refusing to overwrite)", path))?;
+                        f.write_all(toml.as_bytes())
+                            .with_context(|| format!("writing config to {:?}", path))?;
+                    }
+                    #[cfg(not(unix))]
+                    {
+                        std::fs::write(path, &toml)
+                            .with_context(|| format!("writing config to {:?}", path))?;
+                    }
+                    eprintln!("config written to {:?} (mode 0600)", path);
                 }
                 None => print!("{}", toml),
             }

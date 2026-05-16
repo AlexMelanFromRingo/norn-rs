@@ -1,0 +1,54 @@
+# cargo-deny config: https://embarkstudios.github.io/cargo-deny/
+
+[graph]
+all-features = true
+
+# ── Licences ──────────────────────────────────────────────────────────────────
+[licenses]
+# SPDX list — explicit allow-list. Anything outside fails the build.
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "MIT",
+    "MIT-0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "Zlib",
+    "CC0-1.0",
+    "MPL-2.0",
+    "0BSD",
+]
+confidence-threshold = 0.8
+
+# ── Advisories ────────────────────────────────────────────────────────────────
+[advisories]
+db-urls = ["https://github.com/rustsec/advisory-db"]
+yanked = "deny"
+ignore = []  # add advisory IDs here only with a written justification
+
+# ── Bans ──────────────────────────────────────────────────────────────────────
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+highlight = "all"
+
+# Crates we never want pulled in.
+deny = [
+    # OpenSSL leaks system entropy state and is hard to audit. We use rustls if needed.
+    { crate = "openssl-sys", reason = "use rustls / ring instead" },
+    # rust-crypto is unmaintained and has known issues.
+    { crate = "rust-crypto", reason = "unmaintained; use RustCrypto/aes, /chacha20poly1305 etc." },
+]
+
+# Allow more than one version only with explicit per-crate justification.
+skip = []
+
+# ── Sources ───────────────────────────────────────────────────────────────────
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

@@ -156,7 +156,7 @@ pub async fn start(
 
     // TUN MTU: norn payload minus session overhead (ChaCha20 tag=16, length=2,
     // padding up to 255 bytes worst-case). 65200 fits comfortably.
-    let tun_mtu = (conn.mtu() as u64).saturating_sub(300).max(1280) as u16;
+    let tun_mtu = conn.mtu().saturating_sub(300).max(1280) as u16;
 
     // Create TUN device
     let mut tun_config = tun2::Configuration::default();

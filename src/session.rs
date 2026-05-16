@@ -212,34 +212,94 @@ impl SessionInfo {
 // SessionInit / SessionAck wire format
 // ──────────────────────────────────────────────
 
-pub const SESSION_INIT_MAGIC: u8 = 0x53; // 'S'
-pub const SESSION_ACK_MAGIC: u8 = 0x41; // 'A'
+// v2 protocol: magic bytes changed to make incompatible peers fail loudly
+// at the very first parse step. v1 receivers will see "invalid magic" and
+// reject; v2 receivers see the lowercase variant and parse correctly.
+pub const SESSION_INIT_MAGIC: u8 = 0x73; // 's' (v2)
+pub const SESSION_ACK_MAGIC: u8 = 0x61;  // 'a' (v2)
 
-/// SessionInit wire format:
-/// [magic:1][ed_pub:32][sig:64][x25519_pub:32]
-/// sig covers: magic || ed_pub || x25519_pub
+/// Maximum clock skew tolerated for SessionInit/Ack timestamps, milliseconds.
+/// Inits older than this (relative to local wall clock) are rejected as replays;
+/// inits from too far in the future are also rejected (forward-skew abuse).
+pub const HANDSHAKE_TIME_WINDOW_MS: u64 = 60_000; // 60s
+
+/// SessionInit (v2) wire format:
+///   [magic:1][ed_pub:32][sig:64][x25519_pub:32][timestamp_ms:8 LE][recipient_ed_pub:32]
+/// sig covers: magic || ed_pub || x25519_pub || timestamp_ms || recipient_ed_pub
+///
+/// `recipient_ed_pub` binds the init to its intended responder, defeating cross-target
+/// replay. `timestamp_ms` limits the replay window to HANDSHAKE_TIME_WINDOW_MS.
 pub struct SessionInit {
     pub ed_pub: [u8; 32],
     pub signature: [u8; 64],
     pub x25519_pub: [u8; 32],
+    pub timestamp_ms: u64,
+    pub recipient_ed_pub: [u8; 32],
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+fn build_init_sign_bytes(
+    ed_pub: &[u8; 32],
+    x25519_pub: &[u8; 32],
+    timestamp_ms: u64,
+    recipient_ed_pub: &[u8; 32],
+) -> Vec<u8> {
+    let mut sign_data = Vec::with_capacity(1 + 32 + 32 + 8 + 32);
+    sign_data.push(SESSION_INIT_MAGIC);
+    sign_data.extend_from_slice(ed_pub);
+    sign_data.extend_from_slice(x25519_pub);
+    sign_data.extend_from_slice(&timestamp_ms.to_le_bytes());
+    sign_data.extend_from_slice(recipient_ed_pub);
+    sign_data
+}
+
+fn build_ack_sign_bytes(
+    ed_pub: &[u8; 32],
+    x25519_pub: &[u8; 32],
+    timestamp_ms: u64,
+    recipient_ed_pub: &[u8; 32],
+) -> Vec<u8> {
+    let mut sign_data = Vec::with_capacity(1 + 32 + 32 + 8 + 32);
+    sign_data.push(SESSION_ACK_MAGIC);
+    sign_data.extend_from_slice(ed_pub);
+    sign_data.extend_from_slice(x25519_pub);
+    sign_data.extend_from_slice(&timestamp_ms.to_le_bytes());
+    sign_data.extend_from_slice(recipient_ed_pub);
+    sign_data
 }
 
 impl SessionInit {
-    /// Create a SessionInit signed with our signing key, announcing our x25519 pub.
-    pub fn create(signing_key: &SigningKey, x25519_pub: &X25519PublicKey) -> Self {
+    /// Create a SessionInit bound to a specific recipient.
+    pub fn create(
+        signing_key: &SigningKey,
+        x25519_pub: &X25519PublicKey,
+        recipient_ed_pub: &[u8; 32],
+    ) -> Self {
         let ed_pub = signing_key.verifying_key().to_bytes();
-        let mut sign_data = vec![SESSION_INIT_MAGIC];
-        sign_data.extend_from_slice(&ed_pub);
-        sign_data.extend_from_slice(x25519_pub.as_bytes());
+        let x_bytes = *x25519_pub.as_bytes();
+        let timestamp_ms = now_ms();
+        let sign_data = build_init_sign_bytes(&ed_pub, &x_bytes, timestamp_ms, recipient_ed_pub);
         let signature = signing_key.sign(&sign_data).to_bytes();
-        SessionInit { ed_pub, signature, x25519_pub: *x25519_pub.as_bytes() }
+        SessionInit {
+            ed_pub, signature, x25519_pub: x_bytes,
+            timestamp_ms, recipient_ed_pub: *recipient_ed_pub,
+        }
     }
 
     pub fn encode(&self) -> Vec<u8> {
-        let mut buf = vec![SESSION_INIT_MAGIC];
+        let mut buf = Vec::with_capacity(1 + 32 + 64 + 32 + 8 + 32);
+        buf.push(SESSION_INIT_MAGIC);
         buf.extend_from_slice(&self.ed_pub);
         buf.extend_from_slice(&self.signature);
         buf.extend_from_slice(&self.x25519_pub);
+        buf.extend_from_slice(&self.timestamp_ms.to_le_bytes());
+        buf.extend_from_slice(&self.recipient_ed_pub);
         buf
     }
 
@@ -247,56 +307,79 @@ impl SessionInit {
         if data.is_empty() || data[0] != SESSION_INIT_MAGIC {
             bail!("invalid SessionInit magic");
         }
-        let mut pos = 1;
-        if data.len() < pos + 32 + 64 + 32 {
-            bail!("SessionInit too short: {}", data.len());
+        let need = 1 + 32 + 64 + 32 + 8 + 32;
+        if data.len() < need {
+            bail!("SessionInit too short: {} (need {})", data.len(), need);
         }
+        let mut pos = 1;
         let mut ed_pub = [0u8; 32];
-        ed_pub.copy_from_slice(&data[pos..pos + 32]);
-        pos += 32;
+        ed_pub.copy_from_slice(&data[pos..pos + 32]); pos += 32;
         let mut signature = [0u8; 64];
-        signature.copy_from_slice(&data[pos..pos + 64]);
-        pos += 64;
+        signature.copy_from_slice(&data[pos..pos + 64]); pos += 64;
         let mut x25519_pub = [0u8; 32];
-        x25519_pub.copy_from_slice(&data[pos..pos + 32]);
-        Ok(SessionInit { ed_pub, signature, x25519_pub })
+        x25519_pub.copy_from_slice(&data[pos..pos + 32]); pos += 32;
+        let mut ts_bytes = [0u8; 8];
+        ts_bytes.copy_from_slice(&data[pos..pos + 8]); pos += 8;
+        let timestamp_ms = u64::from_le_bytes(ts_bytes);
+        let mut recipient_ed_pub = [0u8; 32];
+        recipient_ed_pub.copy_from_slice(&data[pos..pos + 32]);
+        Ok(SessionInit { ed_pub, signature, x25519_pub, timestamp_ms, recipient_ed_pub })
     }
 
-    pub fn verify(&self) -> Result<()> {
+    /// Verify the signature *and* that the init is fresh and addressed to `expected_recipient`.
+    pub fn verify(&self, expected_recipient: &[u8; 32]) -> Result<()> {
+        if &self.recipient_ed_pub != expected_recipient {
+            bail!("SessionInit not addressed to us");
+        }
+        let now = now_ms();
+        let skew = (now as i64 - self.timestamp_ms as i64).unsigned_abs();
+        if skew > HANDSHAKE_TIME_WINDOW_MS {
+            bail!("SessionInit timestamp outside ±{}ms window (skew {}ms)",
+                HANDSHAKE_TIME_WINDOW_MS, skew);
+        }
         let vk = VerifyingKey::from_bytes(&self.ed_pub)?;
-        let mut sign_data = vec![SESSION_INIT_MAGIC];
-        sign_data.extend_from_slice(&self.ed_pub);
-        sign_data.extend_from_slice(&self.x25519_pub);
-        let sig = Signature::from_bytes(&self.signature);
-        vk.verify(&sign_data, &sig)?;
+        let sign_data = build_init_sign_bytes(
+            &self.ed_pub, &self.x25519_pub, self.timestamp_ms, &self.recipient_ed_pub,
+        );
+        vk.verify(&sign_data, &Signature::from_bytes(&self.signature))?;
         Ok(())
     }
 }
 
-/// SessionAck wire format:
-/// [magic:1][ed_pub:32][sig:64][x25519_pub:32]
-/// sig covers: magic || ed_pub || x25519_pub
+/// SessionAck (v2) wire format: same as SessionInit but with ack magic.
 pub struct SessionAck {
     pub ed_pub: [u8; 32],
     pub signature: [u8; 64],
     pub x25519_pub: [u8; 32],
+    pub timestamp_ms: u64,
+    pub recipient_ed_pub: [u8; 32],
 }
 
 impl SessionAck {
-    pub fn create(signing_key: &SigningKey, x25519_pub: &X25519PublicKey) -> Self {
+    pub fn create(
+        signing_key: &SigningKey,
+        x25519_pub: &X25519PublicKey,
+        recipient_ed_pub: &[u8; 32],
+    ) -> Self {
         let ed_pub = signing_key.verifying_key().to_bytes();
-        let mut sign_data = vec![SESSION_ACK_MAGIC];
-        sign_data.extend_from_slice(&ed_pub);
-        sign_data.extend_from_slice(x25519_pub.as_bytes());
+        let x_bytes = *x25519_pub.as_bytes();
+        let timestamp_ms = now_ms();
+        let sign_data = build_ack_sign_bytes(&ed_pub, &x_bytes, timestamp_ms, recipient_ed_pub);
         let signature = signing_key.sign(&sign_data).to_bytes();
-        SessionAck { ed_pub, signature, x25519_pub: *x25519_pub.as_bytes() }
+        SessionAck {
+            ed_pub, signature, x25519_pub: x_bytes,
+            timestamp_ms, recipient_ed_pub: *recipient_ed_pub,
+        }
     }
 
     pub fn encode(&self) -> Vec<u8> {
-        let mut buf = vec![SESSION_ACK_MAGIC];
+        let mut buf = Vec::with_capacity(1 + 32 + 64 + 32 + 8 + 32);
+        buf.push(SESSION_ACK_MAGIC);
         buf.extend_from_slice(&self.ed_pub);
         buf.extend_from_slice(&self.signature);
         buf.extend_from_slice(&self.x25519_pub);
+        buf.extend_from_slice(&self.timestamp_ms.to_le_bytes());
+        buf.extend_from_slice(&self.recipient_ed_pub);
         buf
     }
 
@@ -304,28 +387,40 @@ impl SessionAck {
         if data.is_empty() || data[0] != SESSION_ACK_MAGIC {
             bail!("invalid SessionAck magic");
         }
-        let mut pos = 1;
-        if data.len() < pos + 32 + 64 + 32 {
-            bail!("SessionAck too short");
+        let need = 1 + 32 + 64 + 32 + 8 + 32;
+        if data.len() < need {
+            bail!("SessionAck too short: {} (need {})", data.len(), need);
         }
+        let mut pos = 1;
         let mut ed_pub = [0u8; 32];
-        ed_pub.copy_from_slice(&data[pos..pos + 32]);
-        pos += 32;
+        ed_pub.copy_from_slice(&data[pos..pos + 32]); pos += 32;
         let mut signature = [0u8; 64];
-        signature.copy_from_slice(&data[pos..pos + 64]);
-        pos += 64;
+        signature.copy_from_slice(&data[pos..pos + 64]); pos += 64;
         let mut x25519_pub = [0u8; 32];
-        x25519_pub.copy_from_slice(&data[pos..pos + 32]);
-        Ok(SessionAck { ed_pub, signature, x25519_pub })
+        x25519_pub.copy_from_slice(&data[pos..pos + 32]); pos += 32;
+        let mut ts_bytes = [0u8; 8];
+        ts_bytes.copy_from_slice(&data[pos..pos + 8]); pos += 8;
+        let timestamp_ms = u64::from_le_bytes(ts_bytes);
+        let mut recipient_ed_pub = [0u8; 32];
+        recipient_ed_pub.copy_from_slice(&data[pos..pos + 32]);
+        Ok(SessionAck { ed_pub, signature, x25519_pub, timestamp_ms, recipient_ed_pub })
     }
 
-    pub fn verify(&self) -> Result<()> {
+    pub fn verify(&self, expected_recipient: &[u8; 32]) -> Result<()> {
+        if &self.recipient_ed_pub != expected_recipient {
+            bail!("SessionAck not addressed to us");
+        }
+        let now = now_ms();
+        let skew = (now as i64 - self.timestamp_ms as i64).unsigned_abs();
+        if skew > HANDSHAKE_TIME_WINDOW_MS {
+            bail!("SessionAck timestamp outside ±{}ms window (skew {}ms)",
+                HANDSHAKE_TIME_WINDOW_MS, skew);
+        }
         let vk = VerifyingKey::from_bytes(&self.ed_pub)?;
-        let mut sign_data = vec![SESSION_ACK_MAGIC];
-        sign_data.extend_from_slice(&self.ed_pub);
-        sign_data.extend_from_slice(&self.x25519_pub);
-        let sig = Signature::from_bytes(&self.signature);
-        vk.verify(&sign_data, &sig)?;
+        let sign_data = build_ack_sign_bytes(
+            &self.ed_pub, &self.x25519_pub, self.timestamp_ms, &self.recipient_ed_pub,
+        );
+        vk.verify(&sign_data, &Signature::from_bytes(&self.signature))?;
         Ok(())
     }
 }
@@ -352,66 +447,60 @@ impl SessionManager {
     }
 
     /// Handle an incoming SessionInit from remote. Returns SessionAck bytes to send back.
-    ///
-    /// If we already have a session with this remote (e.g., simultaneous crossing inits),
-    /// we complete our own session using the remote's x25519 pub key from their init,
-    /// without overwriting our keypair. This resolves the crossing-init race condition:
-    /// both sides end up with matching DH shared secrets.
     pub fn handle_init(&mut self, data: &[u8]) -> Result<Vec<u8>> {
         let init = SessionInit::decode(data)?;
-        init.verify()?;
+        let our_pub = self.our_signing_key.verifying_key().to_bytes();
+        init.verify(&our_pub)?;
 
         let remote_x25519_pub = X25519PublicKey::from(init.x25519_pub);
 
         if let Some(existing) = self.sessions.get_mut(&init.ed_pub) {
-            // Session already exists (we initiated or they initiated before).
-            // Update remote pub and mark established — don't replace our keypair.
             existing.remote_x25519_pub = remote_x25519_pub;
             existing.established = true;
             let local_pub = X25519PublicKey::from(&existing.local_x25519_priv);
-            let ack = SessionAck::create(&self.our_signing_key, &local_pub);
+            let ack = SessionAck::create(&self.our_signing_key, &local_pub, &init.ed_pub);
             return Ok(ack.encode());
         }
 
-        // No existing session: we are the responder.
         let local_priv = StaticSecret::random_from_rng(OsRng);
         let local_pub = X25519PublicKey::from(&local_priv);
         let mut info = SessionInfo::new(init.ed_pub, local_priv, remote_x25519_pub);
         info.established = true;
         self.sessions.insert(init.ed_pub, info);
 
-        let ack = SessionAck::create(&self.our_signing_key, &local_pub);
+        let ack = SessionAck::create(&self.our_signing_key, &local_pub, &init.ed_pub);
         Ok(ack.encode())
     }
 
     /// Handle an incoming SessionAck from remote. Marks session as established.
+    ///
+    /// SECURITY: only accept ACK if we have a pending session (we initiated).
+    /// Previously this method auto-created sessions from unsolicited ACKs, which
+    /// let any attacker create state at will. With the change, an ACK without
+    /// a corresponding initiate() is dropped.
     pub fn handle_ack(&mut self, data: &[u8]) -> Result<()> {
         let ack = SessionAck::decode(data)?;
-        ack.verify()?;
+        let our_pub = self.our_signing_key.verifying_key().to_bytes();
+        ack.verify(&our_pub)?;
         let remote_x_pub = X25519PublicKey::from(ack.x25519_pub);
-        if let Some(info) = self.sessions.get_mut(&ack.ed_pub) {
-            info.remote_x25519_pub = remote_x_pub;
-            info.established = true;
-        } else {
-            // Create new session from ACK (remote initiated then we missed init?)
-            let local_priv = StaticSecret::random_from_rng(OsRng);
-            let mut info = SessionInfo::new(ack.ed_pub, local_priv, remote_x_pub);
-            info.established = true;
-            self.sessions.insert(ack.ed_pub, info);
+        match self.sessions.get_mut(&ack.ed_pub) {
+            Some(info) => {
+                info.remote_x25519_pub = remote_x_pub;
+                info.established = true;
+                Ok(())
+            }
+            None => bail!("unsolicited SessionAck from {:?} (no pending init)", &ack.ed_pub[..4]),
         }
-        Ok(())
     }
 
     /// Initiate session with remote: creates local session state, returns SessionInit bytes.
     pub fn initiate(&mut self, remote_ed_pub: &[u8; 32]) -> Vec<u8> {
-        // Create (or re-create) session with a fresh local x25519 keypair
         let local_priv = StaticSecret::random_from_rng(OsRng);
         let local_pub = X25519PublicKey::from(&local_priv);
-        // remote_x25519_pub placeholder (will be updated from ACK)
         let remote_x_placeholder = X25519PublicKey::from([0u8; 32]);
         let info = SessionInfo::new(*remote_ed_pub, local_priv, remote_x_placeholder);
         self.sessions.insert(*remote_ed_pub, info);
-        SessionInit::create(&self.our_signing_key, &local_pub).encode()
+        SessionInit::create(&self.our_signing_key, &local_pub, remote_ed_pub).encode()
     }
 
     pub fn encrypt(&mut self, remote_ed_pub: &[u8; 32], plaintext: &[u8]) -> Result<Vec<u8>> {
@@ -853,23 +942,48 @@ mod tests {
     #[test]
     fn session_init_verify_wrong_body_fails() {
         let sk = SigningKey::generate(&mut OsRng);
-        let sk2 = SigningKey::generate(&mut OsRng);
+        let recipient = SigningKey::generate(&mut OsRng).verifying_key().to_bytes();
         let x_priv = StaticSecret::random_from_rng(OsRng);
         let x_pub = X25519PublicKey::from(&x_priv);
-        // Create valid SessionInit
-        let _ = sk2;
-        let init = SessionInit::create(&sk, &x_pub);
-        assert!(init.verify().is_ok(), "valid init must verify");
+        let init = SessionInit::create(&sk, &x_pub, &recipient);
+        assert!(init.verify(&recipient).is_ok(), "valid init must verify");
         // Tamper with x25519_pub — signature no longer matches
-        let mut bad_init = SessionInit { x25519_pub: [0xFFu8; 32], ..init };
-        assert!(bad_init.verify().is_err(), "tampered x25519_pub must fail verify");
+        let bad_init = SessionInit { x25519_pub: [0xFFu8; 32], ..init };
+        assert!(bad_init.verify(&recipient).is_err(), "tampered x25519_pub must fail verify");
         // Tamper with ed_pub — signature fails
-        bad_init = SessionInit {
+        let init = SessionInit::create(&sk, &x_pub, &recipient);
+        let bad_init = SessionInit {
             x25519_pub: init.x25519_pub,
             ed_pub: [0xEEu8; 32],
             ..init
         };
-        assert!(bad_init.verify().is_err(), "tampered ed_pub must fail verify");
+        assert!(bad_init.verify(&recipient).is_err(), "tampered ed_pub must fail verify");
+    }
+
+    #[test]
+    fn session_init_rejects_wrong_recipient() {
+        let sk = SigningKey::generate(&mut OsRng);
+        let intended = SigningKey::generate(&mut OsRng).verifying_key().to_bytes();
+        let other    = SigningKey::generate(&mut OsRng).verifying_key().to_bytes();
+        let x_pub = X25519PublicKey::from(&StaticSecret::random_from_rng(OsRng));
+        let init = SessionInit::create(&sk, &x_pub, &intended);
+        // Wrong recipient must reject (anti cross-target replay)
+        assert!(init.verify(&other).is_err(), "init bound to {:?} must not verify for {:?}", &intended[..4], &other[..4]);
+        assert!(init.verify(&intended).is_ok());
+    }
+
+    #[test]
+    fn session_init_rejects_stale_timestamp() {
+        let sk = SigningKey::generate(&mut OsRng);
+        let recipient = SigningKey::generate(&mut OsRng).verifying_key().to_bytes();
+        let x_pub = X25519PublicKey::from(&StaticSecret::random_from_rng(OsRng));
+        let mut init = SessionInit::create(&sk, &x_pub, &recipient);
+        // Roll the timestamp 10 minutes into the past and re-sign to keep the sig valid.
+        init.timestamp_ms = init.timestamp_ms.saturating_sub(10 * 60 * 1000);
+        let sign_data = build_init_sign_bytes(&init.ed_pub, &init.x25519_pub, init.timestamp_ms, &init.recipient_ed_pub);
+        init.signature = sk.sign(&sign_data).to_bytes();
+        let err = init.verify(&recipient).unwrap_err().to_string();
+        assert!(err.contains("window"), "stale init must mention window: {err}");
     }
 
     #[test]

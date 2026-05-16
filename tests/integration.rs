@@ -161,9 +161,15 @@ async fn peer_stats_available() {
 
 #[tokio::test]
 async fn mtu_is_correct() {
+    // MTU is capped below u16::MAX so the 2-byte padded length field never wraps.
+    // See pad_payload() in router.rs — exceeding 65535 silently truncated the
+    // length header before this fix.
     let sk = SigningKey::generate(&mut OsRng);
     let conn = PacketConn::new(sk);
-    assert_eq!(conn.mtu(), 65535);
+    let mtu = conn.mtu();
+    assert!(mtu > 0 && mtu < (u16::MAX as u64),
+        "mtu must be > 0 and < u16::MAX to keep the length field intact; got {mtu}");
+    assert!(mtu >= 1280, "mtu must be at least IPv6 min (1280); got {mtu}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -660,8 +666,8 @@ async fn five_node_star_topology() {
 
     // Verify topology: hub sees 4 peers, each spoke sees 1
     assert_eq!(conns[0].get_peer_stats().len(), 4, "hub must have 4 peers");
-    for spoke in 1..5 {
-        assert_eq!(conns[spoke].get_peer_stats().len(), 1, "spoke {} must have 1 peer", spoke);
+    for (spoke, conn) in conns.iter().enumerate().take(5).skip(1) {
+        assert_eq!(conn.get_peer_stats().len(), 1, "spoke {} must have 1 peer", spoke);
     }
 
     // Test: spoke 1 → spoke 3 (2 hops: 1→0→3)
