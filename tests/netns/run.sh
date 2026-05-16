@@ -113,9 +113,9 @@ write_config "$WORK/b" "${IP_B%/*}" "tcp://${IP_A%/*}:${PORT}" "$WORK/b/admin.so
 echo "── starting daemons ──"
 # RUST_LOG=info so the captured log shows handshake / session establishment
 # milestones — vital when the test fails in CI.
-ip netns exec "$NS_A" env RUST_LOG=norn_rs=info "$NORND" -c "$WORK/a/norn.toml" >"$WORK/a/log" 2>&1 &
+ip netns exec "$NS_A" env RUST_LOG=norn_rs=debug "$NORND" -c "$WORK/a/norn.toml" >"$WORK/a/log" 2>&1 &
 PID_A=$!
-ip netns exec "$NS_B" env RUST_LOG=norn_rs=info "$NORND" -c "$WORK/b/norn.toml" >"$WORK/b/log" 2>&1 &
+ip netns exec "$NS_B" env RUST_LOG=norn_rs=debug "$NORND" -c "$WORK/b/norn.toml" >"$WORK/b/log" 2>&1 &
 PID_B=$!
 
 echo "PID_A=$PID_A  PID_B=$PID_B"

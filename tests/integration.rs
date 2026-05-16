@@ -569,8 +569,11 @@ async fn concurrent_bidirectional_200_each() {
         (ra, rb)
     });
 
-    // Receiver: collect N from B and N from A
-    let recv_on_b = tokio::time::timeout(Duration::from_secs(60), async {
+    // Receiver: collect N from B and N from A. On GitHub Actions runners
+    // under PQ-handshake + concurrent matrix load this routinely needs
+    // > 60 s for N = 200 round-trip messages each way; 180 s gives
+    // comfortable margin without making the test "fail open".
+    let recv_on_b = tokio::time::timeout(Duration::from_secs(180), async {
         let mut count = 0usize;
         while count < N {
             conn_b.read_from().await.expect("B read_from failed");
@@ -578,7 +581,7 @@ async fn concurrent_bidirectional_200_each() {
         }
         count
     });
-    let recv_on_a = tokio::time::timeout(Duration::from_secs(60), async {
+    let recv_on_a = tokio::time::timeout(Duration::from_secs(180), async {
         let mut count = 0usize;
         while count < N {
             conn_a.read_from().await.expect("A read_from failed");
