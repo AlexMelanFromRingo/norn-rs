@@ -17,7 +17,7 @@ is and is not designed to resist.
 | Multiple cooperating malicious peers                      |    ◐     | Path-selection randomness limits passive correlation; full Sybil resistance is **not** claimed. |
 | Compromise of one onion relay                             |    ✓     | Relay sees neither origin nor destination, only its immediate neighbours. |
 | Compromise of *all* relays on a circuit                   |    ✗     | This deanonymises the flow — a property shared with Tor. |
-| Compromise of node’s long-term ed25519 private key        |    ✗     | Address derivation makes the key the identity; loss of the key = loss of the identity. Forward secrecy of past traffic is provided by session-layer x25519 rotation, but onion-layer traffic to/from the compromised node is not forward-secret because the onion key derives from the long-term identity (see [Known weaknesses](#known-weaknesses)). |
+| Compromise of node’s long-term ed25519 private key        |    ◐     | Address derivation makes the key the identity; loss of the key = loss of the identity *going forward*. Past traffic is largely forward-secret: session-layer x25519 rotates every 100 sends, and onion-layer keys are now a rotating ephemeral keypair separate from the long-term identity (rotated hourly with a one-rotation graceful window). The remaining gap is the *fallback* onion path used when the sender hasn't yet learned the recipient's advertised ephemeral pub. |
 | Global passive adversary observing all link-level traffic |    ◐     | Padding (256-byte blocks), forwarding jitter, and cover traffic make timing/size correlation harder but not infeasible. |
 | Quantum adversary                                         |    ✗     | All asymmetric primitives are classical (ed25519, x25519). |
 
@@ -40,29 +40,52 @@ is and is not designed to resist.
   * Pending PathLookup dedup set capped at 10 000 entries; coord table at 16 384.
   * Idle sessions expire after 5 min.
 
+### Resolved in this release (v0.3 onion v3)
+
+These items were on the previous "Known weaknesses" list and are now closed:
+
+* **Onion-layer forward secrecy** (CLOSED — partial). Onion peel now uses a
+  rotating per-node ephemeral X25519 keypair, distinct from the long-term
+  Ed25519 identity. The keypair rotates every hour; the prior key is held
+  for one further rotation period for in-flight onions, then zeroized. Past
+  onion traffic becomes undecryptable two rotations later.
+  *Remaining gap:* the identity-derived key is kept as a peel fallback for
+  cells from senders that haven't yet learned the relay's current ephemeral.
+  Closing this fully requires network-wide propagation of onion ephemeral
+  pubs (current propagation is one-hop via CoordAnnounce).
+* **Variable-size onion cells** (CLOSED). Every onion frame is padded to a
+  constant `ONION_CELL_SIZE = 1280` bytes regardless of remaining depth.
+  Removes the per-hop size signal that previously let a global observer
+  count circuit length.
+* **Onion replay** (CLOSED). Each relay keeps a 4 096-entry LRU of recent
+  cell digests and silently drops duplicates. Prevents tagging-by-replay.
+* **Cuckoo gossip poisoning** (PARTIAL). Per-peer trust scores bias routing
+  lookups: peers that miss keepalives or otherwise misbehave are
+  de-prioritised. An auto-prober that issues PathLookups to verify advertised
+  routes remains future work.
+
 ### Known weaknesses (open issues)
 
 These are *deliberately* unresolved in the current release; PRs welcome.
 
-1. **Onion-layer forward secrecy** — `OnionPacket::peel` derives the relay key
-   from the relay’s long-term ed25519 identity. If a relay’s key is later
-   compromised, all past onion traffic that transited it can be decrypted.
-   *Fix:* per-circuit ephemeral DH on the relay side (Sphinx / HORNET).
-2. **Variable-size onion cells** — `OnionPacket` shrinks at each hop, leaking
-   hop count to any observer seeing two consecutive links.
-   *Fix:* fixed-size cells with end-padding (Tor uses 514-byte cells).
-3. **Cuckoo gossip poisoning** — a peer can claim to know any routing tag and
-   draw traffic to itself. Confidentiality of the payload is unaffected
-   (AEAD), but availability and traffic-analysis resistance degrade.
-   *Mitigation in current code:* per-peer cuckoo state is bounded; loop
-   detection and forwarding caps prevent amplification.
-   *Fix:* path validation or proof-of-reachability before trusting a tag.
-4. **Hyperbolic coordinate spoofing** — peers self-report their coordinates.
+1. **Network-wide ephemeral-pub propagation** — CoordAnnounce only reaches
+   direct peers, so an onion sender that wants to use a non-neighbour as
+   destination falls back to the identity-derived key. This degrades FS for
+   that hop.
+   *Fix:* a signed `OnionKeyAnnounce` flooded like Announce, or piggyback
+   the announce on PathNotify.
+2. **Hyperbolic coordinate spoofing** — peers self-report their coordinates.
    A malicious peer can claim a coordinate close to any target, biasing
    greedy routing.
    *Mitigation in current code:* coord signatures are verified; non-finite
    coords are rejected; coord-table size is bounded.
-5. **No post-quantum hybrid** — when this becomes practical (e.g. X-Wing or
+3. **Active route validation for cuckoo poisoning** — the trust framework
+   exists but trust currently moves only on liveness probes (SigReq/Res).
+   A peer that responds to pings but lies about route claims escapes
+   detection.
+   *Fix:* periodic PathLookup probes against a random claimed tag; decay
+   trust on missing PathNotify.
+4. **No post-quantum hybrid** — when this becomes practical (e.g. X-Wing or
    ML-KEM-768), the session handshake should add a PQ KEM alongside x25519.
 
 ## Reporting a vulnerability

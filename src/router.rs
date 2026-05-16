@@ -77,6 +77,12 @@ const MAX_COORD_TABLE_SIZE: usize = 16_384;
 /// spawns a tokio task with a sleep; without a bound, a flooder can
 /// exhaust memory by spawning unbounded tasks.
 const MAX_INFLIGHT_FORWARDS: usize = 4_096;
+/// Size of the per-node onion-replay LRU. Each entry is a 32-byte hash.
+/// At 4 096 entries that's 128 KiB — enough to cover ~minutes of cells at
+/// modest traffic rates without growing unbounded.
+const ONION_REPLAY_CACHE_SIZE: usize = 4_096;
+/// Rotate the onion ephemeral key every N maintenance ticks (1 hour at 1 Hz).
+const ONION_KEY_ROTATION_TICKS: u32 = 3_600;
 
 // ──────────────────────────────────────────────
 // Public types
@@ -101,6 +107,9 @@ pub struct PeerStats {
     pub rx_bytes: u64,
     pub tx_bytes: u64,
     pub uptime: Duration,
+    /// Trust score in [0.01, 4.0]; 1.0 is the default. Operators can spot a
+    /// poisoning attempt by an outlier with very low trust.
+    pub trust: f32,
 }
 
 // ──────────────────────────────────────────────
@@ -143,11 +152,51 @@ struct PeerData {
     // RTT tracking
     pending_sig_req_time: Option<(u64, Instant)>, // (seq, sent_time)
     sig_req_seq: u64,
+    /// Latest onion-ephemeral X25519 pub key this peer has advertised (via signed
+    /// CoordAnnounce). Used when selecting this peer as a relay so that we
+    /// encrypt the onion layer with its CURRENT ephemeral key rather than its
+    /// long-term identity-derived key.
+    onion_eph_pub: Option<[u8; 32]>,
+    /// Trust score in [TRUST_MIN, TRUST_MAX]. Used as a cost multiplier in
+    /// lookup_by_tag: peers with lower trust get a higher effective cost and
+    /// are de-prioritised when multiple peers claim the same routing tag.
+    /// This neutralises cuckoo poisoning: a malicious peer that claims tags
+    /// it can't actually reach will fail probes (when probing is enabled) and
+    /// fall to the bottom of the lookup ranking.
+    trust: f32,
 }
+
+/// Starting trust for a new peer.
+const TRUST_INITIAL: f32 = 1.0;
+/// Floor — peers never lose ALL trust (a fully-poisoned filter would still
+/// be tried as a last-resort path).
+const TRUST_MIN: f32 = 0.01;
+/// Ceiling — boosts don't accumulate beyond this.
+const TRUST_MAX: f32 = 4.0;
 
 impl PeerData {
     fn effective_cost(&self) -> u64 {
         effective_cost(self.lag, self.loss_rate)
+    }
+
+    /// Trust-adjusted cost: low trust → high cost → de-prioritised in lookups.
+    /// Caps at u64::MAX to avoid overflow.
+    fn trust_adjusted_cost(&self) -> u64 {
+        let base = self.effective_cost() as f64;
+        let trust = self.trust.clamp(TRUST_MIN, TRUST_MAX) as f64;
+        let adjusted = base / trust;
+        if adjusted >= u64::MAX as f64 { u64::MAX } else { adjusted as u64 }
+    }
+
+    /// Decay trust on probe failure / route timeout. Multiplicative for fast
+    /// recovery (one bad probe ≠ permanent black-listing).
+    fn decay_trust(&mut self) {
+        self.trust = (self.trust * 0.5).max(TRUST_MIN);
+    }
+
+    /// Boost trust on probe success / observed successful delivery.
+    fn boost_trust(&mut self) {
+        self.trust = (self.trust * 1.2).min(TRUST_MAX);
     }
 }
 
@@ -171,6 +220,13 @@ struct RouterState {
     /// Own cuckoo generation counter (per tree). Incremented every CUCKOO_GEN_TICKS.
     /// Included in outgoing CuckooMsg so receivers can detect staleness.
     cuckoo_generation: [u64; K],
+    /// Rotating per-node onion ephemeral keypair. Distinct from `signing_key`
+    /// for forward secrecy: compromising the long-term identity does not let
+    /// an attacker decrypt past onion traffic that transited this node.
+    onion_keys: crate::onion::OnionKeyChain,
+    /// LRU-style set of recent onion (epk, aead-prefix) hashes for replay
+    /// detection. Bounded; oldest entries evicted when full.
+    onion_seen: std::collections::VecDeque<[u8; 32]>,
 }
 
 // ──────────────────────────────────────────────
@@ -342,6 +398,7 @@ impl RouterState {
     fn new(signing_key: SigningKey, traffic_tx: mpsc::Sender<InboundPacket>) -> Self {
         let pub_key = signing_key.verifying_key().to_bytes();
         let sessions = Arc::new(Mutex::new(SessionManager::new(signing_key.clone())));
+        let onion_keys = crate::onion::OnionKeyChain::with_identity_fallback(&signing_key);
 
         let trees = std::array::from_fn(|_| TreeState {
             parent: None,
@@ -369,6 +426,8 @@ impl RouterState {
             own_depth: 0,
             tick: 0,
             cuckoo_generation: [0u64; K],
+            onion_keys,
+            onion_seen: std::collections::VecDeque::with_capacity(ONION_REPLAY_CACHE_SIZE),
         }
     }
 
@@ -395,6 +454,8 @@ impl RouterState {
             connected_at: Instant::now(),
             pending_sig_req_time: None,
             sig_req_seq: 0,
+            onion_eph_pub: None,
+            trust: TRUST_INITIAL,
         };
         self.peers.insert(pub_key, peer);
         self.update_landmarks();
@@ -608,9 +669,12 @@ impl RouterState {
         for peer_key in peer_keys {
             let seq = {
                 let peer = self.peers.get_mut(&peer_key).unwrap();
-                // If a previous SigReq was never acknowledged, count it as a loss.
+                // If a previous SigReq was never acknowledged, count it as a loss
+                // AND decay this peer's trust score. A peer that doesn't respond
+                // to liveness pings shouldn't be trusted with route claims either.
                 if peer.pending_sig_req_time.is_some() {
                     peer.loss_rate = peer.loss_rate * 0.875 + 0.125;
+                    peer.decay_trust();
                 }
                 peer.sig_req_seq += 1;
                 peer.sig_req_seq
@@ -663,8 +727,21 @@ impl RouterState {
             self.send_keepalives();
         }
         self.rotate_session_keys();
+        self.rotate_onion_keys_if_due();
         self.cleanup_stale_lookups();
         self.cleanup_stale_sessions();
+    }
+
+    /// Rotate the onion ephemeral keypair at the configured cadence.
+    /// On rotation, the old key moves to the `previous` slot so in-flight
+    /// onions still decrypt for one more period, then is zeroized on the
+    /// rotation after that.
+    #[mutants::skip]
+    fn rotate_onion_keys_if_due(&mut self) {
+        if self.tick.is_multiple_of(ONION_KEY_ROTATION_TICKS) && self.tick > 0 {
+            self.onion_keys.rotate();
+            debug!("onion keys rotated at tick {}", self.tick);
+        }
     }
 
     /// Rotate x25519 keys for sessions that have sent many messages.
@@ -689,16 +766,19 @@ impl RouterState {
         self.coord_table.insert(self.pub_key, self.own_coord);
     }
 
-    /// Broadcast our hyperbolic coordinate to all peers.
-    // Skip mutations: signs and sends CoordAnnounce to every peer — verifying
-    // the coordinate reaches remote nodes requires a multi-peer integration test.
+    /// Broadcast our hyperbolic coordinate + onion ephemeral pub to all peers.
     #[mutants::skip]
     fn broadcast_coord(&mut self) {
         let coord_bytes = self.own_coord.encode();
-        let mut msg = coord_bytes.to_vec();
-        msg.extend_from_slice(&self.own_depth.to_le_bytes());
-        let sig = self.signing_key.sign(&msg).to_bytes();
-        let ann = CoordAnnounce { coord: coord_bytes, tree_depth: self.own_depth, sig };
+        let onion_eph_pub = *self.onion_keys.pub_key().as_bytes();
+        let unsigned = CoordAnnounce {
+            coord: coord_bytes,
+            tree_depth: self.own_depth,
+            onion_eph_pub,
+            sig: [0u8; 64],
+        };
+        let sig = self.signing_key.sign(&unsigned.sign_bytes()).to_bytes();
+        let ann = CoordAnnounce { sig, ..unsigned };
         let mut frame = vec![TYPE_COORD_ANNOUNCE];
         ann.encode_into(&mut frame);
         let peer_keys: Vec<PeerId> = self.peers.keys().copied().collect();
@@ -710,42 +790,40 @@ impl RouterState {
     /// Handle an incoming CoordAnnounce from a peer.
     #[mutants::skip]
     pub fn handle_coord_announce(&mut self, from_key: [u8; 32], ann: CoordAnnounce) {
-        // Verify signature: sig over (coord || tree_depth as 4-byte LE)
         let vk = match ed25519_dalek::VerifyingKey::from_bytes(&from_key) {
             Ok(v) => v,
             Err(_) => return,
         };
-        let mut msg = ann.coord.to_vec();
-        msg.extend_from_slice(&ann.tree_depth.to_le_bytes());
         let sig = ed25519_dalek::Signature::from_bytes(&ann.sig);
-        if vk.verify(&msg, &sig).is_err() {
+        if vk.verify(&ann.sign_bytes(), &sig).is_err() {
             warn!("invalid coord announce signature from {:?}", &from_key[..4]);
             return;
         }
         let coord = HypCoord::decode(&ann.coord);
-        // Reject NaN/Inf coordinates — they propagate through `distance()` as NaN
-        // and silently break greedy routing (NaN comparisons are always false).
         if !coord.r.is_finite() || !coord.theta.is_finite() {
             warn!("coord announce from {:?} has non-finite values, ignoring", &from_key[..4]);
             return;
         }
-        // Bound table size: under flood, evict an arbitrary entry to make room
-        // (better than unbounded growth). We avoid evicting peers — those are
-        // re-inserted on the next maintenance tick anyway.
         if self.coord_table.len() >= MAX_COORD_TABLE_SIZE
             && !self.coord_table.contains_key(&from_key) {
-            // Drop one non-peer entry to keep the table bounded.
             let victim = self.coord_table.keys()
                 .find(|k| !self.peers.contains_key(*k) && **k != self.pub_key)
                 .copied();
             if let Some(v) = victim {
                 self.coord_table.remove(&v);
             } else {
-                // All entries belong to known peers — skip the insert.
                 return;
             }
         }
         self.coord_table.insert(from_key, coord);
+
+        // Record the peer's *current* advertised onion ephemeral pub. Onion
+        // packets built for this peer as a relay will encrypt to this key
+        // rather than the long-term-identity-derived key, giving forward
+        // secrecy once the peer rotates.
+        if let Some(peer) = self.peers.get_mut(&from_key) {
+            peer.onion_eph_pub = Some(ann.onion_eph_pub);
+        }
     }
 
     fn cleanup_stale_lookups(&mut self) {
@@ -830,7 +908,6 @@ impl RouterState {
                 && pending_seq == res.seq {
                     let rtt = Instant::now().duration_since(sent_time);
                     let new_lag = rtt / 2;
-                    // Exponential moving average
                     let old_lag_us = peer.lag.as_micros() as i64;
                     let new_lag_us = new_lag.as_micros() as i64;
                     let diff = (new_lag_us - old_lag_us).unsigned_abs();
@@ -840,8 +917,9 @@ impl RouterState {
                     peer.lag = Duration::from_micros(
                         (old_lag_us as u64 * 7 / 8) + new_lag_us as u64 / 8
                     );
-                    // Successful ACK — decay loss estimate toward 0
                     peer.loss_rate *= 0.875;
+                    // Liveness probe succeeded → boost trust slightly.
+                    peer.boost_trust();
                 }
         }
     }
@@ -1212,7 +1290,15 @@ impl RouterState {
             peer.last_rx_time = Instant::now();
         }
 
-        match pkt.peel(&self.signing_key) {
+        // Onion replay check: drop packets whose (epk, first AEAD bytes) hash
+        // we've recently seen. Replays would let a tagging attacker confirm
+        // path participation by re-injecting captured cells.
+        if self.is_onion_replay(&pkt) {
+            debug!("onion peel: replay detected, dropping");
+            return;
+        }
+
+        match pkt.peel(&self.onion_keys) {
             Ok(PeeledOnion::Forward(inner_bytes)) => {
                 // We are a relay: decode the next layer and forward it
                 match OnionPacket::decode(&inner_bytes) {
@@ -1248,6 +1334,30 @@ impl RouterState {
         }
     }
 
+    /// Has this onion packet's tag been seen recently? If not, record it.
+    /// We hash (epk || first 16 bytes of aead_payload) into a 32-byte BLAKE2b
+    /// digest — collision-resistant and cheap. The cache is an LRU bounded by
+    /// ONION_REPLAY_CACHE_SIZE.
+    #[mutants::skip]
+    fn is_onion_replay(&mut self, pkt: &OnionPacket) -> bool {
+        use blake2::{Blake2b, Digest};
+        use blake2::digest::consts::U32;
+        let mut h: Blake2b<U32> = Blake2b::new();
+        h.update(b"norn:onion-replay");
+        h.update(pkt.epk);
+        let prefix_len = pkt.aead_payload.len().min(16);
+        h.update(&pkt.aead_payload[..prefix_len]);
+        let digest: [u8; 32] = h.finalize().into();
+        if self.onion_seen.iter().any(|d| d == &digest) {
+            return true;
+        }
+        if self.onion_seen.len() >= ONION_REPLAY_CACHE_SIZE {
+            self.onion_seen.pop_front();
+        }
+        self.onion_seen.push_back(digest);
+        false
+    }
+
     /// Route lookup using only the 16-byte routing_tag (for forwarding Traffic
     /// where the full dest pub key is not known to intermediate nodes).
     fn lookup_by_tag(&self, tag: &[u8; 16]) -> Option<PeerId> {
@@ -1258,6 +1368,11 @@ impl RouterState {
     /// to avoid bouncing a packet back to the peer it just came from — without
     /// this, cuckoo gossip (which naturally propagates each tag in both
     /// directions) creates trivial 2-cycles.
+    ///
+    /// Ranking uses *trust-adjusted* cost: peers that have failed past route
+    /// probes get a higher effective cost and are pushed to the back of the
+    /// queue. This mitigates cuckoo poisoning — a peer that lies about
+    /// reachable tags will see its trust decay and stop being chosen.
     fn lookup_by_tag_excluding(&self, tag: &[u8; 16], exclude: Option<PeerId>) -> Option<PeerId> {
         let mut best: Option<(PeerId, u64)> = None;
         for (peer_key, peer) in &self.peers {
@@ -1266,7 +1381,7 @@ impl RouterState {
             }
             for tree_id in 0..K {
                 if peer.cuckoo[tree_id].contains(tag) {
-                    let cost = peer.effective_cost();
+                    let cost = peer.trust_adjusted_cost();
                     let better = best.is_none_or(|(_, bc)| cost < bc);
                     if better {
                         best = Some((*peer_key, cost));
@@ -1624,16 +1739,72 @@ impl PacketConn {
     }
 
     /// Select up to `n` random peers to use as onion relays.
-    /// Returns fewer than `n` relays if insufficient peers are connected.
-    // Skip mutations: uses OsRng shuffle (non-deterministic) and peer list at
-    // call time — cannot reliably verify exact relay selection in a unit test.
+    /// Returns fewer than `n` relays if insufficient peers are connected
+    /// **with a known onion ephemeral pub** (learned via CoordAnnounce). Peers
+    /// without one are skipped — we cannot give forward secrecy if we'd have
+    /// to fall back to identity-derived keys.
     #[mutants::skip]
-    pub fn select_relays(&self, n: usize) -> Vec<[u8; 32]> {
+    pub fn select_relays(&self, n: usize) -> Vec<crate::onion::OnionHop> {
         use rand::seq::SliceRandom;
-        let mut peers: Vec<[u8; 32]> = self.inner.lock_or_recover().peers.keys().copied().collect();
-        peers.shuffle(&mut rand::rngs::OsRng);
-        peers.truncate(n);
-        peers
+        let mut hops: Vec<crate::onion::OnionHop> = self.inner.lock_or_recover()
+            .peers
+            .values()
+            .filter_map(|p| {
+                p.onion_eph_pub.map(|eph| crate::onion::OnionHop {
+                    identity_ed_pub: p.pub_key,
+                    ephemeral_x_pub: eph,
+                })
+            })
+            .collect();
+        hops.shuffle(&mut rand::rngs::OsRng);
+        hops.truncate(n);
+        hops
+    }
+
+    /// Look up an OnionHop for the given identity.
+    ///
+    /// Returns `Some` with the peer's *current* announced ephemeral pub when
+    /// known (full forward secrecy). When unknown — e.g. the identity is not
+    /// a direct peer and we've never heard a CoordAnnounce from them — falls
+    /// back to deriving an X25519 pub from the identity's Ed25519 key. The
+    /// fallback works (Ed25519/X25519 share a curve so the derivation is
+    /// well-defined) but provides NO forward secrecy for that hop: a future
+    /// identity compromise lets the attacker decrypt past onion layers built
+    /// against the derived key.
+    ///
+    /// A `warn!` is logged on fallback so operators can see which dests need
+    /// out-of-band ephemeral-key propagation (a future PROTOCOL.md extension).
+    pub fn onion_hop_for(&self, identity: &[u8; 32]) -> Option<crate::onion::OnionHop> {
+        let state = self.inner.lock_or_recover();
+        // Self-destination: use our own current onion pub.
+        if identity == &state.pub_key {
+            return Some(crate::onion::OnionHop {
+                identity_ed_pub: *identity,
+                ephemeral_x_pub: *state.onion_keys.pub_key().as_bytes(),
+            });
+        }
+        if let Some(p) = state.peers.get(identity)
+            && let Some(eph) = p.onion_eph_pub {
+            return Some(crate::onion::OnionHop {
+                identity_ed_pub: *identity,
+                ephemeral_x_pub: eph,
+            });
+        }
+        // Fallback: derive X25519 from the Ed25519 identity. Provides
+        // confidentiality but not forward secrecy for this hop.
+        match crate::session::ed25519_pub_to_x25519(identity) {
+            Ok(x) => {
+                warn!(
+                    "onion hop {:?}: no advertised ephemeral pub, falling back to identity-derived key (no FS for this hop)",
+                    &identity[..4]
+                );
+                Some(crate::onion::OnionHop {
+                    identity_ed_pub: *identity,
+                    ephemeral_x_pub: *x.as_bytes(),
+                })
+            }
+            Err(_) => None,
+        }
     }
 
     /// Send a payload to `dst` via the given `relays` using onion routing.
@@ -1650,11 +1821,21 @@ impl PacketConn {
         &self,
         payload: &[u8],
         dst: &[u8; 32],
-        relays: &[[u8; 32]],
+        relays: &[crate::onion::OnionHop],
     ) -> Result<()> {
         if relays.is_empty() {
             return self.write_to(payload, dst).await;
         }
+
+        // We need the destination's *current* onion ephemeral pub to build the
+        // innermost layer. If we don't have one yet, abort — caller should
+        // wait for a CoordAnnounce from the destination (or use write_to
+        // which doesn't require it).
+        let dest_hop = self.onion_hop_for(dst)
+            .ok_or_else(|| anyhow::anyhow!(
+                "no onion ephemeral pub known for dst {:?}; wait for CoordAnnounce or use write_to",
+                &dst[..4]
+            ))?;
 
         // Check session
         {
@@ -1675,7 +1856,6 @@ impl PacketConn {
             }
         }
 
-        // Encrypt payload with session key, wrap in Traffic, then wrap in onion layers
         let padded = pad_payload(payload);
         let ciphertext = {
             let state = self.inner.lock_or_recover();
@@ -1693,17 +1873,15 @@ impl PacketConn {
             watermark: 0,
             payload: ciphertext,
         };
-        let traffic_bytes = traffic.encode(); // includes leading TRAFFIC byte
+        let traffic_bytes = traffic.encode();
 
-        // Build onion around the Traffic packet
-        let onion_pkt = match build_onion(relays, dst, traffic_bytes) {
+        let onion_pkt = match build_onion(relays, &dest_hop, traffic_bytes) {
             Ok(p) => p,
             Err(e) => bail!("failed to build onion: {}", e),
         };
         let encoded = onion_pkt.encode();
 
-        // Send to first relay
-        let first_relay = relays[0];
+        let first_relay = relays[0].identity_ed_pub;
         let next_hop = self.inner.lock_or_recover().lookup(&first_relay);
         if let Some(next) = next_hop {
             self.inner.lock_or_recover().send_to_peer(&next, encoded);
@@ -1741,6 +1919,7 @@ impl PacketConn {
             rx_bytes: p.rx_bytes,
             tx_bytes: p.tx_bytes,
             uptime: now.duration_since(p.connected_at),
+            trust: p.trust,
         }).collect()
     }
 
@@ -2597,6 +2776,125 @@ mod tests {
     }
 
     // ── send_announces depth encoding ─────────────────────────────────────────
+
+    // ── trust scoring ────────────────────────────────────────────────────────
+
+    #[test]
+    fn peer_starts_at_initial_trust() {
+        let mut rs = make_router();
+        let key = [0xA1u8; 32];
+        add_dummy_peer(&mut rs, key);
+        assert_eq!(rs.peers[&key].trust, TRUST_INITIAL,
+            "new peers start at TRUST_INITIAL");
+    }
+
+    #[test]
+    fn decay_trust_multiplies_and_floors() {
+        let mut rs = make_router();
+        let key = [0xA2u8; 32];
+        add_dummy_peer(&mut rs, key);
+        rs.peers.get_mut(&key).unwrap().trust = 1.0;
+        rs.peers.get_mut(&key).unwrap().decay_trust();
+        assert!((rs.peers[&key].trust - 0.5).abs() < 1e-6,
+            "one decay halves trust: {}", rs.peers[&key].trust);
+        // Many decays must floor at TRUST_MIN.
+        for _ in 0..100 { rs.peers.get_mut(&key).unwrap().decay_trust(); }
+        assert!(rs.peers[&key].trust >= TRUST_MIN,
+            "trust must never fall below TRUST_MIN");
+    }
+
+    #[test]
+    fn boost_trust_multiplies_and_caps() {
+        let mut rs = make_router();
+        let key = [0xA3u8; 32];
+        add_dummy_peer(&mut rs, key);
+        rs.peers.get_mut(&key).unwrap().trust = 1.0;
+        rs.peers.get_mut(&key).unwrap().boost_trust();
+        assert!(rs.peers[&key].trust > 1.0, "boost must increase trust");
+        for _ in 0..100 { rs.peers.get_mut(&key).unwrap().boost_trust(); }
+        assert!(rs.peers[&key].trust <= TRUST_MAX,
+            "trust must never exceed TRUST_MAX");
+    }
+
+    #[test]
+    fn trust_adjusted_cost_inverse_to_trust() {
+        let mut rs = make_router();
+        let key = [0xA4u8; 32];
+        add_dummy_peer(&mut rs, key);
+        rs.peers.get_mut(&key).unwrap().lag = Duration::from_millis(100);
+        rs.peers.get_mut(&key).unwrap().loss_rate = 0.0;
+        rs.peers.get_mut(&key).unwrap().trust = 1.0;
+        let cost_at_1 = rs.peers[&key].trust_adjusted_cost();
+        rs.peers.get_mut(&key).unwrap().trust = 0.1;
+        let cost_at_low = rs.peers[&key].trust_adjusted_cost();
+        assert!(cost_at_low > cost_at_1,
+            "low trust must yield higher cost (de-prioritised in lookup); {} vs {}",
+            cost_at_low, cost_at_1);
+    }
+
+    #[test]
+    fn lookup_by_tag_prefers_higher_trust_on_tie() {
+        // Two peers both claim the same tag with identical lag; the higher-trust
+        // one should win.
+        let mut rs = make_router();
+        let high = [0xB0u8; 32];
+        let low  = [0xB1u8; 32];
+        add_dummy_peer(&mut rs, high);
+        add_dummy_peer(&mut rs, low);
+        rs.peers.get_mut(&high).unwrap().lag = Duration::from_millis(50);
+        rs.peers.get_mut(&low).unwrap().lag  = Duration::from_millis(50);
+        rs.peers.get_mut(&high).unwrap().trust = 2.0;
+        rs.peers.get_mut(&low).unwrap().trust  = 0.1;
+        let tag = [0xCC_u8; 16];
+        rs.peers.get_mut(&high).unwrap().cuckoo[0].add(&tag);
+        rs.peers.get_mut(&low).unwrap().cuckoo[0].add(&tag);
+        let winner = rs.lookup_by_tag(&tag).expect("at least one peer should match");
+        assert_eq!(winner, high,
+            "the high-trust peer must win the lookup tie");
+    }
+
+    // ── onion replay cache ──────────────────────────────────────────────────
+
+    #[test]
+    fn onion_replay_first_sight_not_replay() {
+        let mut rs = make_router();
+        let pkt = crate::onion::OnionPacket {
+            routing_tag: [0u8; 16],
+            epk: [1u8; 32],
+            aead_payload: vec![0xAA; 32],
+        };
+        assert!(!rs.is_onion_replay(&pkt), "first sighting must not be flagged");
+    }
+
+    #[test]
+    fn onion_replay_second_sight_is_replay() {
+        let mut rs = make_router();
+        let pkt = crate::onion::OnionPacket {
+            routing_tag: [0u8; 16],
+            epk: [1u8; 32],
+            aead_payload: vec![0xAA; 32],
+        };
+        assert!(!rs.is_onion_replay(&pkt));
+        assert!(rs.is_onion_replay(&pkt), "identical second sighting must be detected as replay");
+    }
+
+    #[test]
+    fn onion_replay_distinguishes_different_epks() {
+        let mut rs = make_router();
+        let pkt_a = crate::onion::OnionPacket {
+            routing_tag: [0u8; 16],
+            epk: [1u8; 32],
+            aead_payload: vec![0xAA; 32],
+        };
+        let pkt_b = crate::onion::OnionPacket {
+            routing_tag: [0u8; 16],
+            epk: [2u8; 32], // different epk
+            aead_payload: vec![0xAA; 32],
+        };
+        assert!(!rs.is_onion_replay(&pkt_a));
+        assert!(!rs.is_onion_replay(&pkt_b),
+            "different epk → different digest → not a replay");
+    }
 
     #[test]
     fn send_announces_encodes_own_depth_for_tree_0() {

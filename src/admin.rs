@@ -55,6 +55,7 @@ struct PeerInfo {
     tx_bytes: u64,
     uptime_secs: f64,
     priority: u8,
+    trust: f32,
 }
 
 #[derive(Serialize)]
@@ -201,6 +202,7 @@ async fn dispatch(req: Request, conn: &Arc<PacketConn>, connected: &ConnectedPee
                 tx_bytes: p.tx_bytes,
                 uptime_secs: p.uptime.as_secs_f64(),
                 priority: p.priority,
+                trust: p.trust,
             }).collect();
             Response::GetPeers(peers)
         }

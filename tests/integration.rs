@@ -755,9 +755,15 @@ async fn onion_routing_via_relay() {
         .map(|i| format!("onion_msg_{}", i).into_bytes())
         .collect();
 
+    // Build the relay hop: needs the peer's *current* onion ephemeral pub
+    // (learned by A via CoordAnnounce gossip from B). Without it, FS-grade
+    // onion routing can't be performed.
+    let b_hop = conn_a.onion_hop_for(&pub_b)
+        .expect("A must have learned B's onion ephemeral pub via CoordAnnounce");
+
     for msg in &msgs {
         conn_a
-            .write_to_onion(msg, &pub_c, &[pub_b])
+            .write_to_onion(msg, &pub_c, std::slice::from_ref(&b_hop))
             .await
             .expect("write_to_onion failed");
     }

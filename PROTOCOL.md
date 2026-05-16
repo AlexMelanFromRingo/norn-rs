@@ -1,8 +1,8 @@
 # norn-rs wire protocol
 
 This document is the normative reference for the `norn-rs` protocol as of
-version **0.3.0**. Implementations claiming compatibility MUST match this
-specification byte-for-byte.
+version **0.3.0** (with onion v3 extensions). Implementations claiming
+compatibility MUST match this specification byte-for-byte.
 
 Notation:
 * `u8`, `u16`, `u32`, `u64` are little-endian.
@@ -205,16 +205,20 @@ Path length MUST NOT exceed 1024 hops.
 
 ## 9. COORD_ANNOUNCE (0x0A)
 
+v2 layout (116 bytes):
+
 ```
 [coord: 16]                   — (r: f64 LE, theta: f64 LE)
 [tree_depth: u32 LE]
-[sig: 64]                     — sender signs (coord || tree_depth)
+[onion_eph_pub: 32]           — sender's current onion ephemeral X25519 pub
+[sig: 64]                     — sender signs (coord || tree_depth || onion_eph_pub)
 ```
 
 Receivers MUST:
 * verify the signature;
 * reject coords containing NaN or Inf;
-* bound the coord table to 16 384 entries (evict a non-peer entry when full).
+* bound the coord table to 16 384 entries (evict a non-peer entry when full);
+* record `onion_eph_pub` against the announcing peer for later onion building.
 
 ## 10. ONION (0x0B)
 
@@ -223,10 +227,35 @@ Receivers MUST:
 [epk: 32]                     — per-layer ephemeral X25519 pub
 [aead_len: varint]
 [aead_payload: aead_len]
+[padding…]                    — zeros, to a fixed total wire size
 ```
 
+**Fixed cell size**: every onion frame MUST be padded to exactly
+`ONION_CELL_SIZE = 1280` bytes (including the leading 0x0B type byte). This
+removes the per-hop size signal that lets a global passive observer
+correlate packets across consecutive links. `aead_len` tells the receiver
+where the AEAD payload ends; trailing bytes are zero padding and ignored.
+
+**Forward-secret relay key**: `aead_payload` is encrypted to the relay's
+*current advertised onion ephemeral pub* (from §9 CoordAnnounce). Relays
+rotate this keypair every hour and zeroize the prior key after one further
+rotation period. Past onion traffic that transited a relay becomes
+undecryptable once two rotations have elapsed (forward secrecy).
+
+Relays MUST attempt decryption with: (1) the current onion ephemeral priv,
+(2) the previous ephemeral priv (one-rotation graceful window), (3) the
+identity-derived X25519 priv as a fallback for senders that have not yet
+heard the relay's CoordAnnounce. The fallback path provides confidentiality
+but NOT forward secrecy for those layers.
+
+**Replay cache**: each relay maintains an LRU of 4 096
+BLAKE2b("norn:onion-replay" || epk || aead_payload[..16]) digests and
+silently drops any onion cell whose digest has been seen recently. This
+prevents tagging-by-replay attacks.
+
 `aead_payload` decrypts (ChaCha20-Poly1305, nonce all-zero, AAD = `epk`,
-key = `DH(epk_priv_or_relay_x25519_priv, …)`) to one of:
+key = `DH(epk_priv, relay_eph_pub)` from sender side, `DH(relay_eph_priv, epk)`
+from relay side) to one of:
 
 * `[0x01][inner_len: varint][inner: inner_len]` — relay layer: `inner` is the
   next OnionPacket (without the leading TYPE_ONION byte). Forward toward

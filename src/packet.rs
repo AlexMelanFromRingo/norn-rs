@@ -535,31 +535,53 @@ pub fn routing_tag(pub_key: &[u8; 32]) -> [u8; 16] {
     h.finalize().into()
 }
 
-/// Broadcast by each node: its hyperbolic coordinate + signed by its key.
+/// Broadcast by each node: its hyperbolic coordinate, onion-ephemeral pub,
+/// and signed by its long-term ed25519 key.
+///
+/// Wire layout (v2):
+///   [coord: 16][tree_depth: u32 LE][onion_eph_pub: 32][sig: 64]
+///
+/// Signature covers: coord || tree_depth || onion_eph_pub. The receiver
+/// authenticates the announced ephemeral pub against the sender's identity
+/// before using it for onion DH.
 #[derive(Clone, Debug)]
 pub struct CoordAnnounce {
     pub coord: [u8; 16],
     pub tree_depth: u32,
+    pub onion_eph_pub: [u8; 32],
     pub sig: [u8; 64],
 }
 
 impl CoordAnnounce {
+    /// Bytes that the sender must sign (everything *but* the signature).
+    pub fn sign_bytes(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(16 + 4 + 32);
+        buf.extend_from_slice(&self.coord);
+        buf.extend_from_slice(&self.tree_depth.to_le_bytes());
+        buf.extend_from_slice(&self.onion_eph_pub);
+        buf
+    }
+
     pub fn encode_into(&self, buf: &mut Vec<u8>) {
         buf.extend_from_slice(&self.coord);
         buf.extend_from_slice(&self.tree_depth.to_le_bytes());
+        buf.extend_from_slice(&self.onion_eph_pub);
         buf.extend_from_slice(&self.sig);
     }
 
     pub fn decode(data: &[u8]) -> Result<Self> {
-        if data.len() < 16 + 4 + 64 {
-            bail!("CoordAnnounce too short: got {}", data.len());
+        let need = 16 + 4 + 32 + 64;
+        if data.len() < need {
+            bail!("CoordAnnounce too short: got {} (need {})", data.len(), need);
         }
         let mut coord = [0u8; 16];
         coord.copy_from_slice(&data[0..16]);
         let tree_depth = u32::from_le_bytes(data[16..20].try_into().unwrap());
+        let mut onion_eph_pub = [0u8; 32];
+        onion_eph_pub.copy_from_slice(&data[20..52]);
         let mut sig = [0u8; 64];
-        sig.copy_from_slice(&data[20..84]);
-        Ok(CoordAnnounce { coord, tree_depth, sig })
+        sig.copy_from_slice(&data[52..116]);
+        Ok(CoordAnnounce { coord, tree_depth, onion_eph_pub, sig })
     }
 }
 
@@ -1027,6 +1049,7 @@ mod tests {
         let ann = CoordAnnounce {
             coord: [0xABu8; 16],
             tree_depth: 42,
+            onion_eph_pub: [0x77u8; 32],
             sig: [0x5Cu8; 64],
         };
         let mut buf = Vec::new();
@@ -1034,6 +1057,7 @@ mod tests {
         let dec = CoordAnnounce::decode(&buf).unwrap();
         assert_eq!(dec.coord, ann.coord);
         assert_eq!(dec.tree_depth, ann.tree_depth);
+        assert_eq!(dec.onion_eph_pub, ann.onion_eph_pub);
         assert_eq!(dec.sig, ann.sig);
     }
 
@@ -1042,6 +1066,7 @@ mod tests {
         let ann = CoordAnnounce {
             coord: [0u8; 16],
             tree_depth: 0x01020304,
+            onion_eph_pub: [0u8; 32],
             sig: [0u8; 64],
         };
         let mut buf = Vec::new();
@@ -1057,10 +1082,11 @@ mod tests {
 
     #[test]
     fn coord_announce_decode_truncated_fails() {
-        // Needs exactly 16 + 4 + 64 = 84 bytes
-        assert!(CoordAnnounce::decode(&[0u8; 83]).is_err(), "83 bytes must fail");
+        // v2 layout: 16 (coord) + 4 (tree_depth) + 32 (onion_eph_pub) + 64 (sig) = 116 bytes
+        let need = 16 + 4 + 32 + 64;
+        assert!(CoordAnnounce::decode(&[0u8; 115]).is_err(), "{} - 1 bytes must fail", need);
         assert!(CoordAnnounce::decode(&[0u8; 0]).is_err(), "empty must fail");
-        assert!(CoordAnnounce::decode(&[0u8; 84]).is_ok(), "84 bytes must succeed");
+        assert!(CoordAnnounce::decode(&vec![0u8; need]).is_ok(), "{} bytes must succeed", need);
     }
 
     // ── Traffic decode boundary ───────────────────────────────────────────────
