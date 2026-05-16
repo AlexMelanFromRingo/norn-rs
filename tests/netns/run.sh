@@ -76,32 +76,38 @@ ip -n "$NS_A" link set lo up
 ip -n "$NS_B" link set lo up
 
 # ── configs ───────────────────────────────────────────────────────────────
+# Build the configs from scratch (instead of appending to `genconfig` output,
+# which would duplicate keys and fail TOML parsing). We still call genconfig
+# once just to harvest a fresh private_key.
 echo "── generating configs ──"
 mkdir -p "$WORK/a" "$WORK/b"
-"$NORND" genconfig -o "$WORK/a/norn.toml"
-"$NORND" genconfig -o "$WORK/b/norn.toml"
-chmod 600 "$WORK/a/norn.toml" "$WORK/b/norn.toml"
 
-# Patch each config:
-#   - listen port (avoid the default 9001 colliding with anything)
-#   - admin socket path (per-ns)
-#   - peer cache path (per-ns, empty by default — disable for cleanliness)
-#   - mdns/multicast off (no point in tiny netns)
-patch_config() {
-    local dir=$1 me_addr=$2 peer_uri=$3 sock=$4
-    cat >>"$dir/norn.toml" <<EOF
-# Patched by netns test harness:
-listen = ["tcp://${me_addr%/*}:${PORT}"]
-peers  = ["${peer_uri}"]
+generate_key() {
+    "$NORND" genconfig | awk -F'"' '/^private_key/ {print $2; exit}'
+}
+
+write_config() {
+    local dir=$1 me_addr=$2 peer_uri=$3 sock=$4 priv_hex=$5
+    cat >"$dir/norn.toml" <<EOF
+private_key = "${priv_hex}"
+listen      = ["tcp://${me_addr%/*}:${PORT}"]
+peers       = ["${peer_uri}"]
+tun_name    = "norn0"
 admin_socket    = "${sock}"
 peer_cache_path = ""
 multicast_enabled = false
-mdns_enabled    = false
-log_level       = "warn"
+mdns_enabled      = false
+metrics_addr      = ""
+min_peer_difficulty_bits = 0
+log_level        = "warn"
 EOF
+    chmod 600 "$dir/norn.toml"
 }
-patch_config "$WORK/a" "${IP_A%/*}" "tcp://${IP_B%/*}:${PORT}" "$WORK/a/admin.sock"
-patch_config "$WORK/b" "${IP_B%/*}" "tcp://${IP_A%/*}:${PORT}" "$WORK/b/admin.sock"
+
+KEY_A=$(generate_key)
+KEY_B=$(generate_key)
+write_config "$WORK/a" "${IP_A%/*}" "tcp://${IP_B%/*}:${PORT}" "$WORK/a/admin.sock" "$KEY_A"
+write_config "$WORK/b" "${IP_B%/*}" "tcp://${IP_A%/*}:${PORT}" "$WORK/b/admin.sock" "$KEY_B"
 
 # ── start daemons ─────────────────────────────────────────────────────────
 echo "── starting daemons ──"

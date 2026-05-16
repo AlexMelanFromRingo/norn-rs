@@ -94,11 +94,15 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
       - uses: Swatinem/rust-cache@v2
-      # Pin cargo-fuzz: newer Rust versions reject the unsafe `rustc` attrs
-      # that older proc-macro-error (a transitive dep of older cargo-fuzz)
-      # used. 0.12 was the first release to ship without that footgun.
+      # Install cargo-fuzz from a prebuilt binary. Building from source via
+      # `cargo install` repeatedly broke because older cargo-fuzz versions
+      # pin transitive deps (proc-macro-error 1.x, rustix 0.36) that no
+      # longer compile on current nightly. The taiki-e action grabs an
+      # up-to-date statically-linked binary.
       - name: Install cargo-fuzz
-        run: cargo +nightly install --locked --version "^0.12" cargo-fuzz
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
       - name: Fuzz uvarint
         run: cargo +nightly fuzz run fuzz_uvarint -- -max_total_time=60
       - name: Fuzz packet decode
