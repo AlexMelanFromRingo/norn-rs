@@ -222,6 +222,21 @@ pub async fn listen(
                 Ok(Ok(p)) => p,
             };
 
+            // Sybil-resistance: refuse peers whose pub_key has insufficient
+            // built-in proof-of-work. Each extra bit doubles the cost of
+            // generating an identity.
+            let min_bits = conn.min_peer_difficulty_bits();
+            if min_bits > 0 {
+                let got = crate::address::key_difficulty_bits(&remote_pub);
+                if got < min_bits {
+                    warn!(
+                        "rejecting inbound from {} ({:?}): difficulty {} < required {}",
+                        peer_addr, &remote_pub[..4], got, min_bits
+                    );
+                    return;
+                }
+            }
+
             // Dedup: skip if already connected
             {
                 let mut set = connected.lock().unwrap();
@@ -264,6 +279,22 @@ pub async fn dial(uri: &str, conn: Arc<PacketConn>, connected: ConnectedPeers) {
                 };
                 match remote_pub_res {
                     Ok(remote_pub) => {
+                        // Symmetric Sybil-resistance check on outbound side:
+                        // if the remote's pub_key falls below our minimum
+                        // difficulty we drop and back off — peer cannot meet
+                        // our policy so the cache shouldn't keep dialing it.
+                        let min_bits = conn.min_peer_difficulty_bits();
+                        if min_bits > 0 {
+                            let got = crate::address::key_difficulty_bits(&remote_pub);
+                            if got < min_bits {
+                                warn!(
+                                    "outbound: refusing peer {:?} at {} (difficulty {} < required {})",
+                                    &remote_pub[..4], addr, got, min_bits
+                                );
+                                tokio::time::sleep(Duration::from_secs(300)).await;
+                                continue;
+                            }
+                        }
                         // Dedup: drop the guard before any await
                         let already = connected.lock().unwrap().contains(&remote_pub);
                         if already {

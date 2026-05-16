@@ -5,8 +5,10 @@
 // switches it. Exits non-zero on transport errors or daemon-reported errors.
 
 use anyhow::{bail, Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
+use clap_complete::{generate, Shell};
 use serde::{Deserialize, Serialize};
+use std::io;
 use std::path::PathBuf;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
@@ -46,6 +48,17 @@ enum Cmd {
     Showaddr {
         /// 64-char hex Ed25519 public key.
         pub_key_hex: String,
+    },
+    /// Emit shell-completion script to stdout.
+    ///
+    /// Examples:
+    ///   nornctl completions bash > /usr/share/bash-completion/completions/nornctl
+    ///   nornctl completions zsh  > ~/.zsh/completions/_nornctl
+    ///   nornctl completions fish > ~/.config/fish/completions/nornctl.fish
+    Completions {
+        /// Target shell: bash | zsh | fish | elvish | powershell
+        #[arg(value_enum)]
+        shell: Shell,
     },
 }
 
@@ -133,6 +146,13 @@ async fn main() -> Result<()> {
                 let r: AddPeerResult = serde_json::from_value(v).context("parsing addPeer reply")?;
                 println!("{}: {}", r.status, r.uri);
             }
+        }
+        Cmd::Completions { shell } => {
+            // Generate the script to stdout — does not touch the admin socket.
+            let mut cmd = Cli::command();
+            let name = cmd.get_name().to_string();
+            generate(shell, &mut cmd, name, &mut io::stdout());
+            return Ok(());
         }
         Cmd::Showaddr { pub_key_hex } => {
             // Local computation — no socket call needed.
@@ -223,5 +243,33 @@ mod tests {
     fn cli_default_socket() {
         let cli = Cli::try_parse_from(["nornctl", "status"]).unwrap();
         assert_eq!(cli.socket.to_str().unwrap(), DEFAULT_SOCKET);
+    }
+
+    #[test]
+    fn cli_completions_accepts_known_shells() {
+        for s in &["bash", "zsh", "fish", "elvish", "powershell"] {
+            let cli = Cli::try_parse_from(["nornctl", "completions", s]).unwrap();
+            assert!(matches!(cli.cmd, Cmd::Completions { .. }));
+        }
+    }
+
+    #[test]
+    fn cli_completions_rejects_unknown_shell() {
+        let result = Cli::try_parse_from(["nornctl", "completions", "tcsh"]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn completions_bash_writes_nonempty() {
+        // Smoke test: generate a bash completion script into a Vec<u8> and
+        // verify it's a plausible shell script (mentions our binary name).
+        let mut buf = Vec::new();
+        let mut cmd = Cli::command();
+        let name = cmd.get_name().to_string();
+        generate(Shell::Bash, &mut cmd, name, &mut buf);
+        let s = String::from_utf8(buf).expect("completion output must be UTF-8");
+        assert!(!s.is_empty(), "bash completion script must not be empty");
+        assert!(s.contains("nornctl"),
+            "bash completion script must mention 'nornctl'");
     }
 }

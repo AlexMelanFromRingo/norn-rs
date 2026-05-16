@@ -13,6 +13,8 @@ pub mod transport;
 pub mod discovery;
 pub mod admin;
 pub mod tun;
+pub mod metrics;
 pub mod node;
+pub mod peercache;
 
 pub use router::{InboundPacket, PacketConn, PeerStats};

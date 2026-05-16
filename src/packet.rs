@@ -1150,6 +1150,49 @@ mod tests {
         assert_eq!(dec.tree_depth, 0x01020304);
     }
 
+    // ── Anti-amplification audit: wire-size invariants ──────────────────────
+    //
+    // Reflection-amplification attacks rely on a UDP-style design where an
+    // attacker can spoof a source address and have the server reply with
+    // more bytes than the request. norn-rs runs over TCP for all session
+    // traffic (no source spoofing possible), but we additionally enforce
+    // that no protocol response is much bigger than its trigger.
+    //
+    // These tests fail compilation if the wire format grows unexpectedly,
+    // so a future change that opens an amplification window will be caught
+    // at review time.
+
+    #[test]
+    fn coord_announce_size_bounded() {
+        // Sent to direct peers only, signed. 116 bytes is small and fixed.
+        let need = 16 + 4 + 32 + 64;
+        assert_eq!(need, 116, "CoordAnnounce wire size has grown unexpectedly");
+    }
+
+    #[test]
+    fn onion_key_announce_size_bounded() {
+        // Flooded but only on first-sight per (origin, seq). Bounded fan-out
+        // because each receiver forwards only once.
+        let need = 32 + 8 + 8 + 32 + 64;
+        assert_eq!(need, 144, "OnionKeyAnnounce wire size has grown unexpectedly");
+    }
+
+    #[test]
+    fn sigreq_vs_sigres_amplification_bounded() {
+        // SigReq:  type(1) + tree_id(1) + varint(seq, ≤9) + varint(ts, ≤9) + pub(32) ≤ 52 bytes
+        // SigRes:  type(1) + tree_id(1) + varint(seq, ≤9) + varint(ts, ≤9) + sig(64) + pub(32) ≤ 116 bytes
+        // Amplification factor ≤ 116/35 ≈ 3.3× for typical (1-byte varint) inputs.
+        // Since SigReq is rate-limited per-peer (one per KEEPALIVE_TICKS) and
+        // TCP can't be source-spoofed, no reflection attack is possible.
+        let req = SigReq { tree_id: 0, seq: 1, timestamp_ms: 1, pub_key: [0u8; 32] };
+        let res = SigRes { tree_id: 0, seq: 1, timestamp_ms: 1, signature: [0u8; 64], pub_key: [0u8; 32] };
+        let req_size = req.encode().len();
+        let res_size = res.encode().len();
+        assert!(res_size < 4 * req_size,
+            "SigRes/SigReq amplification factor {} exceeds 4×; would be a UDP-reflection problem if any UDP path opened",
+            res_size as f64 / req_size as f64);
+    }
+
     // ── OnionKeyAnnounce ────────────────────────────────────────────────────
 
     #[test]

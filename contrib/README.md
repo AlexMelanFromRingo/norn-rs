@@ -82,14 +82,22 @@ sudo install -m 755 target/release/nornctl /usr/local/bin/
 sudo systemctl start norn
 ```
 
-## Bash / Zsh completions
+## Bash / Zsh / Fish completions
 
-`clap` can emit completions at build time. Add a step like:
+`nornctl` ships a built-in completion generator. Install with:
 
 ```bash
-cargo run --release --bin nornctl -- --help    # ensure built
-# (or use clap_complete::generate in a build.rs / xtask)
+# Bash (system-wide)
+nornctl completions bash | sudo tee /usr/share/bash-completion/completions/nornctl >/dev/null
+
+# Zsh (user — make sure ~/.zsh/completions is in $fpath in your .zshrc)
+nornctl completions zsh > ~/.zsh/completions/_nornctl
+
+# Fish (user)
+nornctl completions fish > ~/.config/fish/completions/nornctl.fish
+
+# PowerShell
+nornctl completions powershell > $PROFILE.CurrentUserAllHosts
 ```
 
-If you wire `clap_complete::generate` into the binary, install completions to
-`/usr/share/bash-completion/completions/nornctl` and the equivalent zsh path.
+Re-run after every `nornctl` upgrade so completions track new subcommands.

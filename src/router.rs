@@ -408,6 +408,15 @@ fn coords_approx_equal(a: &HypCoord, b: &HypCoord) -> bool {
     dr < 1e-9 && dt < 1e-9
 }
 
+/// Constant-time equality on routing tags. The leak is minor (an attacker
+/// would have to time forwarding decisions under 50ms jitter) but the cost
+/// is zero, so this is defence in depth.
+#[inline]
+fn routing_tag_eq(a: &[u8; 16], b: &[u8; 16]) -> bool {
+    use subtle::ConstantTimeEq;
+    a.ct_eq(b).unwrap_u8() == 1
+}
+
 /// XOR-metric for tree root selection. Each tree uses a different seed.
 pub fn tree_metric(pub_key: &[u8; 32], seed: &[u8; 8]) -> [u8; 32] {
     let mut metric = *pub_key;
@@ -763,6 +772,7 @@ impl RouterState {
         }
         self.rotate_session_keys();
         self.rotate_onion_keys_if_due();
+        self.rotate_pq_keys_if_due();
         // Periodically re-announce our onion ephemeral pub so the network-wide
         // table heals after splits/peer churn. Multiple-of check fires on the
         // first tick too — that's the deliberate cold-start announce.
@@ -789,6 +799,16 @@ impl RouterState {
             self.onion_keys.rotate();
             self.broadcast_onion_key_announce();
             debug!("onion keys rotated at tick {}", self.tick);
+        }
+    }
+
+    /// Rotate the long-term ML-KEM keypair if the time-based threshold has
+    /// passed. Cheap when nothing's due; we just check the timer.
+    #[mutants::skip]
+    fn rotate_pq_keys_if_due(&self) {
+        let mut sm = self.sessions.lock_or_recover();
+        if sm.maybe_rotate_pq_keys() {
+            debug!("ML-KEM long-term keypair rotated");
         }
     }
 
@@ -1377,7 +1397,7 @@ impl RouterState {
 
         // Determine if this packet is addressed to us by comparing routing tags.
         let my_tag = routing_tag(&self.pub_key);
-        if traffic.routing_tag == my_tag {
+        if routing_tag_eq(&traffic.routing_tag, &my_tag) {
             match traffic.pkt_type {
                 packet::PKT_CONTROL => {
                     // Session control — padded, NOT session-encrypted.
@@ -1746,7 +1766,7 @@ fn dispatch(state: &Arc<Mutex<RouterState>>, from: PeerId, frame: Vec<u8>) {
             if let Ok(traffic) = Traffic::decode(data) {
                 let my_pub = state.lock_or_recover().pub_key;
                 let my_tag = routing_tag(&my_pub);
-                if traffic.routing_tag == my_tag {
+                if routing_tag_eq(&traffic.routing_tag, &my_tag) {
                     // For us: handle immediately (no jitter — latency matters)
                     state.lock_or_recover().handle_traffic(from, traffic);
                 } else {
@@ -1780,7 +1800,7 @@ fn dispatch(state: &Arc<Mutex<RouterState>>, from: PeerId, frame: Vec<u8>) {
             if let Ok(pkt) = OnionPacket::decode(data) {
                 let my_pub = state.lock_or_recover().pub_key;
                 let my_tag = routing_tag(&my_pub);
-                if pkt.routing_tag == my_tag {
+                if routing_tag_eq(&pkt.routing_tag, &my_tag) {
                     // This layer is for us — peel and act
                     let state2 = state.clone();
                     tokio::spawn(async move {
@@ -1825,6 +1845,11 @@ pub struct PacketConn {
     /// per-connection authenticated handshake. Stored here so that transports
     /// don't need to be parameterised with the key separately.
     signing_key: SigningKey,
+    /// Sybil-resistance threshold: an inbound peer's pub_key MUST have at
+    /// least this many leading 1-bits in BLAKE2b(pub_key) (cf.
+    /// `address::key_difficulty_bits`). 0 = no requirement. Stored as
+    /// AtomicU32 so it can be raised at runtime without locking.
+    min_peer_difficulty_bits: Arc<std::sync::atomic::AtomicU32>,
     shutdown_tx: watch::Sender<bool>,
 }
 
@@ -1832,6 +1857,17 @@ impl PacketConn {
     /// Borrow the signing key (used by the transport layer for handshake signing).
     pub fn signing_key(&self) -> &SigningKey {
         &self.signing_key
+    }
+
+    /// Current Sybil-resistance threshold in bits.
+    pub fn min_peer_difficulty_bits(&self) -> u32 {
+        self.min_peer_difficulty_bits.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Set the Sybil-resistance threshold. Inbound peers with fewer
+    /// `key_difficulty_bits` are refused at the transport layer.
+    pub fn set_min_peer_difficulty_bits(&self, bits: u32) {
+        self.min_peer_difficulty_bits.store(bits, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -1898,6 +1934,7 @@ impl PacketConn {
             traffic_rx: tokio::sync::Mutex::new(traffic_rx),
             pub_key,
             signing_key: signing_key_for_pc,
+            min_peer_difficulty_bits: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             shutdown_tx,
         }
     }

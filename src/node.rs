@@ -25,6 +25,9 @@ impl Node {
         let signing_key = config.signing_key()?;
         let conn = Arc::new(PacketConn::new(signing_key));
 
+        // Apply Sybil-resistance threshold from config.
+        conn.set_min_peer_difficulty_bits(config.min_peer_difficulty_bits);
+
         let key_store = new_key_store();
         // Register our own key so TUN knows our address
         key_store.lock().unwrap().register(conn.pub_key);
@@ -70,6 +73,29 @@ impl Node {
             });
         }
 
+        // ── Persistent known-peers cache ─────────────────────────────────
+        // Read at startup, dial each URI alongside the static peers, and
+        // dedupe naturally via the `connected` set inside transport::dial.
+        // The cache is rewritten on a maintenance cadence by a background
+        // task that observes get_peer_stats(). On restart the daemon picks
+        // up where it left off, surviving DNS churn and accidental config
+        // drift.
+        if !self.config.peer_cache_path.is_empty() {
+            let cache = crate::peercache::PeerCache::load(&self.config.peer_cache_path);
+            let cached_count = cache.len();
+            if cached_count > 0 {
+                info!("seeded {} dial(s) from peer cache {:?}", cached_count, self.config.peer_cache_path);
+            }
+            for uri in cache.uris() {
+                let conn = self.conn.clone();
+                let connected = self.connected.clone();
+                let uri = uri.to_string();
+                tokio::spawn(async move {
+                    crate::transport::dial(&uri, conn, connected).await;
+                });
+            }
+        }
+
         // ── Multicast discovery ──────────────────────────────────────────
         if self.config.multicast_enabled {
             let conn = self.conn.clone();
@@ -90,6 +116,17 @@ impl Node {
             tokio::spawn(async move {
                 if let Err(e) = crate::admin::listen(&path, conn, connected).await {
                     tracing::warn!("admin socket: {}", e);
+                }
+            });
+        }
+
+        // ── Prometheus /metrics endpoint ─────────────────────────────────
+        if !self.config.metrics_addr.is_empty() {
+            let conn = self.conn.clone();
+            let addr = self.config.metrics_addr.clone();
+            tokio::spawn(async move {
+                if let Err(e) = crate::metrics::listen(&addr, conn).await {
+                    tracing::warn!("metrics endpoint: {}", e);
                 }
             });
         }

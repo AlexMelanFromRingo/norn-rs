@@ -1,8 +1,25 @@
 # norn-rs wire protocol
 
 This document is the normative reference for the `norn-rs` protocol as of
-version **0.3.0** (with onion v3 extensions). Implementations claiming
-compatibility MUST match this specification byte-for-byte.
+version **0.4.0**. Implementations claiming compatibility MUST match this
+specification byte-for-byte.
+
+### 0.4 changes vs 0.3
+
+* ML-KEM-768 long-term keypair now rotates every ~24h with a 60s overlap
+  window. No wire change — the rotation is purely a local operational
+  hardening; mid-rotation Acks decap via the prior dk and the responder
+  carries a `pq_shared_fallback` on `SessionInfo` until the first packet
+  validates.
+* Sybil-resistance threshold: an inbound peer's pub_key MUST satisfy
+  `min_peer_difficulty_bits` (operator-set, 0 = off) before its TCP
+  connection is accepted. The check is the leading-ones count of
+  BLAKE2b(pub_key) — same metric already used in `addr[1]`.
+* All `routing_tag` and `recipient_ed_pub` matches use constant-time
+  comparison (`subtle::ConstantTimeEq`).
+* Anti-amplification: pinned wire-size invariants (`SESSION_INIT_WIRE_BYTES`
+  ≥ `SESSION_ACK_WIRE_BYTES`); static assert ensures responses cannot
+  exceed requests in size.
 
 Notation:
 * `u8`, `u16`, `u32`, `u64` are little-endian.

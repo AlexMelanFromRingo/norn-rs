@@ -23,6 +23,7 @@ norn-rs creates an encrypted IPv6 mesh network. Each node gets a unique `200::/7
 | Cuckoo filter gossip (2-byte fingerprints, FPR 0.012%) | ✅ |
 | ChaCha20-Poly1305 session encryption | ✅ |
 | X25519 + ML-KEM-768 PQ-hybrid session keys | ✅ |
+| Daily ML-KEM long-term keypair rotation (PQ FS) | ✅ |
 | Per-send X25519 key rotation (classical FS) | ✅ |
 | Rotating onion ephemeral keys (post-quantum-relay FS) | ✅ |
 | Fixed-size onion cells (1280 B, Tor-style) | ✅ |
@@ -31,7 +32,13 @@ norn-rs creates an encrypted IPv6 mesh network. Each node gets a unique `200::/7
 | Per-peer trust scoring biases routing | ✅ |
 | Hyperbolic coord consistency check | ✅ |
 | Authenticated TCP handshake (NRN1 magic) | ✅ |
-| `nornctl` admin CLI | ✅ |
+| Sybil resistance via per-key PoW (configurable bits) | ✅ |
+| Constant-time pub_key / routing_tag comparisons | ✅ |
+| Persistent known-peers cache (survives restart) | ✅ |
+| Prometheus `/metrics` endpoint | ✅ |
+| `nornctl` admin CLI + shell completions | ✅ |
+| Property-based parser fuzzing (proptest) | ✅ |
+| Anti-amplification audit + size-pinning tests | ✅ |
 | Sliding-window replay protection (64-slot) | ✅ |
 | Source privacy (encrypted enc_header) | ✅ |
 | Destination hiding (routing_tag + enc_header) | ✅ |

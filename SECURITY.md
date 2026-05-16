@@ -74,23 +74,37 @@ All previously-listed "Known weaknesses" are closed:
   AEAD key via HKDF-Extract+Expand-SHA256. The session is confidential as
   long as EITHER X25519 OR ML-KEM-768 holds.
 
-### Known weaknesses (open issues)
+### Resolved since v0.3
 
-These are intentionally outside the v0.3 release; tracked for follow-up.
+* **Long-term ML-KEM keypair rotation** (CLOSED). The ML-KEM-768 keypair
+  rotates every ~24h via `PqKeys::rotate_if_due`. The previous dk is
+  retained for a 60-second overlap window so in-flight Acks targeted at
+  the just-rotated pub still decap (`SessionInfo::pq_shared_fallback`),
+  then is zeroized.
+* **Sybil resistance via built-in PoW** (CLOSED). Inbound peers must
+  satisfy `min_peer_difficulty_bits` — the leading-ones count of
+  BLAKE2b(pub_key) — before they're accepted at the transport layer.
+  Each bit doubles the cost of generating an admissible identity. Same
+  mechanism used by Yggdrasil/cjdns; off by default (0 bits) to avoid
+  locking out existing keys on upgrade, opt-in via config.
+* **Constant-time comparisons** (CLOSED). `subtle::ConstantTimeEq` for
+  routing_tag and recipient_ed_pub matches, removing the timing side
+  channel that a short-circuiting `==` would otherwise present.
 
-1. **Long-term ML-KEM keypair rotation** — the ML-KEM decapsulation key
-   currently lives for the process lifetime. Compromising it allows
-   retroactive decryption of all session-init-time PQ secrets it received.
-   *Fix:* daily ML-KEM rotation with a graceful overlap window, analogous
-   to the onion-ephemeral rotation already in place.
-2. **Sybil resistance** — three-tree XOR-metric root selection helps but
-   cannot stop a well-funded attacker spinning up many identities. We rely
-   on `trust` to degrade misbehavers but do not bound them up-front.
-   *Fix:* gossip-graph proof-of-uniqueness, or stake-based admission.
-3. **Side-channel hardening of crypto** — RustCrypto primitives we use
-   document constant-time properties, but the host's CPU / compiler
-   pipeline can leak via cache timing. No explicit countermeasures (e.g.
-   wbox, blinding) are applied at the session layer.
+### Remaining known weaknesses
+
+1. **Active probe-based Sybil hardening** — the PoW threshold raises the
+   per-identity cost but does not detect cooperating malicious peers
+   with valid (just-expensive) keys. Combined with `trust` decay this is
+   acceptable for v0.4; an explicit reputation gossip layer remains
+   future work.
+2. **Side-channel hardening of underlying crypto crates** — RustCrypto
+   primitives document constant-time properties, but the host's CPU /
+   compiler pipeline can still leak via cache timing. No explicit
+   wbox/blinding countermeasures at the session layer.
+3. **Formal verification** — the PQ-hybrid HKDF construction follows
+   standard practice but has not been mechanically verified against a
+   security game (ProVerif / Tamarin).
 
 ## Reporting a vulnerability
 

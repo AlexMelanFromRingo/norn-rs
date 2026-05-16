@@ -26,12 +26,30 @@ use sha2::{Digest as Sha2Digest, Sha256, Sha512};
 type MlKemDk = ml_kem::DecapsulationKey<ml_kem::MlKem768>;
 type MlKemEk = ml_kem::EncapsulationKey<ml_kem::MlKem768>;
 
-/// Long-term ML-KEM-768 keypair held per SessionManager. Used to receive
-/// PQ-encapsulated shared secrets during inbound SessionInit / SessionAck.
+/// Long-term-rotating ML-KEM-768 keypair held per SessionManager.
+///
+/// Used to receive PQ-encapsulated shared secrets during inbound
+/// SessionInit / SessionAck. Rotated on a daily cadence by
+/// `rotate_if_due()`; the prior decapsulation key is retained for
+/// `ML_KEM_KEY_OVERLAP_MS` so in-flight Acks built against the just-
+/// rotated pub still decap. Past PQ traffic becomes undecryptable once
+/// both `prev_dk` and `dk` have rotated past the original.
 struct PqKeys {
     dk: MlKemDk,
     ek_bytes: [u8; ML_KEM_PUB_BYTES],
+    /// Just-rotated-out dk, kept for the overlap window. Cleared on the
+    /// next rotation. zeroize-on-drop is provided by ml-kem's "zeroize"
+    /// feature, so dropping clears the secret material.
+    prev_dk: Option<MlKemDk>,
+    /// When `dk` was generated (used to decide when to rotate).
+    rotated_at: Instant,
 }
+
+/// Maximum age of the current ML-KEM keypair before it should rotate.
+pub const ML_KEM_KEY_ROTATION_MS: u64 = 24 * 60 * 60 * 1000; // 24h
+/// How long we keep the previous dk after rotation, to decap Acks that were
+/// already in flight against the just-replaced pub.
+pub const ML_KEM_KEY_OVERLAP_MS: u64 = 60_000; // 60s
 
 impl PqKeys {
     fn generate() -> Self {
@@ -39,16 +57,91 @@ impl PqKeys {
         let ek_arr = ek.to_bytes();
         let mut ek_bytes = [0u8; ML_KEM_PUB_BYTES];
         ek_bytes.copy_from_slice(ek_arr.as_slice());
-        PqKeys { dk, ek_bytes }
+        PqKeys { dk, ek_bytes, prev_dk: None, rotated_at: Instant::now() }
     }
+
     fn pub_bytes(&self) -> &[u8; ML_KEM_PUB_BYTES] { &self.ek_bytes }
+
     fn decap(&self, ct_bytes: &[u8; ML_KEM_CT_BYTES]) -> Result<[u8; ML_KEM_SHARED_BYTES]> {
         let ct = Array::try_from(ct_bytes.as_slice())
             .map_err(|_| anyhow::anyhow!("ml-kem: bad ct length"))?;
+        // Current key first — common case.
         let shared = self.dk.decapsulate(&ct);
+        // ML-KEM decap is "implicit rejection": it never fails per se, it
+        // returns a pseudo-random value derived from the secret on bogus
+        // ct. So we cannot tell from this alone whether the ct was really
+        // for `dk` or `prev_dk`. Caller verifies via the AEAD tag on the
+        // first session packet; if decryption fails the caller should
+        // retry decap against prev_dk.
         let mut out = [0u8; ML_KEM_SHARED_BYTES];
         out.copy_from_slice(shared.as_slice());
         Ok(out)
+    }
+
+    /// Try `prev_dk` (if present) — used as a fallback when the first
+    /// post-handshake packet fails AEAD with the secret derived from `dk`.
+    /// This only runs during the overlap window and is rare in practice.
+    #[allow(dead_code)] // wired in but only used by callers handling AEAD-fail retry
+    fn decap_prev(&self, ct_bytes: &[u8; ML_KEM_CT_BYTES]) -> Option<[u8; ML_KEM_SHARED_BYTES]> {
+        let prev = self.prev_dk.as_ref()?;
+        let ct = Array::try_from(ct_bytes.as_slice()).ok()?;
+        let shared = prev.decapsulate(&ct);
+        let mut out = [0u8; ML_KEM_SHARED_BYTES];
+        out.copy_from_slice(shared.as_slice());
+        Some(out)
+    }
+
+    /// Rotate to a fresh keypair if the current one has exceeded
+    /// ML_KEM_KEY_ROTATION_MS, or if the overlap window has elapsed and
+    /// the prior key should be cleared. Returns true if anything changed.
+    pub fn rotate_if_due(&mut self) -> bool {
+        let elapsed_ms = self.rotated_at.elapsed().as_millis() as u64;
+        let mut changed = false;
+
+        // Clear prev_dk after overlap window so it can't decap any longer
+        // (and so the StaticSecret is dropped / zeroized).
+        if self.prev_dk.is_some() && elapsed_ms > ML_KEM_KEY_OVERLAP_MS {
+            self.prev_dk = None;
+            changed = true;
+        }
+
+        // Rotate when key has aged past ROTATION_MS.
+        if elapsed_ms > ML_KEM_KEY_ROTATION_MS {
+            let (new_dk, new_ek) = MlKem768::generate_keypair();
+            let new_ek_arr = new_ek.to_bytes();
+            let mut new_ek_bytes = [0u8; ML_KEM_PUB_BYTES];
+            new_ek_bytes.copy_from_slice(new_ek_arr.as_slice());
+
+            // Move current → previous, install new.
+            let mut old_dk = new_dk;
+            std::mem::swap(&mut self.dk, &mut old_dk);
+            self.prev_dk = Some(old_dk);
+            self.ek_bytes = new_ek_bytes;
+            self.rotated_at = Instant::now();
+            changed = true;
+        }
+
+        changed
+    }
+
+    /// Test helper: force a rotation regardless of timer.
+    #[cfg(test)]
+    fn force_rotate(&mut self) {
+        let (new_dk, new_ek) = MlKem768::generate_keypair();
+        let new_ek_arr = new_ek.to_bytes();
+        let mut new_ek_bytes = [0u8; ML_KEM_PUB_BYTES];
+        new_ek_bytes.copy_from_slice(new_ek_arr.as_slice());
+        let mut old_dk = new_dk;
+        std::mem::swap(&mut self.dk, &mut old_dk);
+        self.prev_dk = Some(old_dk);
+        self.ek_bytes = new_ek_bytes;
+        self.rotated_at = Instant::now();
+    }
+
+    /// Test helper: clear the prev_dk slot (simulates overlap-window expiry).
+    #[cfg(test)]
+    fn drop_prev(&mut self) {
+        self.prev_dk = None;
     }
 }
 
@@ -97,6 +190,19 @@ use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret};
 pub const ML_KEM_PUB_BYTES: usize = 1184;
 pub const ML_KEM_CT_BYTES: usize = 1088;
 pub const ML_KEM_SHARED_BYTES: usize = 32;
+
+/// Total bytes of an encoded SessionInit (v3) frame on the wire.
+pub const SESSION_INIT_WIRE_BYTES: usize = 1 + 32 + 64 + 32 + 8 + 32 + ML_KEM_PUB_BYTES;
+/// Total bytes of an encoded SessionAck (v3) frame on the wire.
+pub const SESSION_ACK_WIRE_BYTES: usize = 1 + 32 + 64 + 32 + 8 + 32 + ML_KEM_CT_BYTES;
+
+// Anti-amplification: response (Ack) MUST NOT be larger than the trigger (Init).
+// SessionInit carries ml_kem_pub (1184 B); SessionAck carries ml_kem_ct (1088 B).
+// So responder→initiator amplification factor < 1. No reflection vector.
+const _: () = assert!(
+    SESSION_ACK_WIRE_BYTES <= SESSION_INIT_WIRE_BYTES,
+    "SessionAck must not exceed SessionInit in size (anti-amplification)"
+);
 
 /// Convert an ed25519 private key scalar to an x25519 static secret.
 pub fn ed25519_priv_to_x25519(ed_priv_bytes: &[u8; 32]) -> StaticSecret {
@@ -158,6 +264,13 @@ pub struct SessionInfo {
     /// so the session remains confidential against a future quantum break of
     /// X25519 alone. None until the handshake completes.
     pq_shared: Option<[u8; ML_KEM_SHARED_BYTES]>,
+    /// Secondary `pq_shared` candidate used only during the ML-KEM rotation
+    /// overlap window. If we just rotated our ML-KEM keypair, an inbound Ack
+    /// might have been encap'd against either our new or our just-retired
+    /// pub. We decap with both, store both, and `decrypt` tries each in turn.
+    /// Cleared as soon as a packet successfully decrypts with `pq_shared`
+    /// (i.e. once we know which one was the right one).
+    pq_shared_fallback: Option<[u8; ML_KEM_SHARED_BYTES]>,
 }
 
 impl SessionInfo {
@@ -178,6 +291,7 @@ impl SessionInfo {
             established: false,
             last_used: Instant::now(),
             pq_shared: None,
+            pq_shared_fallback: None,
         }
     }
 
@@ -258,20 +372,14 @@ impl SessionInfo {
         let seq = u64::from_le_bytes(seq_bytes);
 
         // Key = DH(our_stable_local_priv, sender_pub_from_packet)
-        // equals DH(sender_priv, our_local_pub) by commutativity — because
-        // our_local_pub is what we advertised in our last packet, and the
-        // sender used DH(sender_priv, our_pub) to encrypt.
+        // equals DH(sender_priv, our_local_pub) by commutativity.
         let x25519_shared = Self::compute_key(&self.local_x25519_priv, &sender_x_pub);
-        let key_bytes = derive_packet_key(&x25519_shared, self.pq_shared.as_ref());
-        let key = Key::from_slice(&key_bytes);
-        let cipher = ChaCha20Poly1305::new(key);
 
         let mut nonce_bytes = [0u8; 12];
         nonce_bytes[..8].copy_from_slice(&seq.to_le_bytes());
         let nonce = Nonce::from_slice(&nonce_bytes);
 
         // Anti-replay sliding window (64 slots).
-        // Reject packets that are replays or older than the window.
         const WINDOW: u64 = 64;
         if seq + WINDOW <= self.remote_seq_high {
             bail!("replay: seq {} too old (high={})", seq, self.remote_seq_high);
@@ -283,10 +391,41 @@ impl SessionInfo {
             }
         }
 
-        let mut buf = ciphertext[40..].to_vec();
-        cipher
-            .decrypt_in_place(nonce, &sender_x_pub_bytes, &mut buf)
-            .map_err(|e| anyhow::anyhow!("decrypt error: {:?}", e))?;
+        // PQ-hybrid: prefer the primary pq_shared candidate. If AEAD fails
+        // AND we have a fallback (set during ML-KEM rotation overlap), retry
+        // with the fallback and on success promote it to primary so the
+        // session converges on the right key after the first packet.
+        let primary_key = derive_packet_key(&x25519_shared, self.pq_shared.as_ref());
+        let raw_ct = &ciphertext[40..];
+
+        let mut buf = raw_ct.to_vec();
+        let primary_ok = {
+            let cipher = ChaCha20Poly1305::new(Key::from_slice(&primary_key));
+            cipher.decrypt_in_place(nonce, &sender_x_pub_bytes, &mut buf).is_ok()
+        };
+        if !primary_ok {
+            // Try fallback.
+            if let Some(fb) = self.pq_shared_fallback.as_ref() {
+                let fb_key = derive_packet_key(&x25519_shared, Some(fb));
+                let mut fb_buf = raw_ct.to_vec();
+                let cipher = ChaCha20Poly1305::new(Key::from_slice(&fb_key));
+                if cipher.decrypt_in_place(nonce, &sender_x_pub_bytes, &mut fb_buf).is_ok() {
+                    // Fallback worked. Promote: the initiator must have
+                    // encap'd against our previous ek; keep that as primary
+                    // for this session and clear the fallback slot.
+                    self.pq_shared = Some(*fb);
+                    self.pq_shared_fallback = None;
+                    buf = fb_buf;
+                } else {
+                    bail!("decrypt error: AEAD failed with both primary and fallback PQ keys");
+                }
+            } else {
+                bail!("decrypt error: AEAD failed");
+            }
+        } else {
+            // Primary worked → fallback no longer needed.
+            self.pq_shared_fallback = None;
+        }
 
         // Update the sliding window after successful decryption.
         if seq > self.remote_seq_high {
@@ -439,7 +578,12 @@ impl SessionInit {
 
     /// Verify the signature *and* that the init is fresh and addressed to `expected_recipient`.
     pub fn verify(&self, expected_recipient: &[u8; 32]) -> Result<()> {
-        if &self.recipient_ed_pub != expected_recipient {
+        // Constant-time compare: a timing oracle on this match would let an
+        // attacker iteratively guess our pub_key byte by byte. Vanishingly
+        // small leak channel in practice (we're 32 bytes random), but the
+        // cost is zero.
+        use subtle::ConstantTimeEq;
+        if self.recipient_ed_pub.ct_eq(expected_recipient).unwrap_u8() == 0 {
             bail!("SessionInit not addressed to us");
         }
         let now = now_ms();
@@ -588,10 +732,30 @@ impl SessionManager {
         &self.our_signing_key
     }
 
-    /// Bytes of our long-term ML-KEM encapsulation key (advertised in
-    /// outbound SessionInit). 1184 bytes.
+    /// Bytes of our current ML-KEM encapsulation key (advertised in
+    /// outbound SessionInit). 1184 bytes. Rotates on a daily cadence —
+    /// call `maybe_rotate_pq_keys()` from maintenance.
     pub fn pq_pub_bytes(&self) -> &[u8; ML_KEM_PUB_BYTES] {
         self.pq_keys.pub_bytes()
+    }
+
+    /// Called by the maintenance loop. Rotates the ML-KEM keypair when it
+    /// has aged past `ML_KEM_KEY_ROTATION_MS`, and clears the prior dk
+    /// once the `ML_KEM_KEY_OVERLAP_MS` window has elapsed. Returns true
+    /// if anything changed.
+    pub fn maybe_rotate_pq_keys(&mut self) -> bool {
+        self.pq_keys.rotate_if_due()
+    }
+
+    /// Test helper: force-rotate the long-term ML-KEM keypair.
+    #[cfg(test)]
+    pub fn _test_force_rotate_pq(&mut self) {
+        self.pq_keys.force_rotate();
+    }
+
+    #[cfg(test)]
+    pub fn _test_drop_prev_pq(&mut self) {
+        self.pq_keys.drop_prev();
     }
 
     /// Handle an incoming SessionInit (v3) from remote. Returns SessionAck bytes
@@ -642,14 +806,20 @@ impl SessionManager {
         ack.verify(&our_pub)?;
         let remote_x_pub = X25519PublicKey::from(ack.x25519_pub);
 
-        // Decap MUST succeed before we mutate session state.
+        // Decap with the current dk. If we're inside an ML-KEM rotation
+        // overlap window, ALSO decap with the prior dk so the SessionInfo
+        // has a fallback to try if our peer encap'd against our just-rotated
+        // pub. SessionInfo::decrypt picks the one that AEAD-validates and
+        // discards the other.
         let pq_shared = self.pq_keys.decap(&ack.ml_kem_ct)?;
+        let pq_shared_fallback = self.pq_keys.decap_prev(&ack.ml_kem_ct);
 
         match self.sessions.get_mut(&ack.ed_pub) {
             Some(info) => {
                 info.remote_x25519_pub = remote_x_pub;
                 info.established = true;
                 info.pq_shared = Some(pq_shared);
+                info.pq_shared_fallback = pq_shared_fallback;
                 Ok(())
             }
             None => bail!("unsolicited SessionAck from {:?} (no pending init)", &ack.ed_pub[..4]),
@@ -1192,6 +1362,65 @@ mod tests {
             .expect("responder must have pq_shared after Init");
         assert_eq!(pq_a, pq_b,
             "PQ hybrid: both sides MUST derive the same pq_shared from ML-KEM");
+    }
+
+    #[test]
+    fn ml_kem_rotation_keeps_in_flight_decryptable() {
+        // Initiator I sends Init advertising I's pq_pub.
+        // Then I force-rotates its ML-KEM keypair (overlap window now holds
+        // prev_dk = the old priv).
+        // Responder R receives Init and sends Ack encap'd against the
+        // OLD ek (because Init carried the old pq_pub).
+        // I receives Ack and MUST still derive the right pq_shared via the
+        // fallback path.
+        let sk_i = SigningKey::generate(&mut OsRng);
+        let sk_r = SigningKey::generate(&mut OsRng);
+        let pub_i = sk_i.verifying_key().to_bytes();
+        let pub_r = sk_r.verifying_key().to_bytes();
+
+        let mut mgr_i = SessionManager::new(sk_i);
+        let mut mgr_r = SessionManager::new(sk_r);
+
+        let init = mgr_i.initiate(&pub_r);
+        // I rotates BEFORE the Ack arrives (rare but real race during a
+        // periodic rotation). The Ack will be against the OLD ek; without
+        // the fallback path I would now derive a wrong pq_shared.
+        mgr_i._test_force_rotate_pq();
+
+        let ack = mgr_r.handle_init(&init).unwrap();
+        mgr_i.handle_ack(&ack).unwrap();
+
+        // pq_shared on I should be set; pq_shared_fallback may be set if
+        // decap_prev was invoked (it is, since prev_dk exists).
+        let info_i = mgr_i.sessions.get(&pub_r).unwrap();
+        assert!(info_i.pq_shared.is_some());
+        assert!(info_i.pq_shared_fallback.is_some(),
+            "decap_prev must be tried during overlap window");
+
+        // Encrypt + decrypt roundtrip must work. The first decrypt on I's
+        // side should pick the fallback (because R encap'd against I's OLD
+        // ek). On success, fallback promotes to primary.
+        let ct_r = mgr_r.encrypt(&pub_i, b"hello-cross-rotation").unwrap();
+        let pt_i = mgr_i.decrypt(&pub_r, &ct_r).expect("decrypt must succeed via fallback");
+        assert_eq!(pt_i, b"hello-cross-rotation");
+
+        // After promotion, fallback is cleared.
+        assert!(mgr_i.sessions.get(&pub_r).unwrap().pq_shared_fallback.is_none(),
+            "fallback must be cleared after first successful decrypt");
+    }
+
+    #[test]
+    fn ml_kem_rotation_after_overlap_drops_old_dk() {
+        let mut mgr = SessionManager::new(SigningKey::generate(&mut OsRng));
+        let pub_before = *mgr.pq_keys.pub_bytes();
+        mgr._test_force_rotate_pq();
+        let pub_after = *mgr.pq_keys.pub_bytes();
+        assert_ne!(pub_before, pub_after, "rotation must change pub");
+        assert!(mgr.pq_keys.prev_dk.is_some(),
+            "prev_dk must be retained within the overlap window");
+        mgr._test_drop_prev_pq();
+        assert!(mgr.pq_keys.prev_dk.is_none(),
+            "after the overlap expires, prev_dk must be cleared (forward secrecy)");
     }
 
     #[test]

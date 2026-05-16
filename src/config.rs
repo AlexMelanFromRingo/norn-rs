@@ -39,6 +39,28 @@ pub struct NodeConfig {
     /// Log level: "error" | "warn" | "info" | "debug" | "trace"
     #[serde(default = "default_log_level")]
     pub log_level: String,
+
+    /// Path to the persistent known-peers cache. Each successfully-established
+    /// peer is recorded here; on restart the cache is read back and every
+    /// known URI is dialed alongside the static `peers` list. Set to an
+    /// empty string to disable persistence.
+    #[serde(default = "default_peer_cache_path")]
+    pub peer_cache_path: String,
+
+    /// Address for the Prometheus /metrics HTTP endpoint. Empty string =
+    /// disabled. Default binds to loopback only — exposing it on a public
+    /// interface leaks per-peer pub_keys and connection counts.
+    #[serde(default = "default_metrics_addr")]
+    pub metrics_addr: String,
+
+    /// Sybil-resistance threshold: minimum `key_difficulty_bits` an inbound
+    /// peer's pub_key must reach. Each extra bit doubles the expected cost
+    /// of finding a valid pub_key, so 16 bits ≈ 65k hashes (~ms on modern
+    /// CPU; one-time cost when generating an identity). Default 0 = off,
+    /// since enabling this on an existing network locks out peers whose
+    /// keys were generated without the requirement.
+    #[serde(default)]
+    pub min_peer_difficulty_bits: u32,
 }
 
 fn default_listen() -> Vec<String> { vec!["tcp://0.0.0.0:9001".to_string()] }
@@ -47,6 +69,8 @@ fn default_admin_socket() -> String { "/var/run/norn.sock".to_string() }
 fn default_true() -> bool { true }
 fn default_multicast_port() -> u16 { 9001 }
 fn default_log_level() -> String { "info".to_string() }
+fn default_peer_cache_path() -> String { "/var/lib/norn/peers.json".to_string() }
+fn default_metrics_addr() -> String { String::new() } // disabled by default
 
 impl Default for NodeConfig {
     fn default() -> Self {
@@ -59,6 +83,9 @@ impl Default for NodeConfig {
             multicast_enabled: true,
             multicast_port: default_multicast_port(),
             log_level: default_log_level(),
+            peer_cache_path: default_peer_cache_path(),
+            metrics_addr: default_metrics_addr(),
+            min_peer_difficulty_bits: 0,
         }
     }
 }
