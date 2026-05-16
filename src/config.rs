@@ -61,6 +61,12 @@ pub struct NodeConfig {
     /// keys were generated without the requirement.
     #[serde(default)]
     pub min_peer_difficulty_bits: u32,
+
+    /// Enable mDNS / DNS-SD peer discovery on the LAN. Standard
+    /// `_norn._tcp.local` service type. Coexists with `multicast_enabled`;
+    /// both can be on or off independently.
+    #[serde(default = "default_true")]
+    pub mdns_enabled: bool,
 }
 
 fn default_listen() -> Vec<String> { vec!["tcp://0.0.0.0:9001".to_string()] }
@@ -86,6 +92,7 @@ impl Default for NodeConfig {
             peer_cache_path: default_peer_cache_path(),
             metrics_addr: default_metrics_addr(),
             min_peer_difficulty_bits: 0,
+            mdns_enabled: true,
         }
     }
 }

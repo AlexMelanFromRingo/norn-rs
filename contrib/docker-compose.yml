@@ -1,0 +1,55 @@
+# Example deployment of nornd as a Docker container.
+#
+# Usage:
+#   1. Generate a config:
+#        docker run --rm -v $PWD:/work --entrypoint /usr/local/bin/nornd \
+#                ghcr.io/anthropics/norn-rs:latest \
+#                genconfig -o /work/norn.toml
+#      then `chmod 600 norn.toml`.
+#   2. Edit norn.toml — set `metrics_addr = "0.0.0.0:9090"` for the
+#      healthcheck below to work.
+#   3. docker compose up -d.
+
+services:
+  norn:
+    image: ghcr.io/anthropics/norn-rs:latest
+    container_name: norn
+
+    # Mount the config read-only.
+    volumes:
+      - ./norn.toml:/etc/norn/norn.toml:ro
+      - norn-state:/var/lib/norn          # persistent peer cache
+
+    # TUN device requires CAP_NET_ADMIN + /dev/net/tun + the right
+    # network namespace. With network_mode=host nornd directly manages
+    # the host's TUN; without it, it operates inside the container's
+    # network namespace (use this for isolated testing).
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    network_mode: host
+
+    # Healthcheck via the Prometheus /metrics endpoint. Requires the
+    # nonroot user inside distroless to be able to reach the metrics
+    # port (which it can — it bound the listener).
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/nornctl", "-s", "/var/run/norn.sock", "status"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+    restart: unless-stopped
+
+    # systemd-equivalent hardening: read-only root filesystem, no new
+    # privileges, only the caps we explicitly added.
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp:size=8M
+      - /var/run:size=8M
+
+volumes:
+  norn-state:

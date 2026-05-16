@@ -69,6 +69,24 @@ jobs:
         with:
           command: check bans licenses sources
 
+  netns-e2e:
+    name: Network namespace end-to-end
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build release nornd
+        run: cargo build --release --features tun-support --bin nornd
+      - name: Install iproute2 + iputils
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends iproute2 iputils-ping
+      - name: Load tun module
+        run: sudo modprobe tun || true
+      - name: Run netns harness
+        env:
+          NORND: ./target/release/nornd
+        run: sudo -E NORND=$NORND bash tests/netns/run.sh
+
   fuzz-smoke:
     name: Fuzz smoke (60s per target)
     runs-on: ubuntu-latest

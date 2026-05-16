@@ -96,6 +96,17 @@ impl Node {
             }
         }
 
+        // ── mDNS / DNS-SD discovery ──────────────────────────────────────
+        if self.config.mdns_enabled {
+            let conn = self.conn.clone();
+            let connected = self.connected.clone();
+            tokio::spawn(async move {
+                if let Err(e) = crate::mdns::start(conn, tcp_port, connected).await {
+                    tracing::warn!("mDNS discovery: {}", e);
+                }
+            });
+        }
+
         // ── Multicast discovery ──────────────────────────────────────────
         if self.config.multicast_enabled {
             let conn = self.conn.clone();

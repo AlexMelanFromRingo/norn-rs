@@ -1,0 +1,10 @@
+target/
+fuzz/target/
+fuzz/corpus/
+fuzz/artifacts/
+mutants.out/
+mutants.out.old/
+.git/
+*.swp
+.vscode/
+.idea/
