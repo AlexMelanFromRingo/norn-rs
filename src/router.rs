@@ -83,6 +83,18 @@ const MAX_INFLIGHT_FORWARDS: usize = 4_096;
 const ONION_REPLAY_CACHE_SIZE: usize = 4_096;
 /// Rotate the onion ephemeral key every N maintenance ticks (1 hour at 1 Hz).
 const ONION_KEY_ROTATION_TICKS: u32 = 3_600;
+/// Broadcast our OnionKeyAnnounce every N maintenance ticks (~5 min) and on rotation.
+const ONION_KEY_ANNOUNCE_TICKS: u32 = 300;
+/// Maximum age (ms) of an OnionKeyAnnounce that we still trust / forward.
+const ONION_KEY_VALIDITY_MS: u64 = 24 * 60 * 60 * 1_000;
+/// Cap on remembered foreign onion keys (LRU-ish via HashMap, evicts on insert
+/// when full — see record_remote_onion_key).
+const MAX_REMOTE_ONION_KEYS: usize = 16_384;
+/// Issue one path-validation probe every N maintenance ticks.
+const PROBE_INTERVAL_TICKS: u32 = 15;
+/// Probes that have been pending this long without a PathNotify are counted
+/// as a failure: the via-peer's trust score decays.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 
 // ──────────────────────────────────────────────
 // Public types
@@ -227,6 +239,16 @@ struct RouterState {
     /// LRU-style set of recent onion (epk, aead-prefix) hashes for replay
     /// detection. Bounded; oldest entries evicted when full.
     onion_seen: std::collections::VecDeque<[u8; 32]>,
+    /// Network-wide table of current onion ephemeral pubs per identity.
+    /// Populated from OnionKeyAnnounce floods. Latest seq per origin wins.
+    /// (seq, eph_pub, recorded_at)
+    remote_onion_keys: HashMap<[u8; 32], (u64, [u8; 32], Instant)>,
+    /// Monotonic seq for our own OnionKeyAnnounce broadcasts.
+    own_onion_key_seq: u64,
+    /// Outgoing probe table: probe_id → (peer-we-sent-via, sent_at).
+    /// On matching PathNotify → boost trust + remove. On timeout (handled
+    /// in cleanup_stale_probes) → decay trust + remove.
+    pending_probes: HashMap<u64, (PeerId, Instant)>,
 }
 
 // ──────────────────────────────────────────────
@@ -376,6 +398,16 @@ pub fn effective_cost(lag: Duration, loss_rate: f32) -> u64 {
     effective as u64
 }
 
+/// Approximate equality for two HypCoord values, accounting for f64 rounding
+/// during encode/decode (LE byte roundtrip is exact, but cross-system the
+/// tanh evaluation may differ in the last bit). Used by handle_coord_announce
+/// to validate that a peer's claimed coord matches the deterministic formula.
+fn coords_approx_equal(a: &HypCoord, b: &HypCoord) -> bool {
+    let dr = (a.r - b.r).abs();
+    let dt = (a.theta - b.theta).abs();
+    dr < 1e-9 && dt < 1e-9
+}
+
 /// XOR-metric for tree root selection. Each tree uses a different seed.
 pub fn tree_metric(pub_key: &[u8; 32], seed: &[u8; 8]) -> [u8; 32] {
     let mut metric = *pub_key;
@@ -428,6 +460,9 @@ impl RouterState {
             cuckoo_generation: [0u64; K],
             onion_keys,
             onion_seen: std::collections::VecDeque::with_capacity(ONION_REPLAY_CACHE_SIZE),
+            remote_onion_keys: HashMap::new(),
+            own_onion_key_seq: 0,
+            pending_probes: HashMap::new(),
         }
     }
 
@@ -728,6 +763,17 @@ impl RouterState {
         }
         self.rotate_session_keys();
         self.rotate_onion_keys_if_due();
+        // Periodically re-announce our onion ephemeral pub so the network-wide
+        // table heals after splits/peer churn. Multiple-of check fires on the
+        // first tick too — that's the deliberate cold-start announce.
+        if self.tick == 1 || self.tick.is_multiple_of(ONION_KEY_ANNOUNCE_TICKS) {
+            self.broadcast_onion_key_announce();
+        }
+        // Active route validation: probe one cuckoo claim per cycle.
+        if self.tick.is_multiple_of(PROBE_INTERVAL_TICKS) && self.tick > 0 {
+            self.probe_cuckoo_claim();
+        }
+        self.cleanup_stale_probes();
         self.cleanup_stale_lookups();
         self.cleanup_stale_sessions();
     }
@@ -735,13 +781,197 @@ impl RouterState {
     /// Rotate the onion ephemeral keypair at the configured cadence.
     /// On rotation, the old key moves to the `previous` slot so in-flight
     /// onions still decrypt for one more period, then is zeroized on the
-    /// rotation after that.
+    /// rotation after that. Also forces an immediate OnionKeyAnnounce so
+    /// neighbours don't keep building onions with our about-to-expire pub.
     #[mutants::skip]
     fn rotate_onion_keys_if_due(&mut self) {
         if self.tick.is_multiple_of(ONION_KEY_ROTATION_TICKS) && self.tick > 0 {
             self.onion_keys.rotate();
+            self.broadcast_onion_key_announce();
             debug!("onion keys rotated at tick {}", self.tick);
         }
+    }
+
+    /// Periodic OnionKeyAnnounce broadcast. Each broadcast carries a strictly
+    /// increasing seq so receivers can dedup/order. We flood to all peers;
+    /// each peer that's first-to-see for this (origin, seq) forwards onward.
+    #[mutants::skip]
+    fn broadcast_onion_key_announce(&mut self) {
+        self.own_onion_key_seq += 1;
+        let seq = self.own_onion_key_seq;
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let onion_eph_pub = *self.onion_keys.pub_key().as_bytes();
+        let unsigned = OnionKeyAnnounce {
+            origin: self.pub_key,
+            seq,
+            valid_from_ms: now_ms,
+            onion_eph_pub,
+            sig: [0u8; 64],
+        };
+        let sig = self.signing_key.sign(&unsigned.sign_bytes()).to_bytes();
+        let ann = OnionKeyAnnounce { sig, ..unsigned };
+        // Record ourselves so onion_hop_for can find us via remote_onion_keys too.
+        self.remote_onion_keys.insert(
+            self.pub_key,
+            (seq, onion_eph_pub, Instant::now()),
+        );
+        let encoded = ann.encode();
+        let peer_keys: Vec<PeerId> = self.peers.keys().copied().collect();
+        for pk in peer_keys {
+            self.send_to_peer(&pk, encoded.clone());
+        }
+    }
+
+    /// Handle an incoming OnionKeyAnnounce. Verify, dedup by (origin, seq),
+    /// drop expired, then forward to all peers except the sender.
+    pub fn handle_onion_key_announce(&mut self, from: PeerId, ann: OnionKeyAnnounce) {
+        // Reject announces purportedly from ourselves (self-loop / spoof).
+        if ann.origin == self.pub_key {
+            return;
+        }
+        // Verify signature against the announced origin.
+        let vk = match VerifyingKey::from_bytes(&ann.origin) {
+            Ok(v) => v,
+            Err(_) => return,
+        };
+        if vk.verify(&ann.sign_bytes(), &ed25519_dalek::Signature::from_bytes(&ann.sig)).is_err() {
+            warn!("invalid OnionKeyAnnounce sig from origin {:?}", &ann.origin[..4]);
+            return;
+        }
+        // Freshness window.
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let age = now_ms.saturating_sub(ann.valid_from_ms);
+        if age > ONION_KEY_VALIDITY_MS {
+            debug!("OnionKeyAnnounce too old ({}ms > {}ms), dropping", age, ONION_KEY_VALIDITY_MS);
+            return;
+        }
+        // Also reject far-future timestamps (skew abuse).
+        if ann.valid_from_ms > now_ms.saturating_add(60_000) {
+            debug!("OnionKeyAnnounce from too far in future, dropping");
+            return;
+        }
+        // Dedup: forward only if strictly newer than the last seq we saw from this origin.
+        let is_newer = match self.remote_onion_keys.get(&ann.origin) {
+            Some((prev_seq, _, _)) => ann.seq > *prev_seq,
+            None => true,
+        };
+        if !is_newer {
+            return; // already saw this or a newer one; do not re-forward
+        }
+        self.record_remote_onion_key(ann.origin, ann.seq, ann.onion_eph_pub);
+
+        // Also reflect into PeerData (if origin is a direct peer) so that the
+        // existing select_relays() picks up the eph for direct-peer fast path.
+        if let Some(peer) = self.peers.get_mut(&ann.origin) {
+            peer.onion_eph_pub = Some(ann.onion_eph_pub);
+        }
+
+        // Flood-forward to all peers except the sender.
+        let encoded = ann.encode();
+        let peer_keys: Vec<PeerId> = self.peers.keys().copied().collect();
+        for pk in peer_keys {
+            if pk != from {
+                self.send_to_peer(&pk, encoded.clone());
+            }
+        }
+    }
+
+    /// Pick one (peer, target_identity) pair where the peer's cuckoo claims
+    /// to know `routing_tag(target_identity)`, then send a PathLookup for
+    /// that identity *only via* that peer. The peer either delivers (we
+    /// receive a PathNotify with matching id → trust boost) or it doesn't
+    /// (probe times out → trust decay).
+    ///
+    /// This converts the otherwise-passive trust score into an active
+    /// poisoning detector: a peer that lies about cuckoo membership will be
+    /// caught the first time we probe one of its false claims.
+    #[mutants::skip]
+    fn probe_cuckoo_claim(&mut self) {
+        // Collect candidate (via_peer, target_identity) pairs.
+        // We consider any known identity (other direct peer or any origin in
+        // remote_onion_keys) that the via_peer's cuckoo claims.
+        let mut candidates: Vec<(PeerId, [u8; 32])> = Vec::new();
+        let known_identities: Vec<[u8; 32]> = self.peers.keys().copied()
+            .chain(self.remote_onion_keys.keys().copied())
+            .filter(|id| *id != self.pub_key)
+            .collect();
+        for (peer_key, peer) in &self.peers {
+            for target in &known_identities {
+                if target == peer_key {
+                    continue; // trivial: P always claims P
+                }
+                let tag = routing_tag(target);
+                if peer.cuckoo.iter().any(|cf| cf.contains(&tag)) {
+                    candidates.push((*peer_key, *target));
+                }
+            }
+        }
+        if candidates.is_empty() {
+            return;
+        }
+        // Pick one at random.
+        use rand::seq::SliceRandom;
+        let &(via, target) = candidates.choose(&mut OsRng).unwrap();
+
+        // Send PathLookup via that specific peer (not the usual flood).
+        let id = rand::random::<u64>();
+        let lookup = PathLookup {
+            target,
+            source: self.pub_key,
+            id,
+            path: vec![],
+        };
+        let encoded = lookup.encode();
+        self.send_to_peer(&via, encoded);
+        self.pending_probes.insert(id, (via, Instant::now()));
+        debug!("probe: id={} target={:?} via={:?}", id, &target[..4], &via[..4]);
+    }
+
+    /// Sweep expired probes. Each timed-out probe decays the via-peer's trust.
+    #[mutants::skip]
+    fn cleanup_stale_probes(&mut self) {
+        let now = Instant::now();
+        let expired: Vec<(u64, PeerId)> = self.pending_probes.iter()
+            .filter_map(|(id, (via, t))| {
+                if now.duration_since(*t) > PROBE_TIMEOUT {
+                    Some((*id, *via))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        for (id, via) in expired {
+            self.pending_probes.remove(&id);
+            if let Some(peer) = self.peers.get_mut(&via) {
+                peer.decay_trust();
+                debug!("probe {} via {:?} timed out → trust decayed to {}", id, &via[..4], peer.trust);
+            }
+        }
+    }
+
+    /// Record a (potentially new) remote onion key. Caps the table at
+    /// MAX_REMOTE_ONION_KEYS by evicting a random non-peer entry when full.
+    fn record_remote_onion_key(&mut self, origin: [u8; 32], seq: u64, eph: [u8; 32]) {
+        if !self.remote_onion_keys.contains_key(&origin)
+            && self.remote_onion_keys.len() >= MAX_REMOTE_ONION_KEYS {
+            // Evict a non-peer entry to make room. Falls back to skipping the
+            // insert if every entry belongs to a current peer.
+            let victim = self.remote_onion_keys.keys()
+                .find(|k| !self.peers.contains_key(*k) && **k != self.pub_key)
+                .copied();
+            if let Some(v) = victim {
+                self.remote_onion_keys.remove(&v);
+            } else {
+                return;
+            }
+        }
+        self.remote_onion_keys.insert(origin, (seq, eph, Instant::now()));
     }
 
     /// Rotate x25519 keys for sessions that have sent many messages.
@@ -803,6 +1033,47 @@ impl RouterState {
         if !coord.r.is_finite() || !coord.theta.is_finite() {
             warn!("coord announce from {:?} has non-finite values, ignoring", &from_key[..4]);
             return;
+        }
+
+        // ── Consistency check #1: coord MUST equal from_tree_depth(depth, pub_key).
+        //
+        // Coords are a deterministic function of (tree_depth, pub_key), so the
+        // sender cannot legitimately pick a coord independent of those two
+        // inputs. Allowing arbitrary self-reported coords lets a malicious peer
+        // place itself near any target, biasing greedy routing toward
+        // themselves (sinkhole). We reject any mismatch.
+        let expected = HypCoord::from_tree_depth(ann.tree_depth, &from_key);
+        if !coords_approx_equal(&coord, &expected) {
+            warn!(
+                "coord announce from {:?} inconsistent with from_tree_depth(depth={}); rejecting",
+                &from_key[..4], ann.tree_depth
+            );
+            // Treat as a soft-fail trust signal too.
+            if let Some(peer) = self.peers.get_mut(&from_key) {
+                peer.decay_trust();
+            }
+            return;
+        }
+
+        // ── Consistency check #2: tree_depth in the announce MUST agree with
+        // the tree-0 Announce we have on file from the same peer (within a
+        // small window to tolerate gossip lag). A peer claiming depth=0 in
+        // CoordAnnounce but depth=5 in Announce is lying about its position.
+        if let Some(peer) = self.peers.get(&from_key)
+            && let Some(t0) = &peer.trees[0] {
+            let announced = t0.depth as i64;
+            let claimed = ann.tree_depth as i64;
+            // Allow ±2 to accommodate transient mid-update races.
+            if (announced - claimed).abs() > 2 {
+                warn!(
+                    "coord announce from {:?} claims tree-0 depth {}, but Announce says {}; rejecting",
+                    &from_key[..4], claimed, announced
+                );
+                if let Some(peer) = self.peers.get_mut(&from_key) {
+                    peer.decay_trust();
+                }
+                return;
+            }
         }
         if self.coord_table.len() >= MAX_COORD_TABLE_SIZE
             && !self.coord_table.contains_key(&from_key) {
@@ -1055,6 +1326,16 @@ impl RouterState {
 
         // If notify is for us, trigger path_notify callback
         if notify.source == self.pub_key {
+            // Was this the response to an outstanding probe? If so, boost
+            // the via-peer's trust (it actually delivered what its cuckoo claimed).
+            if let Some((via, _sent_at)) = self.pending_probes.remove(&notify.id)
+                && let Some(peer) = self.peers.get_mut(&via) {
+                peer.boost_trust();
+                debug!(
+                    "probe {} via {:?} confirmed (target={:?}) → trust boosted to {}",
+                    notify.id, &via[..4], &notify.target[..4], peer.trust
+                );
+            }
             if let Some(cb) = &self.path_notify {
                 let cb = cb.clone();
                 let target = notify.target;
@@ -1490,6 +1771,11 @@ fn dispatch(state: &Arc<Mutex<RouterState>>, from: PeerId, frame: Vec<u8>) {
                 state.lock_or_recover().handle_coord_announce(from, ann);
             }
         }
+        TYPE_ONION_KEY_ANNOUNCE => {
+            if let Ok(ann) = OnionKeyAnnounce::decode(data) {
+                state.lock_or_recover().handle_onion_key_announce(from, ann);
+            }
+        }
         TYPE_ONION => {
             if let Ok(pkt) = OnionPacket::decode(data) {
                 let my_pub = state.lock_or_recover().pub_key;
@@ -1783,11 +2069,20 @@ impl PacketConn {
                 ephemeral_x_pub: *state.onion_keys.pub_key().as_bytes(),
             });
         }
+        // Direct peer with a known ephemeral (fast path, populated by either
+        // CoordAnnounce or OnionKeyAnnounce).
         if let Some(p) = state.peers.get(identity)
             && let Some(eph) = p.onion_eph_pub {
             return Some(crate::onion::OnionHop {
                 identity_ed_pub: *identity,
                 ephemeral_x_pub: eph,
+            });
+        }
+        // Network-wide table: OnionKeyAnnounce from anywhere in the mesh.
+        if let Some((_, eph, _)) = state.remote_onion_keys.get(identity) {
+            return Some(crate::onion::OnionHop {
+                identity_ed_pub: *identity,
+                ephemeral_x_pub: *eph,
             });
         }
         // Fallback: derive X25519 from the Ed25519 identity. Provides
@@ -2854,6 +3149,287 @@ mod tests {
     }
 
     // ── onion replay cache ──────────────────────────────────────────────────
+
+    // ── Hyperbolic coord consistency check ──────────────────────────────────
+
+    fn make_coord_announce(sk: &SigningKey, tree_depth: u32, coord: HypCoord) -> CoordAnnounce {
+        let unsigned = CoordAnnounce {
+            coord: coord.encode(),
+            tree_depth,
+            onion_eph_pub: [0u8; 32],
+            sig: [0u8; 64],
+        };
+        let sig = sk.sign(&unsigned.sign_bytes()).to_bytes();
+        CoordAnnounce { sig, ..unsigned }
+    }
+
+    #[test]
+    fn coord_announce_consistent_accepted() {
+        let mut rs = make_router();
+        let sk = SigningKey::generate(&mut OsRng);
+        let pk = sk.verifying_key().to_bytes();
+        add_dummy_peer(&mut rs, pk);
+        let depth = 3;
+        // Build the *correct* coord for this depth+key.
+        let coord = HypCoord::from_tree_depth(depth, &pk);
+        let ann = make_coord_announce(&sk, depth, coord);
+        rs.handle_coord_announce(pk, ann);
+        assert!(rs.coord_table.contains_key(&pk),
+            "consistent CoordAnnounce must be recorded");
+    }
+
+    #[test]
+    fn coord_announce_spoofed_r_rejected() {
+        // Attack: declare depth=10 (legitimate-looking) but claim coord
+        // r=0.001 (near origin → near every dst → wins greedy routing).
+        let mut rs = make_router();
+        let sk = SigningKey::generate(&mut OsRng);
+        let pk = sk.verifying_key().to_bytes();
+        add_dummy_peer(&mut rs, pk);
+        let spoof = HypCoord {
+            r: 0.001,
+            theta: HypCoord::angle_from_key(&pk),
+        };
+        let ann = make_coord_announce(&sk, 10, spoof);
+        rs.handle_coord_announce(pk, ann);
+        assert!(!rs.coord_table.contains_key(&pk),
+            "spoofed CoordAnnounce (r ≠ tanh(depth*DELTA)) must be rejected");
+    }
+
+    #[test]
+    fn coord_announce_spoofed_theta_rejected() {
+        let mut rs = make_router();
+        let sk = SigningKey::generate(&mut OsRng);
+        let pk = sk.verifying_key().to_bytes();
+        add_dummy_peer(&mut rs, pk);
+        let spoof = HypCoord {
+            r: (3.0_f64 * 0.5).tanh(), // correct r for depth=3
+            theta: 1.234,              // arbitrary theta, NOT derived from pk
+        };
+        let ann = make_coord_announce(&sk, 3, spoof);
+        rs.handle_coord_announce(pk, ann);
+        assert!(!rs.coord_table.contains_key(&pk),
+            "spoofed CoordAnnounce (theta ≠ angle_from_key) must be rejected");
+    }
+
+    #[test]
+    fn coord_announce_depth_disagreement_with_announce_rejected() {
+        let mut rs = make_router();
+        let sk = SigningKey::generate(&mut OsRng);
+        let pk = sk.verifying_key().to_bytes();
+        add_dummy_peer(&mut rs, pk);
+        // Stash a tree-0 Announce on file saying depth=10.
+        rs.peers.get_mut(&pk).unwrap().trees[0] = Some(TreeAnnounce {
+            root: pk,
+            path_cost: 0,
+            received_at: Instant::now(),
+            depth: 10,
+        });
+        // Now CoordAnnounce claims depth=0 (consistent with r=0.0 coord,
+        // so check #1 passes — but check #2 must catch the disagreement).
+        let coord = HypCoord::from_tree_depth(0, &pk);
+        let ann = make_coord_announce(&sk, 0, coord);
+        rs.handle_coord_announce(pk, ann);
+        assert!(!rs.coord_table.contains_key(&pk),
+            "CoordAnnounce depth disagreement with Announce must be rejected");
+    }
+
+    // ── PathLookup auto-prober ──────────────────────────────────────────────
+
+    #[test]
+    fn probe_decays_trust_on_timeout() {
+        let mut rs = make_router();
+        let via = [0x44u8; 32];
+        add_dummy_peer(&mut rs, via);
+        let initial_trust = rs.peers[&via].trust;
+        // Insert an artificially-old probe.
+        let id = 0xCAFE_BABE;
+        let stale = Instant::now()
+            .checked_sub(PROBE_TIMEOUT + Duration::from_secs(1))
+            .expect("subtraction must succeed");
+        rs.pending_probes.insert(id, (via, stale));
+        rs.cleanup_stale_probes();
+        assert!(!rs.pending_probes.contains_key(&id), "stale probe must be removed");
+        assert!(rs.peers[&via].trust < initial_trust,
+            "trust must decay after probe timeout; before={} after={}",
+            initial_trust, rs.peers[&via].trust);
+    }
+
+    #[test]
+    fn probe_kept_if_not_yet_expired() {
+        let mut rs = make_router();
+        let via = [0x45u8; 32];
+        add_dummy_peer(&mut rs, via);
+        let id = 0xDEAD_BEEF;
+        rs.pending_probes.insert(id, (via, Instant::now()));
+        rs.cleanup_stale_probes();
+        assert!(rs.pending_probes.contains_key(&id),
+            "fresh probe must NOT be cleaned up");
+    }
+
+    #[test]
+    fn probe_match_on_path_notify_boosts_trust() {
+        let mut rs = make_router();
+        let via = [0x46u8; 32];
+        let target = [0x47u8; 32];
+        add_dummy_peer(&mut rs, via);
+        let id = 0xFEED_F00D;
+        rs.pending_probes.insert(id, (via, Instant::now()));
+        let trust_before = rs.peers[&via].trust;
+        // Synthesize a PathNotify that addresses us as source.
+        let own_pub = rs.pub_key;
+        rs.handle_path_notify(via, PathNotify {
+            target, source: own_pub, id, path: vec![],
+        });
+        assert!(!rs.pending_probes.contains_key(&id),
+            "matched probe must be removed");
+        assert!(rs.peers[&via].trust > trust_before,
+            "trust must boost on probe success; before={} after={}",
+            trust_before, rs.peers[&via].trust);
+    }
+
+    // ── OnionKeyAnnounce flood ──────────────────────────────────────────────
+
+    fn make_oka(sk: &SigningKey, seq: u64, eph: [u8; 32], age_ms: i64) -> OnionKeyAnnounce {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let valid_from_ms = if age_ms >= 0 {
+            now_ms.saturating_sub(age_ms as u64)
+        } else {
+            now_ms.saturating_add((-age_ms) as u64)
+        };
+        let unsigned = OnionKeyAnnounce {
+            origin: sk.verifying_key().to_bytes(),
+            seq,
+            valid_from_ms,
+            onion_eph_pub: eph,
+            sig: [0u8; 64],
+        };
+        let sig = sk.sign(&unsigned.sign_bytes()).to_bytes();
+        OnionKeyAnnounce { sig, ..unsigned }
+    }
+
+    #[test]
+    fn onion_key_announce_valid_is_recorded() {
+        let mut rs = make_router();
+        let origin_sk = SigningKey::generate(&mut OsRng);
+        let origin_pub = origin_sk.verifying_key().to_bytes();
+        let eph = [0x77u8; 32];
+        let ann = make_oka(&origin_sk, 1, eph, 5_000);
+        let from = [0xFEu8; 32];
+        rs.handle_onion_key_announce(from, ann);
+        let recorded = rs.remote_onion_keys.get(&origin_pub);
+        assert!(recorded.is_some(), "valid announce must be recorded");
+        let (seq, recorded_eph, _) = recorded.unwrap();
+        assert_eq!(*seq, 1);
+        assert_eq!(*recorded_eph, eph);
+    }
+
+    #[test]
+    fn onion_key_announce_invalid_sig_rejected() {
+        let mut rs = make_router();
+        let origin_sk = SigningKey::generate(&mut OsRng);
+        let origin_pub = origin_sk.verifying_key().to_bytes();
+        let mut ann = make_oka(&origin_sk, 1, [0x77u8; 32], 0);
+        ann.sig[0] ^= 0xFF; // tamper
+        rs.handle_onion_key_announce([0u8; 32], ann);
+        assert!(!rs.remote_onion_keys.contains_key(&origin_pub),
+            "bad sig must not be recorded");
+    }
+
+    #[test]
+    fn onion_key_announce_too_old_rejected() {
+        let mut rs = make_router();
+        let origin_sk = SigningKey::generate(&mut OsRng);
+        let origin_pub = origin_sk.verifying_key().to_bytes();
+        // 25 hours old > ONION_KEY_VALIDITY_MS (24h)
+        let ann = make_oka(&origin_sk, 1, [0x77u8; 32], 25 * 60 * 60 * 1000);
+        rs.handle_onion_key_announce([0u8; 32], ann);
+        assert!(!rs.remote_onion_keys.contains_key(&origin_pub),
+            "stale announce must not be recorded");
+    }
+
+    #[test]
+    fn onion_key_announce_self_origin_rejected() {
+        let mut rs = make_router();
+        // Sign with rs's own key — make_oka uses sk.verifying_key as origin.
+        let own_sk = rs.signing_key.clone();
+        let ann = make_oka(&own_sk, 99, [0x77u8; 32], 0);
+        rs.handle_onion_key_announce([0u8; 32], ann);
+        // remote_onion_keys may have us inserted by broadcast_onion_key_announce
+        // (called from maintenance), but never via *incoming* self-origin frames.
+        // Confirm seq stayed at default (we never broadcast in this unit test).
+        let entry = rs.remote_onion_keys.get(&rs.pub_key);
+        assert!(entry.is_none() || entry.unwrap().0 != 99,
+            "self-origin announce must not pollute table");
+    }
+
+    #[test]
+    fn onion_key_announce_newer_replaces_older() {
+        let mut rs = make_router();
+        let origin_sk = SigningKey::generate(&mut OsRng);
+        let origin_pub = origin_sk.verifying_key().to_bytes();
+        let eph1 = [0x01u8; 32];
+        let eph2 = [0x02u8; 32];
+        rs.handle_onion_key_announce([0u8; 32], make_oka(&origin_sk, 1, eph1, 0));
+        rs.handle_onion_key_announce([0u8; 32], make_oka(&origin_sk, 2, eph2, 0));
+        let (seq, recorded, _) = rs.remote_onion_keys.get(&origin_pub).unwrap();
+        assert_eq!(*seq, 2);
+        assert_eq!(*recorded, eph2);
+    }
+
+    #[test]
+    fn onion_key_announce_older_ignored() {
+        let mut rs = make_router();
+        let origin_sk = SigningKey::generate(&mut OsRng);
+        let origin_pub = origin_sk.verifying_key().to_bytes();
+        let eph1 = [0x01u8; 32];
+        let eph_old = [0xEEu8; 32];
+        rs.handle_onion_key_announce([0u8; 32], make_oka(&origin_sk, 5, eph1, 0));
+        // An older seq must be ignored even if the signature is valid.
+        rs.handle_onion_key_announce([0u8; 32], make_oka(&origin_sk, 4, eph_old, 0));
+        let (seq, recorded, _) = rs.remote_onion_keys.get(&origin_pub).unwrap();
+        assert_eq!(*seq, 5);
+        assert_eq!(*recorded, eph1, "older seq must not overwrite");
+    }
+
+    #[test]
+    fn onion_key_announce_forwards_to_other_peers() {
+        let mut rs = make_router();
+        let origin_sk = SigningKey::generate(&mut OsRng);
+        let sender = [0xAAu8; 32];
+        let other  = [0xBBu8; 32];
+        let (tx_sender, _rx_sender) = mpsc::channel(64);
+        let (tx_other, mut rx_other) = mpsc::channel(64);
+        rs.add_peer(sender, tx_sender, 0);
+        rs.add_peer(other, tx_other, 0);
+
+        let ann = make_oka(&origin_sk, 1, [0x77u8; 32], 0);
+        rs.handle_onion_key_announce(sender, ann);
+
+        // `other` must have received a forwarded copy.
+        let forwarded = rx_other.try_recv()
+            .expect("forwarded OnionKeyAnnounce must be in `other`'s channel");
+        assert_eq!(forwarded[0], TYPE_ONION_KEY_ANNOUNCE,
+            "forwarded frame must be of OnionKeyAnnounce type");
+    }
+
+    #[test]
+    fn onion_key_announce_does_not_loop_back_to_sender() {
+        let mut rs = make_router();
+        let origin_sk = SigningKey::generate(&mut OsRng);
+        let sender = [0xAAu8; 32];
+        let (tx_sender, mut rx_sender) = mpsc::channel(64);
+        rs.add_peer(sender, tx_sender, 0);
+
+        let ann = make_oka(&origin_sk, 1, [0x77u8; 32], 0);
+        rs.handle_onion_key_announce(sender, ann);
+        // The sender must NOT receive a forwarded copy (we don't echo).
+        assert!(rx_sender.try_recv().is_err(),
+            "must not echo OnionKeyAnnounce back to its sender");
+    }
 
     #[test]
     fn onion_replay_first_sight_not_replay() {

@@ -3,7 +3,7 @@
 use libfuzzer_sys::fuzz_target;
 use norn_rs::packet::{
     decode_uvarint, decode_path, SigReq, SigRes, Announce, CuckooMsg,
-    PathLookup, PathNotify, PathBroken, Traffic, CoordAnnounce,
+    PathLookup, PathNotify, PathBroken, Traffic, CoordAnnounce, OnionKeyAnnounce,
 };
 
 fuzz_target!(|data: &[u8]| {
@@ -21,4 +21,5 @@ fuzz_target!(|data: &[u8]| {
     let _ = PathBroken::decode(data);
     let _ = Traffic::decode(data);
     let _ = CoordAnnounce::decode(data);
+    let _ = OnionKeyAnnounce::decode(data);
 });

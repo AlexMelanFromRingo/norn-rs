@@ -17,6 +17,7 @@ pub const PATH_BROKEN: u8 = 8;
 pub const TRAFFIC: u8 = 9;
 pub const TYPE_COORD_ANNOUNCE: u8 = 10;
 pub const TYPE_ONION: u8 = 11;
+pub const TYPE_ONION_KEY_ANNOUNCE: u8 = 12;
 
 /// Encode a uvarint into a byte buffer.
 // Skip all mutations of this function: two are permanently untestable —
@@ -533,6 +534,75 @@ pub fn routing_tag(pub_key: &[u8; 32]) -> [u8; 16] {
     h.update(b"norn:route");
     h.update(pub_key);
     h.finalize().into()
+}
+
+/// Network-wide flood announcing a node's current onion ephemeral X25519 pub.
+///
+/// Unlike `CoordAnnounce` (one-hop only), this frame is forwarded by every
+/// node that receives a fresher copy, so senders many hops away learn the
+/// current ephemeral pub of any node and can build forward-secret onions to
+/// non-neighbour destinations.
+///
+/// Wire layout (149 bytes):
+///   [origin: 32]                 — the announcing node's identity pub_key
+///   [seq: u64 LE]                — monotonic; receivers keep only the highest
+///   [valid_from_ms: u64 LE]      — sender wall-clock; used for expiry
+///   [onion_eph_pub: 32]          — the advertised ephemeral pub
+///   [sig: 64]                    — signature by `origin` over the prefix
+///
+/// Signature covers: origin || seq || valid_from_ms || onion_eph_pub.
+///
+/// Anti-replay / loop control:
+///   - Receiver keeps `(origin, seq)` per origin; drops stale or duplicate.
+///   - Refuses announces older than ONION_KEY_VALIDITY (e.g. 24 h).
+///   - Caps per-origin known announces at 1 (latest only).
+#[derive(Clone, Debug)]
+pub struct OnionKeyAnnounce {
+    pub origin: [u8; 32],
+    pub seq: u64,
+    pub valid_from_ms: u64,
+    pub onion_eph_pub: [u8; 32],
+    pub sig: [u8; 64],
+}
+
+impl OnionKeyAnnounce {
+    pub fn sign_bytes(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(32 + 8 + 8 + 32);
+        buf.extend_from_slice(&self.origin);
+        buf.extend_from_slice(&self.seq.to_le_bytes());
+        buf.extend_from_slice(&self.valid_from_ms.to_le_bytes());
+        buf.extend_from_slice(&self.onion_eph_pub);
+        buf
+    }
+
+    pub fn encode(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(1 + 32 + 8 + 8 + 32 + 64);
+        buf.push(TYPE_ONION_KEY_ANNOUNCE);
+        buf.extend_from_slice(&self.origin);
+        buf.extend_from_slice(&self.seq.to_le_bytes());
+        buf.extend_from_slice(&self.valid_from_ms.to_le_bytes());
+        buf.extend_from_slice(&self.onion_eph_pub);
+        buf.extend_from_slice(&self.sig);
+        buf
+    }
+
+    /// Decode from bytes *without* the leading TYPE byte.
+    pub fn decode(data: &[u8]) -> Result<Self> {
+        let need = 32 + 8 + 8 + 32 + 64;
+        if data.len() < need {
+            bail!("OnionKeyAnnounce too short: got {} (need {})", data.len(), need);
+        }
+        let mut pos = 0;
+        let mut origin = [0u8; 32];
+        origin.copy_from_slice(&data[pos..pos + 32]); pos += 32;
+        let seq = u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap()); pos += 8;
+        let valid_from_ms = u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap()); pos += 8;
+        let mut onion_eph_pub = [0u8; 32];
+        onion_eph_pub.copy_from_slice(&data[pos..pos + 32]); pos += 32;
+        let mut sig = [0u8; 64];
+        sig.copy_from_slice(&data[pos..pos + 64]);
+        Ok(OnionKeyAnnounce { origin, seq, valid_from_ms, onion_eph_pub, sig })
+    }
 }
 
 /// Broadcast by each node: its hyperbolic coordinate, onion-ephemeral pub,
@@ -1078,6 +1148,59 @@ mod tests {
         assert_eq!(buf[19], 0x01, "LE byte 3");
         let dec = CoordAnnounce::decode(&buf).unwrap();
         assert_eq!(dec.tree_depth, 0x01020304);
+    }
+
+    // ── OnionKeyAnnounce ────────────────────────────────────────────────────
+
+    #[test]
+    fn onion_key_announce_roundtrip() {
+        let ann = OnionKeyAnnounce {
+            origin: [0x11u8; 32],
+            seq: 42,
+            valid_from_ms: 1_700_000_000_000,
+            onion_eph_pub: [0x22u8; 32],
+            sig: [0x33u8; 64],
+        };
+        let enc = ann.encode();
+        assert_eq!(enc[0], TYPE_ONION_KEY_ANNOUNCE);
+        let dec = OnionKeyAnnounce::decode(&enc[1..]).unwrap();
+        assert_eq!(dec.origin, ann.origin);
+        assert_eq!(dec.seq, ann.seq);
+        assert_eq!(dec.valid_from_ms, ann.valid_from_ms);
+        assert_eq!(dec.onion_eph_pub, ann.onion_eph_pub);
+        assert_eq!(dec.sig, ann.sig);
+    }
+
+    #[test]
+    fn onion_key_announce_decode_too_short() {
+        // Need 32+8+8+32+64 = 144 bytes; one less must fail.
+        let need = 32 + 8 + 8 + 32 + 64;
+        let data = vec![0u8; need - 1];
+        assert!(OnionKeyAnnounce::decode(&data).is_err(),
+            "{}-byte input must be rejected (need {})", need - 1, need);
+        let data = vec![0u8; need];
+        assert!(OnionKeyAnnounce::decode(&data).is_ok(),
+            "{}-byte input must succeed", need);
+    }
+
+    #[test]
+    fn onion_key_announce_sign_bytes_changes_with_each_field() {
+        let base = OnionKeyAnnounce {
+            origin: [0u8; 32], seq: 1, valid_from_ms: 0,
+            onion_eph_pub: [0u8; 32], sig: [0u8; 64],
+        };
+        let mut changed = base.clone();
+        changed.seq = 2;
+        assert_ne!(base.sign_bytes(), changed.sign_bytes(), "seq change must affect sign_bytes");
+        let mut changed = base.clone();
+        changed.valid_from_ms = 1;
+        assert_ne!(base.sign_bytes(), changed.sign_bytes(), "ts change must affect sign_bytes");
+        let mut changed = base.clone();
+        changed.onion_eph_pub = [1u8; 32];
+        assert_ne!(base.sign_bytes(), changed.sign_bytes(), "eph change must affect sign_bytes");
+        let mut changed = base.clone();
+        changed.origin = [1u8; 32];
+        assert_ne!(base.sign_bytes(), changed.sign_bytes(), "origin change must affect sign_bytes");
     }
 
     #[test]
