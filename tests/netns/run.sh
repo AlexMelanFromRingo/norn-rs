@@ -86,12 +86,42 @@ generate_key() {
     "$NORND" genconfig | awk -F'"' '/^private_key/ {print $2; exit}'
 }
 
-write_config() {
+# Generate keys, then pick which side dials based on lex of the pub_keys.
+# Only the canonical-initiator side dials; the other listens. This avoids
+# the symmetric-dial race even if the transport's lex-tiebreak ever
+# regresses, and makes the test deterministic across runs.
+KEY_A=$(generate_key)
+KEY_B=$(generate_key)
+# Compute each pub_key via a tiny disposable config (nornd refuses configs
+# with permissive mode, so use a real 0600 file, not process substitution).
+tmp_cfg_for_pub() {
+    local hex=$1
+    local f
+    f=$(mktemp "$WORK/probe.XXXXXX.toml")
+    printf 'private_key = "%s"\n' "$hex" >"$f"
+    chmod 600 "$f"
+    "$NORND" -c "$f" showaddr | awk '/^pub_key:/ {print $2}'
+    rm -f "$f"
+}
+PUB_A=$(tmp_cfg_for_pub "$KEY_A")
+PUB_B=$(tmp_cfg_for_pub "$KEY_B")
+if [[ "$PUB_A" < "$PUB_B" ]]; then
+    PEER_A="tcp://${IP_B%/*}:${PORT}"    # A dials B (smaller pub initiates)
+    PEER_B=""                            # B only listens
+else
+    PEER_A=""
+    PEER_B="tcp://${IP_A%/*}:${PORT}"
+fi
+write_config_with_peer() {
     local dir=$1 me_addr=$2 peer_uri=$3 sock=$4 priv_hex=$5
+    local peers_line='peers = []'
+    if [[ -n "$peer_uri" ]]; then
+        peers_line="peers = [\"$peer_uri\"]"
+    fi
     cat >"$dir/norn.toml" <<EOF
 private_key = "${priv_hex}"
 listen      = ["tcp://${me_addr%/*}:${PORT}"]
-peers       = ["${peer_uri}"]
+${peers_line}
 tun_name    = "norn0"
 admin_socket    = "${sock}"
 peer_cache_path = ""
@@ -103,11 +133,8 @@ log_level        = "warn"
 EOF
     chmod 600 "$dir/norn.toml"
 }
-
-KEY_A=$(generate_key)
-KEY_B=$(generate_key)
-write_config "$WORK/a" "${IP_A%/*}" "tcp://${IP_B%/*}:${PORT}" "$WORK/a/admin.sock" "$KEY_A"
-write_config "$WORK/b" "${IP_B%/*}" "tcp://${IP_A%/*}:${PORT}" "$WORK/b/admin.sock" "$KEY_B"
+write_config_with_peer "$WORK/a" "${IP_A%/*}" "$PEER_A" "$WORK/a/admin.sock" "$KEY_A"
+write_config_with_peer "$WORK/b" "${IP_B%/*}" "$PEER_B" "$WORK/b/admin.sock" "$KEY_B"
 
 # ── start daemons ─────────────────────────────────────────────────────────
 echo "── starting daemons ──"

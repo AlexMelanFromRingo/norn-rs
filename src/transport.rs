@@ -316,6 +316,26 @@ pub async fn dial(uri: &str, conn: Arc<PacketConn>, connected: ConnectedPeers) {
                                 continue;
                             }
                         }
+
+                        // ── Crossing-dial deterministic tiebreak ──────────
+                        // If BOTH peers dial each other simultaneously, naïve
+                        // first-insert-wins dedup can leave each side keeping
+                        // a TCP whose far-end the OTHER side dropped on its
+                        // own dedup → both connections die. The classic fix:
+                        // smaller-pub-key role = "dialer", larger = "accepter".
+                        // If we are the larger pub, suppress our dial and let
+                        // their dial (smaller pub → our accept) become the
+                        // sole surviving TCP.
+                        let our_pub = conn.pub_key;
+                        if our_pub > remote_pub {
+                            debug!(
+                                "dial deferred: our_pub > remote_pub for {:?} (canonical role = accepter)",
+                                &remote_pub[..4]
+                            );
+                            tokio::time::sleep(Duration::from_secs(30)).await;
+                            continue;
+                        }
+
                         // Dedup: drop the guard before any await
                         let already = connected.lock().unwrap().contains(&remote_pub);
                         if already {
