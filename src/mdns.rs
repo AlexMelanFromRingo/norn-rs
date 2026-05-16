@@ -151,7 +151,10 @@ fn hostname_label() -> String {
         .or_else(|| {
             #[cfg(unix)]
             unsafe {
-                let mut buf = [0i8; 256];
+                // c_char is i8 on x86_64-linux-gnu but u8 on aarch64-linux-gnu
+                // (and on musl). Use the std alias so the buffer type matches
+                // gethostname()'s actual signature on every Unix target.
+                let mut buf: [std::ffi::c_char; 256] = [0; 256];
                 if libc_gethostname_compat(buf.as_mut_ptr(), buf.len()) == 0 {
                     let s = std::ffi::CStr::from_ptr(buf.as_ptr())
                         .to_string_lossy()
@@ -171,11 +174,13 @@ fn hostname_label() -> String {
 }
 
 // Shim that calls libc::gethostname without pulling in the `libc` crate
-// just for this. Safe wrapper around the C signature.
+// just for this. Safe wrapper around the C signature. `c_char` is the std
+// alias for whatever C's `char` is on this target (i8 on x86_64-linux-gnu;
+// u8 on aarch64-linux-gnu, musl, etc.).
 #[cfg(unix)]
 unsafe extern "C" {
     #[link_name = "gethostname"]
-    fn libc_gethostname_compat(name: *mut i8, len: usize) -> i32;
+    fn libc_gethostname_compat(name: *mut std::ffi::c_char, len: usize) -> i32;
 }
 
 #[cfg(test)]

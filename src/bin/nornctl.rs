@@ -10,7 +10,9 @@ use clap_complete::{generate, Shell};
 use serde::{Deserialize, Serialize};
 use std::io;
 use std::path::PathBuf;
+#[cfg(unix)]
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+#[cfg(unix)]
 use tokio::net::UnixStream;
 
 const DEFAULT_SOCKET: &str = "/var/run/norn.sock";
@@ -174,6 +176,7 @@ async fn main() -> Result<()> {
 
 /// Send one JSON request, read one JSON reply, return as serde Value.
 /// Aborts on transport error or daemon-reported `{"error": ...}`.
+#[cfg(unix)]
 async fn call(socket: &PathBuf, method: &str, uri: Option<String>) -> Result<serde_json::Value> {
     let stream = UnixStream::connect(socket)
         .await
@@ -197,6 +200,15 @@ async fn call(socket: &PathBuf, method: &str, uri: Option<String>) -> Result<ser
         bail!("daemon error: {err}");
     }
     Ok(v)
+}
+
+/// Windows stub: admin socket protocol is UNIX-only. status/peers/addpeer
+/// all need this; only `showaddr` (local computation) and `completions`
+/// work without a daemon.
+#[cfg(not(unix))]
+async fn call(_socket: &PathBuf, _method: &str, _uri: Option<String>) -> Result<serde_json::Value> {
+    bail!("admin socket commands (status/peers/addpeer) are not supported on Windows; \
+           use showaddr or completions, or run nornctl on a Unix host")
 }
 
 #[cfg(test)]
