@@ -29,9 +29,39 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// Maximum simultaneous unauthenticated handshakes in-flight per process.
 /// Bounds memory/FD exhaustion from accept floods.
 const MAX_PENDING_HANDSHAKES: usize = 256;
+/// Maximum simultaneous unauthenticated handshakes in-flight from a SINGLE
+/// remote IP. The global cap above is fair-share-blind: an attacker behind one
+/// IP could occupy all 256 slots and starve every other peer. This per-IP cap
+/// guarantees ≥ MAX_PENDING_HANDSHAKES / MAX_PER_IP_HANDSHAKES legitimate
+/// peers can still complete a handshake under flood.
+///
+/// Defence-in-depth alongside Sybil PoW (`min_peer_difficulty_bits`): PoW is
+/// per-IDENTITY, this cap is per-NETWORK-ENDPOINT. An attacker with one IP
+/// and arbitrary CPU still cannot occupy more than 4 slots.
+const MAX_PER_IP_HANDSHAKES: usize = 4;
 
 /// Shared set of currently-connected peer pub keys (for dedup).
 pub type ConnectedPeers = Arc<Mutex<HashSet<[u8; 32]>>>;
+
+/// RAII guard that decrements a per-IP handshake counter on drop. Ensures we
+/// release the slot whether the spawned task exits via success, error, or
+/// timeout — no leak path.
+struct PerIpGuard {
+    ip: std::net::IpAddr,
+    counts: Arc<Mutex<std::collections::HashMap<std::net::IpAddr, usize>>>,
+}
+
+impl Drop for PerIpGuard {
+    fn drop(&mut self) {
+        let mut counts = self.counts.lock().unwrap();
+        if let Some(c) = counts.get_mut(&self.ip) {
+            *c = c.saturating_sub(1);
+            if *c == 0 {
+                counts.remove(&self.ip);
+            }
+        }
+    }
+}
 
 /// Apply TCP_NODELAY and SO_KEEPALIVE to a connected TcpStream.
 ///
@@ -207,6 +237,10 @@ pub async fn listen(
     // bound a TCP SYN/connect flood can exhaust both. Authenticated peers move
     // out of this cap as soon as the handshake completes (semaphore permit dropped).
     let handshake_sem = Arc::new(tokio::sync::Semaphore::new(MAX_PENDING_HANDSHAKES));
+    // Per-source-IP in-flight handshake counter. Bounds Eclipse-attack capacity
+    // from a single endpoint regardless of global capacity. See MAX_PER_IP_HANDSHAKES.
+    let per_ip_counts: Arc<Mutex<std::collections::HashMap<std::net::IpAddr, usize>>> =
+        Arc::new(Mutex::new(std::collections::HashMap::new()));
 
     loop {
         let (mut stream, peer_addr) = match listener.accept().await {
@@ -225,9 +259,32 @@ pub async fn listen(
             }
         };
 
+        // Per-IP rate-limit. Bump the IP's counter atomically; if it would
+        // exceed MAX_PER_IP_HANDSHAKES we drop and release the global permit.
+        // The counter is decremented in a Drop-guard so handshake errors do
+        // not leak slots.
+        let ip = peer_addr.ip();
+        {
+            let mut counts = per_ip_counts.lock().unwrap();
+            let entry = counts.entry(ip).or_insert(0);
+            if *entry >= MAX_PER_IP_HANDSHAKES {
+                warn!(
+                    "per-IP handshake limit reached for {} ({} in flight), dropping",
+                    ip, *entry
+                );
+                drop(stream);
+                continue;
+            }
+            *entry += 1;
+        }
+        let ip_guard = PerIpGuard { ip, counts: per_ip_counts.clone() };
+
         let conn = conn.clone();
         let connected = connected.clone();
         tokio::spawn(async move {
+            // ip_guard lives through the handshake and drops on either path —
+            // success (we move into the long-lived loop) or failure.
+            let _ip_guard = ip_guard;
             configure_socket(&stream);
             let hs_result = timeout(
                 HANDSHAKE_TIMEOUT,
@@ -408,5 +465,48 @@ mod tests {
     fn parse_tcp_uri_preserves_hostname() {
         let addr = parse_tcp_uri("tcp://peer.example.com:9001").unwrap();
         assert_eq!(addr, "peer.example.com:9001");
+    }
+
+    // ── PerIpGuard counter accounting ────────────────────────────────────────
+
+    #[test]
+    fn per_ip_guard_decrements_on_drop() {
+        let counts: Arc<Mutex<std::collections::HashMap<std::net::IpAddr, usize>>> =
+            Arc::new(Mutex::new(std::collections::HashMap::new()));
+        let ip: std::net::IpAddr = "10.1.2.3".parse().unwrap();
+        // Simulate two simultaneous handshakes.
+        counts.lock().unwrap().insert(ip, 2);
+        let g1 = PerIpGuard { ip, counts: counts.clone() };
+        let g2 = PerIpGuard { ip, counts: counts.clone() };
+        drop(g1);
+        assert_eq!(*counts.lock().unwrap().get(&ip).unwrap(), 1,
+            "drop must decrement to 1");
+        drop(g2);
+        assert!(!counts.lock().unwrap().contains_key(&ip),
+            "drop to zero must remove the entry to bound map growth");
+    }
+
+    #[test]
+    fn per_ip_guard_saturating_sub_handles_unexpected_zero() {
+        // If the counter were somehow already 0 (programming bug elsewhere)
+        // the Drop must NOT panic on overflow — saturating_sub guarantees it.
+        let counts: Arc<Mutex<std::collections::HashMap<std::net::IpAddr, usize>>> =
+            Arc::new(Mutex::new(std::collections::HashMap::new()));
+        let ip: std::net::IpAddr = "::1".parse().unwrap();
+        counts.lock().unwrap().insert(ip, 0);
+        let g = PerIpGuard { ip, counts: counts.clone() };
+        drop(g); // must not panic
+        assert!(!counts.lock().unwrap().contains_key(&ip),
+            "decrement-from-zero path must still evict the entry");
+    }
+
+    #[test]
+    fn per_ip_handshake_cap_is_nontrivial() {
+        // Sanity: the cap exists and is small enough that one attacker IP
+        // can't monopolise the global pool. Wrapped in const blocks so
+        // clippy doesn't flag them as always-true runtime assertions —
+        // they're really compile-time invariants.
+        const _: () = assert!(MAX_PER_IP_HANDSHAKES > 0);
+        const _: () = assert!(MAX_PER_IP_HANDSHAKES * 16 <= MAX_PENDING_HANDSHAKES);
     }
 }

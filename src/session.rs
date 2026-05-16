@@ -716,7 +716,29 @@ pub struct SessionManager {
     /// keyed by (our_seq) — currently unused; placeholder for future ratchet.
     #[allow(dead_code)]
     _pq_pending: HashMap<u64, [u8; ML_KEM_SHARED_BYTES]>,
+    /// Per-source rate limit on inbound `handle_init` calls. `Init` triggers
+    /// an ML-KEM-768 encap (~80 µs on modern hardware, but easy to amplify
+    /// over a mesh-routed flood). Each entry stores the timestamps of recent
+    /// init attempts by a given source ed_pub. If a source exceeds
+    /// `MAX_INITS_PER_WINDOW` in the last `INIT_RATE_WINDOW`, further inits
+    /// are rejected before the encap runs.
+    ///
+    /// Per-IDENTITY (not per-IP): the attacker still has to pay the
+    /// Sybil-PoW cost (`min_peer_difficulty_bits`) to generate enough
+    /// distinct ed_pubs to amplify around this cap.
+    init_rate_log: HashMap<[u8; 32], Vec<std::time::Instant>>,
 }
+
+/// Per-source rate-limit window for inbound `handle_init`. Must be short
+/// enough to make legitimate session re-establishment work (peers retry on
+/// timeout); long enough to bound the encap-flood throughput.
+pub const INIT_RATE_WINDOW: std::time::Duration = std::time::Duration::from_secs(10);
+/// Maximum inbound inits per source ed_pub per `INIT_RATE_WINDOW`. At 10s
+/// window × 4 inits = 0.4 ML-KEM encaps/sec/source — well above any
+/// legitimate need, well below CPU-saturation territory.
+pub const MAX_INITS_PER_WINDOW: usize = 4;
+/// Hard cap on the rate-log map size — bounds memory under Sybil attempts.
+const MAX_INIT_RATE_LOG_ENTRIES: usize = 4_096;
 
 impl SessionManager {
     pub fn new(signing_key: SigningKey) -> Self {
@@ -725,7 +747,40 @@ impl SessionManager {
             our_signing_key: signing_key,
             pq_keys: PqKeys::generate(),
             _pq_pending: HashMap::new(),
+            init_rate_log: HashMap::new(),
         }
+    }
+
+    /// Record an init attempt from `source` and return whether the source is
+    /// currently OVER the rate limit (true = reject before doing expensive work).
+    fn rate_limited(&mut self, source: &[u8; 32]) -> bool {
+        let now = std::time::Instant::now();
+        let cutoff = now.checked_sub(INIT_RATE_WINDOW).unwrap_or(now);
+
+        // Bound map size before insertion. Evict an arbitrary entry whose
+        // window is empty when we hit the cap — keeps memory linear in the
+        // number of CONCURRENTLY active sources, not lifetime sources.
+        if !self.init_rate_log.contains_key(source)
+            && self.init_rate_log.len() >= MAX_INIT_RATE_LOG_ENTRIES {
+            let victim = self.init_rate_log.iter()
+                .find(|(_, ts)| ts.iter().all(|t| *t < cutoff))
+                .map(|(k, _)| *k);
+            if let Some(v) = victim {
+                self.init_rate_log.remove(&v);
+            } else {
+                // All slots actively in use → reject conservatively rather
+                // than evict an active session's quota.
+                return true;
+            }
+        }
+
+        let entry = self.init_rate_log.entry(*source).or_default();
+        entry.retain(|t| *t >= cutoff);
+        if entry.len() >= MAX_INITS_PER_WINDOW {
+            return true;
+        }
+        entry.push(now);
+        false
     }
 
     pub fn our_signing_key(&self) -> &SigningKey {
@@ -763,6 +818,23 @@ impl SessionManager {
     /// ml_kem_pub and stores it on the session for hybrid key derivation.
     pub fn handle_init(&mut self, data: &[u8]) -> Result<Vec<u8>> {
         let init = SessionInit::decode(data)?;
+        // Per-source rate limit BEFORE the expensive sig-verify + ML-KEM
+        // encap. We use the claimed `init.ed_pub` rather than the underlying
+        // network endpoint — the latter is already throttled at the TCP
+        // listener (see transport.rs MAX_PER_IP_HANDSHAKES). This layer
+        // throttles MESH-routed inits (PKT_CONTROL flooded inside Traffic),
+        // which bypass the listener entirely.
+        //
+        // Tradeoff: a Sybil attacker can rotate ed_pubs to evade the per-
+        // source cap, but each new ed_pub still has to satisfy
+        // min_peer_difficulty_bits — generating thousands of valid identities
+        // is non-trivial. This rate limit + PoW combo is defence-in-depth.
+        if self.rate_limited(&init.ed_pub) {
+            bail!(
+                "handle_init: source {:?} rate-limited (>{} inits in {:?})",
+                &init.ed_pub[..4], MAX_INITS_PER_WINDOW, INIT_RATE_WINDOW,
+            );
+        }
         let our_pub = self.our_signing_key.verifying_key().to_bytes();
         init.verify(&our_pub)?;
 
@@ -1676,5 +1748,50 @@ mod tests {
         let msg = format!("{}", result.err().expect("just checked is_err"));
         assert!(msg.contains("too short") || msg.contains("short"),
             "error must mention 'too short'; got: {}", msg);
+    }
+
+    // ── rate_limited unit tests ─────────────────────────────────────────────
+
+    #[test]
+    fn rate_limit_accepts_up_to_max_then_rejects() {
+        let sk = SigningKey::generate(&mut OsRng);
+        let mut mgr = SessionManager::new(sk);
+        let src = [0xAA_u8; 32];
+        for i in 0..MAX_INITS_PER_WINDOW {
+            assert!(!mgr.rate_limited(&src),
+                "init #{} of {} must pass the rate limit", i, MAX_INITS_PER_WINDOW);
+        }
+        assert!(mgr.rate_limited(&src),
+            "init #{} (one over MAX_INITS_PER_WINDOW) must be rate-limited",
+            MAX_INITS_PER_WINDOW + 1);
+    }
+
+    #[test]
+    fn rate_limit_isolates_sources() {
+        // Different sources have INDEPENDENT quotas — one noisy attacker
+        // must not starve every other peer.
+        let sk = SigningKey::generate(&mut OsRng);
+        let mut mgr = SessionManager::new(sk);
+        let src_a = [0x01_u8; 32];
+        let src_b = [0x02_u8; 32];
+
+        for _ in 0..MAX_INITS_PER_WINDOW { let _ = mgr.rate_limited(&src_a); }
+        assert!(mgr.rate_limited(&src_a),
+            "A must be limited after filling its window");
+        assert!(!mgr.rate_limited(&src_b),
+            "B (fresh source) must still be allowed regardless of A's quota");
+    }
+
+    #[test]
+    fn rate_limit_decays_after_window() {
+        let sk = SigningKey::generate(&mut OsRng);
+        let mut mgr = SessionManager::new(sk);
+        let src = [0xCC_u8; 32];
+        // Backdate all timestamps past the window — the next call must clear
+        // and accept.
+        let old = std::time::Instant::now() - INIT_RATE_WINDOW - std::time::Duration::from_secs(1);
+        mgr.init_rate_log.insert(src, vec![old; MAX_INITS_PER_WINDOW]);
+        assert!(!mgr.rate_limited(&src),
+            "old timestamps (>WINDOW) must be evicted, freeing the source's quota");
     }
 }

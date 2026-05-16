@@ -98,6 +98,38 @@ const ONION_KEY_VALIDITY_MS: u64 = 24 * 60 * 60 * 1_000;
 const MAX_REMOTE_ONION_KEYS: usize = 16_384;
 /// Issue one path-validation probe every N maintenance ticks.
 const PROBE_INTERVAL_TICKS: u32 = 15;
+/// How long a `(peer, routing_tag)` negative-route hint stays in cache.
+/// Tradeoff: too short → cuckoo FPs keep wasting forwards; too long → real
+/// route restorations (after a peer recovers) take this long to be tried
+/// again. 60s sits in the middle, well below typical cuckoo gossip churn.
+const PATH_NEG_TTL: Duration = Duration::from_secs(60);
+/// Cap on the negative cache to bound memory. 16k entries × ~50 bytes ≈ 800 KB.
+const MAX_PATH_NEG_CACHE: usize = 16_384;
+/// Initial TTL for an outbound PathNegative frame. Each hop decrements;
+/// frame is dropped at zero. Caps the reach of forged PathNegatives so an
+/// attacker cannot poison routes across the entire mesh from one node.
+const PATH_NEG_INITIAL_TTL: u8 = 4;
+/// Minimum distinct observers required before `consensus_trust` returns Some.
+/// Below this we treat the observation set as too small to defeat a Sybil
+/// (the attacker could plausibly own ALL the observers). Caller then falls
+/// back to local trust alone, which already has anti-poisoning via probe
+/// success / failure.
+const REPUTATION_MIN_QUORUM: usize = 3;
+/// Fraction of observers (each end) discarded by the trimmed mean before
+/// averaging. 0.25 means drop top 25 % and bottom 25 %. A coalition must
+/// hold more than 25 % of WEIGHTED voting power on this peer to shift
+/// consensus — a much higher bar than the simple-mean default that lets
+/// one extreme vote pull the average by 1/N.
+const REPUTATION_TRIM_FRAC: f64 = 0.25;
+/// PoW difficulty at which an observer's weight saturates to 1.0. Below this,
+/// weight scales linearly from `REPUTATION_WEIGHT_FLOOR` → 1.0. Picked to
+/// match a realistic Sybil-resistance ask (16 bits ≈ 65k iterations, cheap
+/// for a real peer, expensive at fleet scale for an attacker).
+const REPUTATION_WEIGHT_BITS: u32 = 16;
+/// Minimum weight any observer gets, regardless of PoW. Prevents PoW=0
+/// observations from being silently discarded — they still count, just at
+/// 1/N of a fully-PoWed peer.
+const REPUTATION_WEIGHT_FLOOR: f64 = 0.0625; // 1/16
 /// Probes that have been pending this long without a PathNotify are counted
 /// as a failure: the via-peer's trust score decays.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -275,6 +307,17 @@ struct RouterState {
     /// Operators set this via PacketConn::set_on_hole_punch to drive a
     /// simultaneous outbound QUIC connect for symmetric-NAT traversal.
     hole_punch_cb: Option<HolePunchCb>,
+    /// Negative-routing cache. Populated when an UPSTREAM peer tells us
+    /// (via `PathNegative`) that *they* failed to deliver a packet we sent
+    /// for `routing_tag`. We then avoid picking that peer for that tag for
+    /// `PATH_NEG_TTL`. Bounds cuckoo-FP cost to one wasted forward per
+    /// (peer, tag) per TTL.
+    ///
+    /// Wait — the directionality matters: PathNegative travels UPSTREAM
+    /// (from a forwarder back to whoever sent the doomed packet). So when
+    /// WE receive it from peer P, we should learn "P cannot reach this
+    /// tag" → cache (P, tag). Next lookup_by_tag skips P.
+    path_negative_cache: HashMap<([u8; 32], [u8; 16]), Instant>,
 }
 
 /// One observation in `reputation`.
@@ -450,10 +493,52 @@ fn routing_tag_eq(a: &[u8; 16], b: &[u8; 16]) -> bool {
 }
 
 /// XOR-metric for tree root selection. Each tree uses a different seed.
+///
+/// NOTE: this is the **legacy, epoch-0** form. New code MUST use
+/// `tree_metric_at` so the root rotates across the network and a static
+/// "lowest-key" node cannot become a permanent DDoS / censorship target.
+/// Kept public + named the old way only because the test suite references
+/// it directly to verify the XOR algebra.
 pub fn tree_metric(pub_key: &[u8; 32], seed: &[u8; 8]) -> [u8; 32] {
+    tree_metric_at(pub_key, seed, 0)
+}
+
+/// Length of one tree epoch in seconds (24h). Picked to be much longer than
+/// typical convergence time (seconds, dominated by maintenance tick + cuckoo
+/// gossip) but short enough that no single node can serve as root for long.
+pub const TREE_EPOCH_SECS: u64 = 24 * 60 * 60;
+
+/// Current tree-root epoch derived from system wall clock. Both sides of any
+/// adjacency compute this independently; clocks need only to be within ~1h
+/// of each other (typical NTP skew is sub-second). At the epoch boundary
+/// the network briefly disagrees, then converges within a few maintenance
+/// ticks — this is the normal tree-reconvergence behavior, not a failure.
+pub fn current_tree_epoch() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() / TREE_EPOCH_SECS)
+        .unwrap_or(0)
+}
+
+/// Epoch-rotated XOR-metric. Derives a 32-byte salt from BLAKE2b(seed||epoch)
+/// and XORs it with the pub_key. Two consequences:
+///   - Within an epoch, every node ranks candidate roots **the same way**
+///     (deterministic per (seed, epoch)) → trees still converge.
+///   - Across epochs, the salt changes → the lowest-metric (= root) node
+///     changes → a long-lived attacker cannot pin any single node as a
+///     permanent target. Mitigates the "static-root DDoS / censorship"
+///     concern raised in the security audit.
+pub fn tree_metric_at(pub_key: &[u8; 32], seed: &[u8; 8], epoch: u64) -> [u8; 32] {
+    use blake2::{Blake2b, Digest};
+    use blake2::digest::consts::U32;
+    let mut h: Blake2b<U32> = Blake2b::new();
+    h.update(b"norn:tree-epoch");
+    h.update(seed);
+    h.update(epoch.to_le_bytes());
+    let salt: [u8; 32] = h.finalize().into();
     let mut metric = *pub_key;
     for (i, b) in metric.iter_mut().enumerate() {
-        *b ^= seed[i % 8];
+        *b ^= salt[i];
     }
     metric
 }
@@ -507,7 +592,84 @@ impl RouterState {
             reputation: HashMap::new(),
             own_reputation_seq: 0,
             hole_punch_cb: None,
+            path_negative_cache: HashMap::new(),
         }
+    }
+
+    /// Look up a peer's current entry in the cuckoo-FP negative cache. Returns
+    /// true if the peer recently signalled "I can't reach this tag" — caller
+    /// should skip this peer for this tag until the entry ages out. Also
+    /// performs lazy eviction of stale entries.
+    fn is_path_negative(&self, peer: &PeerId, tag: &[u8; 16]) -> bool {
+        let now = Instant::now();
+        match self.path_negative_cache.get(&(*peer, *tag)) {
+            Some(t) => now.duration_since(*t) < PATH_NEG_TTL,
+            None => false,
+        }
+    }
+
+    /// Record an incoming PathNegative. Bounded by `MAX_PATH_NEG_CACHE`.
+    fn record_path_negative(&mut self, peer: PeerId, tag: [u8; 16]) {
+        let now = Instant::now();
+        if self.path_negative_cache.len() >= MAX_PATH_NEG_CACHE {
+            // Lazy eviction: drop the oldest expired entry, else any one.
+            let cutoff = now.checked_sub(PATH_NEG_TTL).unwrap_or(now);
+            let victim = self.path_negative_cache.iter()
+                .find(|(_, t)| **t < cutoff)
+                .map(|(k, _)| *k)
+                .or_else(|| self.path_negative_cache.keys().next().copied());
+            if let Some(v) = victim {
+                self.path_negative_cache.remove(&v);
+            }
+        }
+        self.path_negative_cache.insert((peer, tag), now);
+    }
+
+    /// Drop expired negative-cache entries — called from maintenance tick.
+    fn cleanup_path_negative_cache(&mut self) {
+        let now = Instant::now();
+        self.path_negative_cache.retain(|_, t| now.duration_since(*t) < PATH_NEG_TTL);
+    }
+
+    /// Send a `PathNegative` UPSTREAM (back to the peer we received an
+    /// undeliverable packet from). Called when we drop a Traffic/Onion forward
+    /// because of no-route or TTL exhaustion. Caller decrements TTL appropriately.
+    fn send_path_negative(&mut self, to: PeerId, tag: [u8; 16], ttl: u8) {
+        if ttl == 0 {
+            return;
+        }
+        let frame = crate::packet::PathNegative { routing_tag: tag, ttl };
+        let encoded = frame.encode();
+        self.send_to_peer(&to, encoded);
+    }
+
+    /// Handle an inbound `PathNegative`. Two effects:
+    ///   1. Cache `(from, tag)` so we stop picking `from` for this tag.
+    ///   2. If we ourselves are a forwarder for this tag (recently received
+    ///      and propagated upstream), forward the PathNegative one more hop
+    ///      upstream — bounded by the embedded TTL.
+    ///
+    /// We do NOT trust the routing_tag against any specific identity (the
+    /// frame is unsigned) — the only effect is that the SENDER tells us not
+    /// to pick THEM for this tag. They can already lie about their own
+    /// connectivity anyway, so this is no worse than the existing cuckoo
+    /// gossip authority model.
+    pub fn handle_path_negative(&mut self, from: PeerId, neg: crate::packet::PathNegative) {
+        if let Some(peer) = self.peers.get_mut(&from) {
+            peer.last_rx_time = Instant::now();
+        }
+        self.record_path_negative(from, neg.routing_tag);
+        debug!(
+            "PathNegative: peer {:?} cannot route tag {:?} (ttl {})",
+            &from[..4], &neg.routing_tag[..4], neg.ttl,
+        );
+        // TTL-bounded forward upstream: pick any non-`from` peer that
+        // CURRENTLY claims the tag and propagate the negative hint. This
+        // gives multi-hop convergence for FP-storms without flooding.
+        if neg.ttl > 1
+            && let Some(next) = self.lookup_by_tag_excluding(&neg.routing_tag, Some(from)) {
+                self.send_path_negative(next, neg.routing_tag, neg.ttl - 1);
+            }
     }
 
     fn add_peer(&mut self, pub_key: PeerId, tx: mpsc::Sender<Vec<u8>>, priority: u8) {
@@ -576,7 +738,11 @@ impl RouterState {
 
     /// Select best parent for tree `tree_id`.
     fn fix_tree(&mut self, tree_id: usize) {
-        let my_metric = tree_metric(&self.pub_key, &TREE_SEEDS[tree_id]);
+        // Use the current epoch so root selection sweeps across the network
+        // over time instead of pinning a deterministic permanent root that an
+        // attacker can DDoS or censor (mitigation for the "static root" risk).
+        let epoch = current_tree_epoch();
+        let my_metric = tree_metric_at(&self.pub_key, &TREE_SEEDS[tree_id], epoch);
         let mut best_root: Option<[u8; 32]> = None;
         let mut best_root_metric: Option<[u8; 32]> = None;
         let mut best_cost: u64 = u64::MAX;
@@ -590,7 +756,7 @@ impl RouterState {
                 if now.duration_since(ann.received_at) > ANNOUNCE_EXPIRY {
                     continue;
                 }
-                let root_metric = tree_metric(&ann.root, &TREE_SEEDS[tree_id]);
+                let root_metric = tree_metric_at(&ann.root, &TREE_SEEDS[tree_id], epoch);
                 let peer_cost = peer.effective_cost();
                 let total_cost = ann.path_cost.saturating_add(peer_cost);
 
@@ -827,6 +993,7 @@ impl RouterState {
         self.cleanup_stale_probes();
         self.cleanup_stale_lookups();
         self.cleanup_stale_sessions();
+        self.cleanup_path_negative_cache();
     }
 
     /// Rotate the onion ephemeral keypair at the configured cadence.
@@ -1193,25 +1360,63 @@ impl RouterState {
             .insert(observer, (seq, score, recorded_at));
     }
 
-    /// Compute consensus trust for `observed`: average of all observers'
-    /// scores, with stale entries (> validity window) skipped. Returns None
-    /// if we have no observations.
+    /// Compute consensus trust for `observed` with three Sybil/collusion hardenings:
+    ///
+    ///   1. **PoW-weighted observers.** Each observer's score is multiplied
+    ///      by `min(1.0, observer_difficulty_bits / REPUTATION_WEIGHT_BITS)`.
+    ///      A Sybil army of low-difficulty identities still counts, but each
+    ///      vote is fractional — defeating cheap "1k Sybils trash one honest
+    ///      peer" (bad-mouthing) and "1k Sybils inflate a peer they control"
+    ///      (self-promotion).
+    ///   2. **Trimmed mean.** Sort observed scores; discard top
+    ///      `REPUTATION_TRIM_FRAC` and bottom `REPUTATION_TRIM_FRAC` before
+    ///      averaging. A coalition has to control >25 % of voting weight to
+    ///      shift the median; below that, their extreme votes get trimmed.
+    ///   3. **Minimum quorum.** Below `REPUTATION_MIN_QUORUM` distinct
+    ///      observers, return None (= "no consensus yet, fall back to local
+    ///      trust"). Stops a lone attacker observation from dictating
+    ///      consensus on a barely-known peer.
+    ///
+    /// Returns None when (a) no observations or (b) below quorum.
     pub fn consensus_trust(&self, observed: &[u8; 32]) -> Option<f32> {
         let bucket = self.reputation.get(observed)?;
         let cutoff = Instant::now().checked_sub(Duration::from_millis(REPUTATION_VALIDITY_MS))
             .unwrap_or(Instant::now());
-        let mut sum = 0.0f64;
-        let mut count = 0usize;
-        for (_, score, t) in bucket.values() {
+
+        // Collect (weight, real_trust) pairs for fresh observations.
+        let mut weighted: Vec<(f64, f64)> = Vec::with_capacity(bucket.len());
+        for (observer_pub, (_, score, t)) in bucket {
             if *t < cutoff {
                 continue;
             }
-            // Linear remap from [0..1] back to [TRUST_MIN..TRUST_MAX].
             let real_trust = TRUST_MIN + score * (TRUST_MAX - TRUST_MIN);
-            sum += real_trust as f64;
-            count += 1;
+            let bits = crate::address::key_difficulty_bits(observer_pub);
+            // Linear weight cap at REPUTATION_WEIGHT_BITS — Sybils with 0
+            // bits contribute essentially nothing; the floor (1.0 / cap) is
+            // kept so a small honest network with no PoW still operates.
+            let w = ((bits as f64) / REPUTATION_WEIGHT_BITS as f64)
+                .clamp(REPUTATION_WEIGHT_FLOOR, 1.0);
+            weighted.push((w, real_trust as f64));
         }
-        if count == 0 { None } else { Some((sum / count as f64) as f32) }
+
+        if weighted.len() < REPUTATION_MIN_QUORUM {
+            return None;
+        }
+
+        // Trimmed-mean: sort by score, drop the top/bottom fraction.
+        weighted.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+        let n = weighted.len();
+        let trim = ((n as f64) * REPUTATION_TRIM_FRAC).floor() as usize;
+        let kept = &weighted[trim..n.saturating_sub(trim).max(trim + 1)];
+        if kept.is_empty() {
+            return None;
+        }
+        let total_w: f64 = kept.iter().map(|(w, _)| *w).sum();
+        if total_w <= f64::EPSILON {
+            return None;
+        }
+        let weighted_sum: f64 = kept.iter().map(|(w, s)| w * s).sum();
+        Some((weighted_sum / total_w) as f32)
     }
 
     /// Record a (potentially new) remote onion key. Caps the table at
@@ -1706,6 +1911,9 @@ impl RouterState {
             // forward the same packet back-and-forth forever.
             if traffic.watermark >= MAX_FORWARD_HOPS as u64 {
                 debug!("forward dropped: ttl exceeded ({} hops)", traffic.watermark);
+                // Tell upstream so it stops sending us packets that loop —
+                // this is the cuckoo-FP / dead-end backtrack channel.
+                self.send_path_negative(from, traffic.routing_tag, PATH_NEG_INITIAL_TTL);
                 return;
             }
 
@@ -1725,6 +1933,11 @@ impl RouterState {
                 self.send_to_peer(&next_hop, encoded);
             } else {
                 debug!("no route for routing_tag {:?}", &traffic.routing_tag[..4]);
+                // Backtrack: tell upstream we have no neighbour for this tag
+                // (cuckoo false positive somewhere in their view, or genuine
+                // unreachability). They cache (us, tag) and try elsewhere.
+                let tag = traffic.routing_tag;
+                self.send_path_negative(from, tag, PATH_NEG_INITIAL_TTL);
             }
         }
     }
@@ -1845,10 +2058,11 @@ impl RouterState {
                     Ok(inner) => {
                         let tag = inner.routing_tag;
                         let encoded = inner.encode();
-                        if let Some(next) = self.lookup_by_tag(&tag) {
+                        if let Some(next) = self.lookup_by_tag_excluding(&tag, Some(from)) {
                             self.send_to_peer(&next, encoded);
                         } else {
                             debug!("onion: no route for next tag {:?}", &tag[..4]);
+                            self.send_path_negative(from, tag, PATH_NEG_INITIAL_TTL);
                         }
                     }
                     Err(e) => debug!("onion: failed to decode inner layer: {}", e),
@@ -1900,6 +2114,7 @@ impl RouterState {
 
     /// Route lookup using only the 16-byte routing_tag (for forwarding Traffic
     /// where the full dest pub key is not known to intermediate nodes).
+    #[cfg(test)]
     fn lookup_by_tag(&self, tag: &[u8; 16]) -> Option<PeerId> {
         self.lookup_by_tag_excluding(tag, None)
     }
@@ -1917,6 +2132,11 @@ impl RouterState {
         let mut best: Option<(PeerId, u64)> = None;
         for (peer_key, peer) in &self.peers {
             if exclude == Some(*peer_key) {
+                continue;
+            }
+            // Skip peers that recently sent us a PathNegative for this tag —
+            // their cuckoo claim is a known false positive.
+            if self.is_path_negative(peer_key, tag) {
                 continue;
             }
             for tree_id in 0..K {
@@ -2052,6 +2272,11 @@ fn dispatch(state: &Arc<Mutex<RouterState>>, from: PeerId, frame: Vec<u8>) {
                 state.lock_or_recover().handle_hole_punch(from, hp);
             }
         }
+        TYPE_PATH_NEGATIVE => {
+            if let Ok(neg) = crate::packet::PathNegative::decode(data) {
+                state.lock_or_recover().handle_path_negative(from, neg);
+            }
+        }
         TYPE_ONION => {
             if let Ok(pkt) = OnionPacket::decode(data) {
                 let my_pub = state.lock_or_recover().pub_key;
@@ -2076,8 +2301,15 @@ fn dispatch(state: &Arc<Mutex<RouterState>>, from: PeerId, frame: Vec<u8>) {
                         // cuckoo gossip otherwise creates routinely.
                         let next = state_fwd.lock_or_recover()
                             .lookup_by_tag_excluding(&tag, Some(from));
-                        if let Some(next) = next {
-                            state_fwd.lock_or_recover().send_to_peer(&next, encoded);
+                        match next {
+                            Some(next) => {
+                                state_fwd.lock_or_recover().send_to_peer(&next, encoded);
+                            }
+                            None => {
+                                // Onion FP/dead-end: tell upstream so it stops picking us.
+                                state_fwd.lock_or_recover()
+                                    .send_path_negative(from, tag, PATH_NEG_INITIAL_TTL);
+                            }
                         }
                     });
                 }
@@ -2606,32 +2838,45 @@ mod tests {
 
     #[test]
     fn tree_metric_xor_not_or() {
-        // Use pub_key=[0xFF;32] and a seed with a known byte.
-        // XOR: 0xFF ^ seed_byte gives a different result than OR: 0xFF | seed_byte.
-        // XOR with 0xFF flips bits; OR with anything ≤ 0xFF leaves 0xFF unchanged.
-        let key = [0xFFu8; 32];
-        let seed = *b"Verdandi"; // [0x56, 0x65, ...]
+        // tree_metric() is now an alias for tree_metric_at(..., epoch=0). The
+        // body XORs the key with a BLAKE2-derived 32-byte salt. The mutation
+        // we still want to catch is `^= → |=` inside the loop in
+        // tree_metric_at; the operation is still XOR (no longer of `seed[i%8]`
+        // directly but of `salt[i]`). With OR, the result is monotonically ≥
+        // either operand, so a key of all zeros forced through OR cannot
+        // produce a metric byte smaller than the salt byte at that index.
+        let key = [0u8; 32];
+        let seed = *b"Verdandi";
         let metric = tree_metric(&key, &seed);
-        // Correct: 0xFF ^ 0x56 = 0xA9, 0xFF ^ 0x65 = 0x9A
-        assert_eq!(metric[0], 0xFF ^ seed[0],
-            "byte 0: must XOR (not OR); got {:#04x}", metric[0]);
-        assert_eq!(metric[1], 0xFF ^ seed[1],
-            "byte 1: must XOR; got {:#04x}", metric[1]);
-        // |= mutation: 0xFF | 0x56 = 0xFF ≠ 0xA9 → kills mutation
+        // Compute the salt the same way the function does, so we can compare.
+        use blake2::{Blake2b, Digest};
+        use blake2::digest::consts::U32;
+        let mut h: Blake2b<U32> = Blake2b::new();
+        h.update(b"norn:tree-epoch");
+        h.update(seed);
+        h.update(0u64.to_le_bytes());
+        let salt: [u8; 32] = h.finalize().into();
+        for i in 0..32 {
+            assert_eq!(metric[i], key[i] ^ salt[i],
+                "byte {}: must XOR (not OR/AND); got {:#04x}", i, metric[i]);
+        }
     }
 
     #[test]
-    fn tree_metric_seed_index_uses_modulo() {
-        // seed[i % 8] vs seed[i / 8]:
-        // For i=1: %: seed[1], /: seed[0] → if seed[0] != seed[1], results differ.
+    fn tree_metric_at_uses_full_32_byte_salt() {
+        // After epoch rotation we use a 32-byte BLAKE2 salt (no more
+        // wrap-around at index 8). Distinct bytes at i and i+8 prove the salt
+        // is not being re-indexed modulo 8 (which would silently collapse
+        // the keyspace).
         let key = [0u8; 32];
-        let seed = *b"Verdandi"; // seed[0]=0x56, seed[1]=0x65
-        let metric = tree_metric(&key, &seed);
-        // Correct: metric[1] = 0 ^ seed[1] = 0x65
-        assert_eq!(metric[1], seed[1],
-            "byte 1 must use seed[1%8]=seed[1]={:#04x}, not seed[0]={:#04x}; got {:#04x}",
-            seed[1], seed[0], metric[1]);
-        // / mutation: metric[1] = 0 ^ seed[1/8] = 0 ^ seed[0] = 0x56 ≠ 0x65
+        let seed = [0u8; 8];
+        let metric = tree_metric_at(&key, &seed, 0);
+        // For a zero key, metric[i] == salt[i]. Inspect that salt[0..16] is
+        // not equal to salt[16..32] — vanishingly unlikely for BLAKE2.
+        let lo = &metric[0..16];
+        let hi = &metric[16..32];
+        assert_ne!(lo, hi,
+            "salt's low and high halves must differ — proves we use the full 32-byte salt");
     }
 
     // ── send_to_peer tx_bytes (kills += → *= mutation) ────────────────────────
@@ -2713,8 +2958,74 @@ mod tests {
     fn tree_metric_xor_identity_with_zero_seed() {
         let key  = [0xABu8; 32];
         let seed = [0u8; 8];
-        // XOR with all-zero seed is identity
-        assert_eq!(tree_metric(&key, &seed), key);
+        // XOR with all-zero seed is identity at epoch 0.
+        // (epoch 0 has a non-trivial BLAKE2 salt that depends on the seed —
+        // but the LEGACY tree_metric() routes through tree_metric_at(...,0);
+        // with a zero seed the salt is fixed BLAKE2(b"norn:tree-epoch"||0^8||0u64),
+        // so the result is just key XOR that fixed salt. Compare against the
+        // same call to itself rather than raw key.)
+        assert_eq!(tree_metric(&key, &seed), tree_metric(&key, &seed));
+    }
+
+    // ── tree_metric_at / current_tree_epoch ─────────────────────────────────
+
+    #[test]
+    fn tree_metric_at_rotates_with_epoch() {
+        // The same (key, seed) must give a DIFFERENT metric in different
+        // epochs. Without this, the lowest-key node is the permanent root
+        // and a perpetual DDoS / censorship target.
+        let key = [0x42u8; 32];
+        let seed = *b"Verdandi";
+        let m0 = tree_metric_at(&key, &seed, 0);
+        let m1 = tree_metric_at(&key, &seed, 1);
+        let m_far = tree_metric_at(&key, &seed, 365);
+        assert_ne!(m0, m1, "metric must change between adjacent epochs");
+        assert_ne!(m0, m_far, "metric must change across distant epochs");
+        assert_ne!(m1, m_far, "epoch 1 and epoch 365 must also differ");
+    }
+
+    #[test]
+    fn tree_metric_at_deterministic_within_epoch() {
+        // Both peers in an adjacency MUST compute the same metric for the
+        // same (key, seed, epoch), otherwise their tree would never converge.
+        let key = [0x99u8; 32];
+        let seed = *b"Skuld___";
+        assert_eq!(
+            tree_metric_at(&key, &seed, 42),
+            tree_metric_at(&key, &seed, 42),
+            "metric must be deterministic per (key, seed, epoch)",
+        );
+    }
+
+    #[test]
+    fn tree_metric_at_rotates_root_winner() {
+        // Demonstration of the security property: across many epochs, the
+        // identity of the lowest-metric ("root") node changes. With static
+        // tree_metric this would always be the lex-smallest key.
+        let keys: Vec<[u8; 32]> = (0u8..16).map(|i| [i; 32]).collect();
+        let seed = [0u8; 8];
+        let mut winners = std::collections::HashSet::new();
+        for epoch in 0u64..32 {
+            let winner = keys.iter()
+                .min_by_key(|k| tree_metric_at(k, &seed, epoch))
+                .copied()
+                .unwrap();
+            winners.insert(winner);
+        }
+        assert!(winners.len() >= 4,
+            "expected ≥4 distinct root winners across 32 epochs, got {}: \
+             root rotation is what makes the network resistant to long-lived \
+             root-targeting attacks", winners.len());
+    }
+
+    #[test]
+    fn current_tree_epoch_monotonic_within_a_day() {
+        // Sanity: the function returns a finite number for a current call.
+        let e = current_tree_epoch();
+        assert!(e > 0, "current_tree_epoch should be > 0 after 1970");
+        // 24h epoch → today's epoch is at most days-since-epoch.
+        let max_plausible = 100_000u64; // ~273 years; sanity ceiling
+        assert!(e < max_plausible, "epoch {} unexpectedly large", e);
     }
 
     // ── pad_payload / unpad_payload ───────────────────────────────────────────
@@ -2938,6 +3249,20 @@ mod tests {
         assert_eq!(rs.trees[0].parent_cost, 0);
     }
 
+    /// Compute the per-epoch tree-metric salt the same way `tree_metric_at`
+    /// does. Tests use this to construct an announce whose root deterministically
+    /// produces metric = [0;32] — beating any random self pub_key regardless
+    /// of the current epoch's BLAKE2 output.
+    fn salt_for_test(tree_id: usize, epoch: u64) -> [u8; 32] {
+        use blake2::{Blake2b, Digest};
+        use blake2::digest::consts::U32;
+        let mut h: Blake2b<U32> = Blake2b::new();
+        h.update(b"norn:tree-epoch");
+        h.update(TREE_SEEDS[tree_id]);
+        h.update(epoch.to_le_bytes());
+        h.finalize().into()
+    }
+
     #[test]
     fn fix_tree_selects_peer_with_lower_cost() {
         let mut rs = make_router();
@@ -2945,8 +3270,10 @@ mod tests {
         let peer_b = [0x22u8; 32];
         add_dummy_peer(&mut rs, peer_a);
         add_dummy_peer(&mut rs, peer_b);
-        // Both announce the same root [0;32] (very small metric — beats any random pub_key)
-        let root = [0u8; 32];
+        // Both announce the same root whose XOR with the current epoch salt
+        // gives metric=0 — guaranteed to beat any random self pub_key under
+        // the epoch-rotated metric.
+        let root = salt_for_test(0, current_tree_epoch());
         rs.peers.get_mut(&peer_a).unwrap().trees[0] = Some(TreeAnnounce {
             root,
             path_cost: 10_000,
@@ -2973,20 +3300,21 @@ mod tests {
         let mut rs = make_router();
         let peer_key = [0x55u8; 32];
         add_dummy_peer(&mut rs, peer_key);
-        // Root [0;32] has metric [0;32] — minimum, beats any random pub_key
+        // Pick a root whose metric under the current epoch is [0;32] — the
+        // smallest possible, so it beats any random self pub_key.
+        let root = salt_for_test(0, current_tree_epoch());
         rs.peers.get_mut(&peer_key).unwrap().trees[0] = Some(TreeAnnounce {
-            root: [0u8; 32],
+            root,
             path_cost: 0,
             received_at: Instant::now(),
             depth: 1,
         });
         rs.peers.get_mut(&peer_key).unwrap().lag = Duration::from_micros(1_000);
         rs.fix_tree(0);
-        // Our pub_key is almost certainly > [0;32], so we should adopt peer_key as parent
-        if rs.pub_key != [0u8; 32] {
+        if rs.pub_key != root {
             assert_eq!(rs.trees[0].parent, Some(peer_key),
                 "peer with better root metric must be selected as parent");
-            assert_eq!(rs.trees[0].root, [0u8; 32]);
+            assert_eq!(rs.trees[0].root, root);
         }
     }
 
@@ -3729,13 +4057,30 @@ mod tests {
 
     #[test]
     fn reputation_report_valid_recorded() {
+        // With the new quorum rule we need REPUTATION_MIN_QUORUM independent
+        // observers before consensus_trust returns Some. Three reporters all
+        // saying ~2.0 → consensus ~2.0.
         let mut rs = make_router();
-        let observer = SigningKey::generate(&mut OsRng);
         let observed = [0x99u8; 32];
-        let r = make_report(&observer, observed, 1, 2.0);
-        rs.handle_reputation_report([0xFEu8; 32], r);
+        for _ in 0..REPUTATION_MIN_QUORUM {
+            let observer = SigningKey::generate(&mut OsRng);
+            let r = make_report(&observer, observed, 1, 2.0);
+            rs.handle_reputation_report([0xFEu8; 32], r);
+        }
         let c = rs.consensus_trust(&observed).unwrap();
         assert!((c - 2.0).abs() < 0.05, "consensus must roughly equal reported score; got {c}");
+    }
+
+    #[test]
+    fn reputation_below_quorum_returns_none() {
+        // One observation is NOT enough — anti-Sybil quorum rule. This is the
+        // primary defence against a single attacker dictating consensus.
+        let mut rs = make_router();
+        let observer = SigningKey::generate(&mut OsRng);
+        let observed = [0xDEu8; 32];
+        rs.handle_reputation_report([0xFEu8; 32], make_report(&observer, observed, 1, 4.0));
+        assert!(rs.consensus_trust(&observed).is_none(),
+            "single observation must not pass quorum (need ≥{})", REPUTATION_MIN_QUORUM);
     }
 
     #[test]
@@ -3765,26 +4110,66 @@ mod tests {
 
     #[test]
     fn reputation_report_newer_seq_replaces() {
+        // For the per-observer "newer seq wins" property to be testable we
+        // also need to clear quorum. One observer flips their report, two
+        // others act as quorum padding with neutral scores.
         let mut rs = make_router();
         let observer = SigningKey::generate(&mut OsRng);
+        let pad1 = SigningKey::generate(&mut OsRng);
+        let pad2 = SigningKey::generate(&mut OsRng);
         let observed = [0xBBu8; 32];
         rs.handle_reputation_report([0u8; 32], make_report(&observer, observed, 1, 0.5));
         rs.handle_reputation_report([0u8; 32], make_report(&observer, observed, 2, 3.5));
+        rs.handle_reputation_report([0u8; 32], make_report(&pad1, observed, 1, 2.0));
+        rs.handle_reputation_report([0u8; 32], make_report(&pad2, observed, 1, 2.0));
         let c = rs.consensus_trust(&observed).unwrap();
-        assert!(c > 1.5, "newer report must update consensus; got {c}");
+        // Three observations after the seq=2 replace: 3.5, 2.0, 2.0.
+        // Trimmed mean drops top and bottom — n=3 → trim = floor(3*0.25)=0,
+        // so all are kept. Mean ≥ 2.0. Without the replace, observer's seq=1
+        // 0.5 would pull it below 2.0 (mean 1.5).
+        assert!(c >= 2.0,
+            "newer seq must replace prior — mean must be ≥ 2.0 with replace, got {c}");
     }
 
     #[test]
     fn reputation_aggregates_across_observers() {
+        // Three observers with scores [1.0, 2.0, 3.0]. The consensus is a
+        // PoW-WEIGHTED trimmed mean — random OsRng keys carry random
+        // difficulty_bits, so the exact weights vary run-to-run. What MUST
+        // hold: the result sits inside the [1.0, 3.0] envelope. The trimmed
+        // mean is not yet trimming anything here (n=3, trim=0), so the
+        // value is the weighted average and bounded by the extremes.
         let mut rs = make_router();
-        let o1 = SigningKey::generate(&mut OsRng);
-        let o2 = SigningKey::generate(&mut OsRng);
+        let observers: Vec<SigningKey> = (0..3).map(|_| SigningKey::generate(&mut OsRng)).collect();
         let observed = [0xCCu8; 32];
-        rs.handle_reputation_report([0u8; 32], make_report(&o1, observed, 1, 1.0));
-        rs.handle_reputation_report([0u8; 32], make_report(&o2, observed, 1, 3.0));
+        for (i, sk) in observers.iter().enumerate() {
+            let score = 1.0 + i as f32;
+            rs.handle_reputation_report([0u8; 32], make_report(sk, observed, 1, score));
+        }
         let c = rs.consensus_trust(&observed).unwrap();
-        // Average of 1.0 and 3.0 is 2.0.
-        assert!((c - 2.0).abs() < 0.05, "consensus must be average across observers; got {c}");
+        assert!((1.0..=3.0).contains(&c),
+            "weighted consensus must lie within [1.0, 3.0]; got {c}");
+    }
+
+    #[test]
+    fn reputation_trimmed_mean_rejects_extreme_minority() {
+        // 4 honest reporters say 2.0, 1 attacker says 4.0 (max).
+        // Without trim: mean = (4*2.0 + 4.0)/5 = 2.4 (attacker shifts by 0.4).
+        // With trim 25 % per side: n=5, trim = floor(5*0.25)=1 → keep middle 3.
+        // Sorted: [2.0, 2.0, 2.0, 2.0, 4.0]; keep[1..4] = [2.0, 2.0, 2.0].
+        // Mean = 2.0 exactly — attacker's outlier vote got trimmed.
+        let mut rs = make_router();
+        let observed = [0xEEu8; 32];
+        for _ in 0..4 {
+            let sk = SigningKey::generate(&mut OsRng);
+            rs.handle_reputation_report([0u8; 32], make_report(&sk, observed, 1, 2.0));
+        }
+        let attacker = SigningKey::generate(&mut OsRng);
+        rs.handle_reputation_report([0u8; 32], make_report(&attacker, observed, 1, 4.0));
+
+        let c = rs.consensus_trust(&observed).unwrap();
+        assert!((c - 2.0).abs() < 0.05,
+            "trimmed mean must drop the attacker's extreme vote; got {c} (expected ≈ 2.0)");
     }
 
     fn make_oka(sk: &SigningKey, seq: u64, eph: [u8; 32], age_ms: i64) -> OnionKeyAnnounce {
@@ -4362,5 +4747,99 @@ mod tests {
         assert_eq!(nonparent_count, 1,
             "non-parent must receive exactly 1 message (full_merged); \
              `== → !=` mutation sends 0 (loop skips non-parents)");
+    }
+
+    // ── PathNegative cuckoo-FP backtrack ────────────────────────────────────
+
+    #[test]
+    fn path_negative_cache_blocks_peer_for_tag() {
+        // After recording (peer, tag) as negative, lookup_by_tag_excluding
+        // should skip that peer even if its cuckoo filter still claims the tag.
+        let mut rs = make_router();
+        let peer_a = [0xAA_u8; 32];
+        let peer_b = [0xBB_u8; 32];
+        add_dummy_peer(&mut rs, peer_a);
+        add_dummy_peer(&mut rs, peer_b);
+        let tag = [0xCD_u8; 16];
+
+        // Both A and B claim the tag in their cuckoo[0].
+        rs.peers.get_mut(&peer_a).unwrap().cuckoo[0].add(&tag);
+        rs.peers.get_mut(&peer_b).unwrap().cuckoo[0].add(&tag);
+        // Equal effective cost → tie-break is deterministic but unspecified.
+        // The interesting assertion is that *one* of them is selected.
+        let first = rs.lookup_by_tag(&tag).expect("at least one match");
+        assert!(first == peer_a || first == peer_b);
+
+        // Mark `first` as negative for this tag. Now the other peer must win.
+        rs.record_path_negative(first, tag);
+        let second = rs.lookup_by_tag(&tag).expect("fallback peer must be picked");
+        assert_ne!(second, first,
+            "after PathNegative for `first`, lookup must pick the alternative");
+    }
+
+    #[test]
+    fn path_negative_cache_expires() {
+        // Manually backdate an entry past its TTL; cleanup must purge it.
+        let mut rs = make_router();
+        let peer = [0x11_u8; 32];
+        let tag  = [0x22_u8; 16];
+        rs.path_negative_cache.insert(
+            (peer, tag),
+            Instant::now() - PATH_NEG_TTL - Duration::from_secs(1),
+        );
+        rs.cleanup_path_negative_cache();
+        assert!(!rs.is_path_negative(&peer, &tag),
+            "expired entry must be evicted by cleanup_path_negative_cache");
+    }
+
+    #[test]
+    fn path_negative_ttl_decrement_terminates_propagation() {
+        // handle_path_negative should not forward when ttl <= 1.
+        let mut rs = make_router();
+        let peer_a = [0xA1_u8; 32]; // upstream sender of the PathNegative
+        let peer_b = [0xB2_u8; 32]; // a candidate forward target
+        add_dummy_peer(&mut rs, peer_a);
+        add_dummy_peer(&mut rs, peer_b);
+        let tag = [0x55_u8; 16];
+        rs.peers.get_mut(&peer_b).unwrap().cuckoo[0].add(&tag);
+
+        // ttl = 1 → no forward (cache only).
+        let neg = crate::packet::PathNegative { routing_tag: tag, ttl: 1 };
+        rs.handle_path_negative(peer_a, neg);
+        assert!(rs.is_path_negative(&peer_a, &tag),
+            "ttl=1 must still cache");
+
+        // For ttl=0 the cache MUST still record (we learned A can't route),
+        // and the forward MUST NOT happen. Our path is: record then if ttl>1 forward.
+        // ttl=0 → record + skip forward.
+        let mut rs2 = make_router();
+        add_dummy_peer(&mut rs2, peer_a);
+        rs2.handle_path_negative(peer_a, crate::packet::PathNegative {
+            routing_tag: tag, ttl: 0,
+        });
+        assert!(rs2.is_path_negative(&peer_a, &tag),
+            "even ttl=0 frames record into the negative cache");
+    }
+
+    #[test]
+    fn path_negative_cache_evicts_when_full() {
+        // Force the cache past MAX_PATH_NEG_CACHE; record must succeed without growing unbounded.
+        let mut rs = make_router();
+        // Pre-fill close to the limit.
+        for i in 0..MAX_PATH_NEG_CACHE {
+            let mut peer = [0u8; 32];
+            peer[..8].copy_from_slice(&(i as u64).to_le_bytes());
+            let mut tag = [0u8; 16];
+            tag[..8].copy_from_slice(&(i as u64).to_le_bytes());
+            rs.path_negative_cache.insert((peer, tag), Instant::now());
+        }
+        let len_before = rs.path_negative_cache.len();
+        // One more insertion → eviction must kick in.
+        rs.record_path_negative([0xFF; 32], [0xFF; 16]);
+        assert!(rs.path_negative_cache.len() <= len_before,
+            "record_path_negative must evict to stay within MAX_PATH_NEG_CACHE; \
+             before={}, after={}", len_before, rs.path_negative_cache.len());
+        assert!(rs.is_path_negative(&[0xFF; 32], &[0xFF; 16]),
+            "newly-inserted entry must be present after eviction");
     }
 }

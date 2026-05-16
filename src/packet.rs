@@ -20,6 +20,11 @@ pub const TYPE_ONION: u8 = 11;
 pub const TYPE_ONION_KEY_ANNOUNCE: u8 = 12;
 pub const TYPE_REPUTATION_REPORT: u8 = 13;
 pub const TYPE_HOLE_PUNCH: u8 = 14;
+/// "Don't try me for this tag" backtrack frame. Sent upstream when a forwarder
+/// has no route for a routing_tag the cuckoo filter promised (false positive)
+/// or when TTL runs out. Receiver caches (peer, tag) as a negative entry for
+/// a short TTL so the next packet picks an alternative neighbour.
+pub const TYPE_PATH_NEGATIVE: u8 = 15;
 
 /// Encode a uvarint into a byte buffer.
 // Skip all mutations of this function: two are permanently untestable —
@@ -409,6 +414,42 @@ impl PathBroken {
         source.copy_from_slice(&data[32..64]);
         let (id, _) = decode_uvarint(&data[64..])?;
         Ok(PathBroken { target, source, id })
+    }
+}
+
+/// "Don't try me for this tag" frame. Sent by a forwarder UPSTREAM when it
+/// could not route a packet for `routing_tag` — either its cuckoo claim was
+/// a false positive, or it hit TTL with no progress. The upstream caches
+/// (sender, routing_tag) so subsequent packets pick a different neighbour
+/// instead of re-walking the dead end. This is the missing feedback channel
+/// for the cuckoo-filter probabilistic-routing layer: it bounds FP cost to
+/// one wasted forward per (peer, tag) per cache TTL, instead of permanently
+/// losing every packet that lands on a stale FP.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PathNegative {
+    pub routing_tag: [u8; 16],
+    /// Hop count remaining (TTL) for the negative frame itself, so an
+    /// adversary cannot create a routing loop by forging endless PathNegative.
+    pub ttl: u8,
+}
+
+impl PathNegative {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(1 + 16 + 1);
+        buf.push(TYPE_PATH_NEGATIVE);
+        buf.extend_from_slice(&self.routing_tag);
+        buf.push(self.ttl);
+        buf
+    }
+
+    pub fn decode(data: &[u8]) -> Result<Self> {
+        if data.len() < 16 + 1 {
+            bail!("PathNegative too short");
+        }
+        let mut routing_tag = [0u8; 16];
+        routing_tag.copy_from_slice(&data[..16]);
+        let ttl = data[16];
+        Ok(PathNegative { routing_tag, ttl })
     }
 }
 
@@ -1151,6 +1192,33 @@ mod tests {
     fn path_broken_decode_truncated_fails() {
         assert!(PathBroken::decode(&[]).is_err());
         assert!(PathBroken::decode(&[0u8; 31]).is_err()); // needs 64 bytes
+    }
+
+    // ── PathNegative roundtrip ──────────────────────────────────────────────
+
+    #[test]
+    fn path_negative_roundtrip() {
+        let neg = PathNegative { routing_tag: [0xABu8; 16], ttl: 4 };
+        let enc = neg.encode();
+        assert_eq!(enc[0], TYPE_PATH_NEGATIVE);
+        let dec = PathNegative::decode(&enc[1..]).unwrap();
+        assert_eq!(dec, neg);
+    }
+
+    #[test]
+    fn path_negative_decode_truncated_fails() {
+        // Needs 17 bytes (16 tag + 1 ttl).
+        assert!(PathNegative::decode(&[]).is_err());
+        assert!(PathNegative::decode(&[0u8; 16]).is_err(), "16 bytes missing ttl");
+    }
+
+    #[test]
+    fn path_negative_encode_size_is_18() {
+        // 1 type byte + 16 tag + 1 ttl = 18 bytes. Cheaper than a Traffic frame
+        // by an order of magnitude — backtrack must not become a DoS vector.
+        let neg = PathNegative { routing_tag: [0u8; 16], ttl: 4 };
+        assert_eq!(neg.encode().len(), 18,
+            "PathNegative wire size must be 18 bytes (1 type + 16 tag + 1 ttl)");
     }
 
     // ── PathLookup / PathNotify / PathBroken 64-byte boundary ────────────────
