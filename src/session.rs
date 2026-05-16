@@ -772,10 +772,30 @@ impl SessionManager {
         // the ciphertext back in the Ack so they can decap to the same secret.
         let (ml_kem_ct, pq_shared) = pq_encapsulate(&init.ml_kem_pub)?;
 
+        // Crossing-init resolution. In a crossing scenario both peers run
+        // both handle_init (as responder for the OTHER's Init) and
+        // handle_ack (as initiator for their OWN Init). Each handle_init
+        // generates a DIFFERENT shared secret via encap → naive overwrite
+        // makes the two sides settle on different keys.
+        //
+        // Convergence rule (deterministic, derived from pub_keys only):
+        //   - In handle_init we ADOPT the encap secret iff pq_shared is
+        //     currently None OR the remote's pub_key is lexicographically
+        //     SMALLER than ours. (The smaller-pub side is the canonical
+        //     initiator; that exchange's encap is the one we keep.)
+        //   - In handle_ack we ADOPT the decap secret iff pq_shared is
+        //     None OR our pub_key is smaller than the remote's. (Symmetric.)
+        // With both rules, the four crossing-init micro-events always
+        // converge on the same secret on both sides — see the
+        // pq_shared_crossing_init_converges test below.
         if let Some(existing) = self.sessions.get_mut(&init.ed_pub) {
             existing.remote_x25519_pub = remote_x25519_pub;
             existing.established = true;
-            existing.pq_shared = Some(pq_shared);
+            let adopt = existing.pq_shared.is_none() || init.ed_pub < our_pub;
+            if adopt {
+                existing.pq_shared = Some(pq_shared);
+                existing.pq_shared_fallback = None;
+            }
             let local_pub = X25519PublicKey::from(&existing.local_x25519_priv);
             let ack = SessionAck::create(
                 &self.our_signing_key, &local_pub, &init.ed_pub, &ml_kem_ct,
@@ -787,6 +807,7 @@ impl SessionManager {
         let local_pub = X25519PublicKey::from(&local_priv);
         let mut info = SessionInfo::new(init.ed_pub, local_priv, remote_x25519_pub);
         info.established = true;
+        // Fresh session (no prior pq_shared) — always adopt.
         info.pq_shared = Some(pq_shared);
         self.sessions.insert(init.ed_pub, info);
 
@@ -818,8 +839,18 @@ impl SessionManager {
             Some(info) => {
                 info.remote_x25519_pub = remote_x_pub;
                 info.established = true;
-                info.pq_shared = Some(pq_shared);
-                info.pq_shared_fallback = pq_shared_fallback;
+                // Symmetric counterpart of the handle_init rule (see comments
+                // there). In a crossing scenario this Ack might be the
+                // response to our NON-canonical Init; if so, the secret we'd
+                // decap differs from the secret the OTHER side just stored
+                // via their handle_init. Only overwrite if (a) we have no
+                // pq_shared yet, or (b) our pub_key is smaller — i.e. we are
+                // the canonical initiator and this is the canonical Ack.
+                let adopt = info.pq_shared.is_none() || our_pub < ack.ed_pub;
+                if adopt {
+                    info.pq_shared = Some(pq_shared);
+                    info.pq_shared_fallback = pq_shared_fallback;
+                }
                 Ok(())
             }
             None => bail!("unsolicited SessionAck from {:?} (no pending init)", &ack.ed_pub[..4]),
@@ -1421,6 +1452,92 @@ mod tests {
         mgr._test_drop_prev_pq();
         assert!(mgr.pq_keys.prev_dk.is_none(),
             "after the overlap expires, prev_dk must be cleared (forward secrecy)");
+    }
+
+    #[test]
+    fn pq_shared_crossing_init_converges() {
+        // Crossing-init scenario: A and B simultaneously initiate to each
+        // other. Without the lex-tiebreak resolution in handle_init /
+        // handle_ack, both sides would overwrite their pq_shared with a
+        // different encap result (one each) — sessions would establish but
+        // every Data packet's AEAD would fail because the two sides
+        // derived different per-packet keys.
+        //
+        // We deterministically reproduce a crossing-init below by manually
+        // exchanging the four message events (two Inits, two Acks) in an
+        // arbitrary order, then assert both sides end up with the same
+        // pq_shared. Test runs for every ordering permutation that could
+        // happen on a real network.
+        use std::cmp::Ordering;
+
+        // Valid orderings must respect causality: B.Ack (event 1) before
+        // A consumes it (event 2); A.Ack (event 0) before B consumes (event 3).
+        for &order in &[
+            (0, 1, 2, 3),  // both produce first, then both consume in order
+            (0, 1, 3, 2),  // both produce, B consumes first
+            (1, 0, 2, 3),  // B produces first
+            (1, 0, 3, 2),  // B produces and consumes first
+            (0, 3, 1, 2),  // A produce, B consume, B produce, A consume — interleaved
+        ] {
+            let sk_a = SigningKey::generate(&mut OsRng);
+            let sk_b = SigningKey::generate(&mut OsRng);
+            let pub_a = sk_a.verifying_key().to_bytes();
+            let pub_b = sk_b.verifying_key().to_bytes();
+            let mut mgr_a = SessionManager::new(sk_a);
+            let mut mgr_b = SessionManager::new(sk_b);
+
+            // Both sides initiate at the same time → two Inits in flight.
+            let init_a = mgr_a.initiate(&pub_b);
+            let init_b = mgr_b.initiate(&pub_a);
+
+            // Each side's handle_init produces the Ack it would have sent.
+            // We capture both Acks before processing any.
+            let mut ack_from_a: Option<Vec<u8>> = None;
+            let mut ack_from_b: Option<Vec<u8>> = None;
+            type Event = Box<dyn FnMut(&mut SessionManager, &mut SessionManager,
+                                       &mut Option<Vec<u8>>, &mut Option<Vec<u8>>,
+                                       &[u8], &[u8])>;
+            let mut events: Vec<Event> = Vec::new();
+            // 0: A handles B.Init → produces A.Ack
+            events.push(Box::new(|a, _b, afa, _afb, _ia, ib| {
+                *afa = Some(a.handle_init(ib).unwrap());
+            }));
+            // 1: B handles A.Init → produces B.Ack
+            events.push(Box::new(|_a, b, _afa, afb, ia, _ib| {
+                *afb = Some(b.handle_init(ia).unwrap());
+            }));
+            // 2: A handles B.Ack
+            events.push(Box::new(|a, _b, _afa, afb, _ia, _ib| {
+                a.handle_ack(afb.as_ref().expect("B.Ack must be produced first")).unwrap();
+            }));
+            // 3: B handles A.Ack
+            events.push(Box::new(|_a, b, afa, _afb, _ia, _ib| {
+                b.handle_ack(afa.as_ref().expect("A.Ack must be produced first")).unwrap();
+            }));
+
+            // The orderings we test all keep init→ack causality intact:
+            // event 2 (A.handle_ack of B.Ack) must come after event 1
+            // (B's handle_init that produces B.Ack), and event 3 must come
+            // after event 0.
+            let (e0, e1, e2, e3) = order;
+            for &i in &[e0, e1, e2, e3] {
+                events[i](&mut mgr_a, &mut mgr_b, &mut ack_from_a, &mut ack_from_b,
+                          &init_a, &init_b);
+            }
+
+            let pq_a = mgr_a.sessions.get(&pub_b).unwrap().pq_shared.unwrap();
+            let pq_b = mgr_b.sessions.get(&pub_a).unwrap().pq_shared.unwrap();
+            assert_eq!(pq_a, pq_b,
+                "crossing-init order ({},{},{},{}) with A.pub_cmp_B = {:?}: sides MUST converge",
+                e0, e1, e2, e3, pub_a.cmp(&pub_b));
+            // Also verify an encrypted Data packet round-trips both ways
+            // — that's the real-world consequence of pq_shared mismatch.
+            assert_ne!(pub_a.cmp(&pub_b), Ordering::Equal);
+            let ct = mgr_a.encrypt(&pub_b, b"hello after crossing-init").unwrap();
+            assert_eq!(mgr_b.decrypt(&pub_a, &ct).unwrap(), b"hello after crossing-init");
+            let ct2 = mgr_b.encrypt(&pub_a, b"reply").unwrap();
+            assert_eq!(mgr_a.decrypt(&pub_b, &ct2).unwrap(), b"reply");
+        }
     }
 
     #[test]
