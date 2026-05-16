@@ -9,8 +9,9 @@ use proptest::prelude::*;
 use norn_rs::onion::OnionPacket;
 use norn_rs::packet::{
     decode_path, decode_uvarint, encode_path, encode_uvarint,
-    Announce, CoordAnnounce, CuckooMsg, OnionKeyAnnounce, PathBroken,
-    PathLookup, PathNotify, SigReq, SigRes, Traffic,
+    Announce, CoordAnnounce, CuckooMsg, HolePunch, OnionKeyAnnounce,
+    PathBroken, PathLookup, PathNotify, ReputationReport, SigReq, SigRes,
+    Traffic,
 };
 use norn_rs::session::{SessionAck, SessionInit};
 
@@ -79,6 +80,8 @@ decode_never_panics!(pathbroken_decode_no_panic,    PathBroken,     0, 256);
 decode_never_panics!(traffic_decode_no_panic,       Traffic,        0, 4096);
 decode_never_panics!(coord_announce_no_panic,       CoordAnnounce,  0, 256);
 decode_never_panics!(onion_key_ann_no_panic,        OnionKeyAnnounce, 0, 256);
+decode_never_panics!(reputation_report_no_panic,    ReputationReport, 0, 256);
+decode_never_panics!(hole_punch_no_panic,           HolePunch,      0, 256);
 decode_never_panics!(session_init_no_panic,         SessionInit,    0, 2048);
 decode_never_panics!(session_ack_no_panic,          SessionAck,     0, 2048);
 decode_never_panics!(onion_packet_decode_no_panic,  OnionPacket,    0, 4096);

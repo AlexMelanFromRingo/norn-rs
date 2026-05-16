@@ -4,6 +4,18 @@ This document is the normative reference for the `norn-rs` protocol as of
 version **0.4.0**. Implementations claiming compatibility MUST match this
 specification byte-for-byte.
 
+### 0.5 changes vs 0.4
+
+* **QUIC transport** alongside TCP. URI scheme `quic://host:port`.
+  Encrypted byte pipe via rustls with self-signed certs; authentication
+  still binds to Ed25519 via NRN1 (TLS cert is opportunistic).
+* **mDNS / DNS-SD discovery** on `_norn._tcp.local`.
+* **Reputation gossip** (TYPE 0x0D) — flooded signed trust reports;
+  consensus trust biases routing alongside local trust.
+* **HolePunch frame** (TYPE 0x0E) — minimal NAT-traversal primitive: A
+  asks rendezvous R to relay endpoint info to B for simultaneous QUIC
+  open. Operator-driven (callback hook).
+
 ### 0.4 changes vs 0.3
 
 * ML-KEM-768 long-term keypair now rotates every ~24h with a 60s overlap
@@ -112,6 +124,8 @@ first byte selects the type:
 | 0x0A | COORD_ANNOUNCE   | Hyperbolic coordinate broadcast (`§9`).    |
 | 0x0B | ONION            | Onion-wrapped Traffic packet (`§10`).      |
 | 0x0C | ONION_KEY_ANNOUNCE | Network-wide onion ephemeral pub flood (`§14`). |
+| 0x0D | REPUTATION_REPORT  | Signed trust observation flooded mesh-wide (`§15`). |
+| 0x0E | HOLE_PUNCH         | NAT-traversal endpoint-exchange relay (`§16`). |
 
 ## 4. Sig request / response
 
@@ -389,6 +403,60 @@ Forwarding rules:
 * Keep per-origin only the highest `seq` seen.
 * On first-sight of a strictly newer `(origin, seq)`, forward to every
   peer except the sender.
+
+## 15. REPUTATION_REPORT (0x0D)
+
+Per-peer signed trust observation flooded through the mesh. Receivers
+aggregate per `observed` into a "consensus trust" that biases routing.
+
+Wire layout (180 bytes):
+
+```
+[observer: 32]
+[observed: 32]
+[score_q16: u16 LE]      — score in [0..1], quantised to u16
+[seq: u64 LE]            — monotonic per (observer, observed)
+[valid_from_ms: u64 LE]
+[sig: 64]                — Ed25519 over the prefix
+```
+
+Forwarding rules:
+* Reject if `observer == observed` (no self-praise).
+* Reject if `observer == own pub_key` (no spoofing as us).
+* Reject if signature doesn't verify against `observer`.
+* Reject if `valid_from_ms` outside ±60 s skew window or older than 1 h.
+* Forward on first-sight of strictly newer (observer, observed, seq).
+
+Receivers de-quantise `score_q16` back to a float in `[TRUST_MIN..TRUST_MAX]`
+and compute `consensus_trust(observed) = mean(score over observers)`,
+which is averaged with local trust for routing decisions.
+
+## 16. HOLE_PUNCH (0x0E)
+
+NAT-traversal coordination frame. A peer A behind NAT sends a HolePunch
+addressed to a target B via a rendezvous R that is connected to both.
+R relays the frame to B; both A and B then simultaneously open outbound
+QUIC connections to each other's reported endpoints.
+
+Wire layout (≥ 137 bytes):
+
+```
+[initiator: 32]
+[target: 32]
+[valid_from_ms: u64 LE]
+[endpoint_len: u8]
+[endpoint: endpoint_len]    — A's externally-observed transport endpoint
+[sig: 64]                   — Ed25519 over the prefix
+```
+
+Forwarding rules:
+* If `target == own pub_key` → fire the optional `on_hole_punch` callback.
+* Else if we have a route to `target` → forward the same frame onward.
+* Else → drop.
+* In all cases, verify signature and ±60 s freshness first; reject invalid.
+
+The frame is signed by the initiator so the rendezvous cannot forge an
+endpoint.
 
 ## 13. Discovery
 

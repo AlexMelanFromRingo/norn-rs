@@ -108,6 +108,24 @@ pub(crate) fn verify_handshake_sig(
 
 #[mutants::skip]
 async fn handshake(stream: &mut TcpStream, signing_key: &SigningKey) -> Result<[u8; 32]> {
+    let (mut reader, mut writer) = stream.split();
+    handshake_over_stream(&mut reader, &mut writer, signing_key).await
+}
+
+/// Generic NRN1 authenticated handshake over any AsyncRead+AsyncWrite pair.
+/// Extracted so the QUIC transport (`src/quic.rs`) can reuse exactly the
+/// same wire protocol as the TCP transport — peers on either transport
+/// authenticate identically.
+#[mutants::skip]
+pub async fn handshake_over_stream<R, W>(
+    reader: &mut R,
+    writer: &mut W,
+    signing_key: &SigningKey,
+) -> Result<[u8; 32]>
+where
+    R: tokio::io::AsyncRead + Unpin + Send,
+    W: tokio::io::AsyncWrite + Unpin + Send,
+{
     let our_pub = signing_key.verifying_key().to_bytes();
     let mut our_nonce = [0u8; 32];
     OsRng.fill_bytes(&mut our_nonce);
@@ -116,8 +134,6 @@ async fn handshake(stream: &mut TcpStream, signing_key: &SigningKey) -> Result<[
     hello.extend_from_slice(&HANDSHAKE_MAGIC);
     hello.extend_from_slice(&our_pub);
     hello.extend_from_slice(&our_nonce);
-
-    let (mut reader, mut writer) = stream.split();
 
     // Phase 1: exchange (magic, pub, nonce).
     let (send_res, recv_res) = tokio::join!(
@@ -139,11 +155,9 @@ async fn handshake(stream: &mut TcpStream, signing_key: &SigningKey) -> Result<[
     let mut their_nonce = [0u8; 32];
     their_nonce.copy_from_slice(&hello_in[36..68]);
 
-    // Refuse self-loops.
     if their_pub == our_pub {
         bail!("handshake: peer announced our own pub_key (self-loop)");
     }
-    // Sanity-check the remote pub_key is a valid ed25519 point before signing.
     VerifyingKey::from_bytes(&their_pub).context("handshake: malformed remote pub_key")?;
 
     // Phase 2: exchange signatures binding both nonces and identities.

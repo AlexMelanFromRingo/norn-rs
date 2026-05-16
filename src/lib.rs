@@ -17,5 +17,6 @@ pub mod mdns;
 pub mod metrics;
 pub mod node;
 pub mod peercache;
+pub mod quic;
 
 pub use router::{InboundPacket, PacketConn, PeerStats};

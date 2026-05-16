@@ -83,6 +83,12 @@ const MAX_INFLIGHT_FORWARDS: usize = 4_096;
 const ONION_REPLAY_CACHE_SIZE: usize = 4_096;
 /// Rotate the onion ephemeral key every N maintenance ticks (1 hour at 1 Hz).
 const ONION_KEY_ROTATION_TICKS: u32 = 3_600;
+/// Broadcast reputation reports about our direct peers every N ticks (~60s).
+const REPUTATION_REPORT_TICKS: u32 = 60;
+/// Maximum age (ms) of a reputation report we still trust / forward.
+const REPUTATION_VALIDITY_MS: u64 = 60 * 60 * 1_000; // 1h
+/// Cap on remembered reputation entries (per observed × per observer).
+const MAX_REPUTATION_OBSERVATIONS: usize = 16_384;
 /// Broadcast our OnionKeyAnnounce every N maintenance ticks (~5 min) and on rotation.
 const ONION_KEY_ANNOUNCE_TICKS: u32 = 300;
 /// Maximum age (ms) of an OnionKeyAnnounce that we still trust / forward.
@@ -193,9 +199,18 @@ impl PeerData {
 
     /// Trust-adjusted cost: low trust → high cost → de-prioritised in lookups.
     /// Caps at u64::MAX to avoid overflow.
+    #[allow(dead_code)] // kept for symmetry with `trust_adjusted_cost_with`; used by tests
     fn trust_adjusted_cost(&self) -> u64 {
+        self.trust_adjusted_cost_with(self.trust)
+    }
+
+    /// Same as `trust_adjusted_cost` but with the trust value supplied
+    /// externally — used by `lookup_by_tag_excluding` to blend the local
+    /// trust score with the network-consensus trust derived from
+    /// `ReputationReport` gossip.
+    fn trust_adjusted_cost_with(&self, trust: f32) -> u64 {
         let base = self.effective_cost() as f64;
-        let trust = self.trust.clamp(TRUST_MIN, TRUST_MAX) as f64;
+        let trust = trust.clamp(TRUST_MIN, TRUST_MAX) as f64;
         let adjusted = base / trust;
         if adjusted >= u64::MAX as f64 { u64::MAX } else { adjusted as u64 }
     }
@@ -249,7 +264,24 @@ struct RouterState {
     /// On matching PathNotify → boost trust + remove. On timeout (handled
     /// in cleanup_stale_probes) → decay trust + remove.
     pending_probes: HashMap<u64, (PeerId, Instant)>,
+    /// Reputation table: per observed peer, map of observer → (seq, score, recorded_at).
+    /// Populated from `ReputationReport` frames received from anywhere in
+    /// the mesh; used to compute consensus trust that biases lookups.
+    reputation: HashMap<[u8; 32], HashMap<[u8; 32], ReputationEntry>>,
+    /// Monotonic seq for our own outbound reputation reports.
+    own_reputation_seq: u64,
+    /// Optional callback fired when a HolePunch frame is received with us
+    /// as the target. Receives (initiator_pub_key, claimed_endpoint).
+    /// Operators set this via PacketConn::set_on_hole_punch to drive a
+    /// simultaneous outbound QUIC connect for symmetric-NAT traversal.
+    hole_punch_cb: Option<HolePunchCb>,
 }
+
+/// One observation in `reputation`.
+type ReputationEntry = (u64, f32, Instant);
+
+/// Callback alias for the hole-punch handler.
+type HolePunchCb = Arc<dyn Fn([u8; 32], String) + Send + Sync>;
 
 // ──────────────────────────────────────────────
 // Header privacy helpers (source + dest hiding)
@@ -472,6 +504,9 @@ impl RouterState {
             remote_onion_keys: HashMap::new(),
             own_onion_key_seq: 0,
             pending_probes: HashMap::new(),
+            reputation: HashMap::new(),
+            own_reputation_seq: 0,
+            hole_punch_cb: None,
         }
     }
 
@@ -783,6 +818,12 @@ impl RouterState {
         if self.tick.is_multiple_of(PROBE_INTERVAL_TICKS) && self.tick > 0 {
             self.probe_cuckoo_claim();
         }
+        // Reputation gossip: every minute send signed trust reports about
+        // each direct peer. Receivers aggregate into consensus_trust used
+        // alongside local trust in routing decisions.
+        if self.tick.is_multiple_of(REPUTATION_REPORT_TICKS) && self.tick > 0 {
+            self.broadcast_reputation();
+        }
         self.cleanup_stale_probes();
         self.cleanup_stale_lookups();
         self.cleanup_stale_sessions();
@@ -973,6 +1014,204 @@ impl RouterState {
                 debug!("probe {} via {:?} timed out → trust decayed to {}", id, &via[..4], peer.trust);
             }
         }
+    }
+
+    /// Periodic broadcast of signed reputation reports about each of our
+    /// direct peers' local trust scores. Receivers aggregate into a
+    /// "consensus trust" that biases their routing decisions.
+    #[mutants::skip]
+    fn broadcast_reputation(&mut self) {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let observer = self.pub_key;
+        let observed_with_trust: Vec<([u8; 32], f32)> = self.peers.values()
+            .map(|p| (p.pub_key, p.trust))
+            .collect();
+        for (observed, trust) in observed_with_trust {
+            self.own_reputation_seq += 1;
+            let seq = self.own_reputation_seq;
+            // Quantise trust to u16 over the configured [TRUST_MIN, TRUST_MAX].
+            // For wire compactness; receiver de-quantises.
+            let frac = ((trust - TRUST_MIN) / (TRUST_MAX - TRUST_MIN)).clamp(0.0, 1.0);
+            let score_q16 = (frac * u16::MAX as f32) as u16;
+            let unsigned = ReputationReport {
+                observer, observed, score_q16, seq, valid_from_ms: now_ms,
+                sig: [0u8; 64],
+            };
+            let sig = self.signing_key.sign(&unsigned.sign_bytes()).to_bytes();
+            let report = ReputationReport { sig, ..unsigned };
+            // Record ourselves so consensus_trust sees our own view too.
+            self.record_reputation(observer, observed, seq, report.score(), Instant::now());
+            let encoded = report.encode();
+            let peer_keys: Vec<PeerId> = self.peers.keys().copied().collect();
+            for pk in peer_keys {
+                self.send_to_peer(&pk, encoded.clone());
+            }
+        }
+    }
+
+    /// Handle an inbound reputation report from a peer (potentially originating
+    /// far away). Verify, dedup, store, forward to non-sender peers.
+    pub fn handle_reputation_report(&mut self, from: PeerId, r: ReputationReport) {
+        // Reject if observer signed about themselves (no information).
+        if r.observer == r.observed {
+            return;
+        }
+        // Reject self-origin (we shouldn't accept claims about us as if we made them).
+        if r.observer == self.pub_key {
+            return;
+        }
+        let vk = match VerifyingKey::from_bytes(&r.observer) {
+            Ok(v) => v,
+            Err(_) => return,
+        };
+        if vk.verify(&r.sign_bytes(), &ed25519_dalek::Signature::from_bytes(&r.sig)).is_err() {
+            warn!("invalid reputation report sig from observer {:?}", &r.observer[..4]);
+            return;
+        }
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let age = now_ms.saturating_sub(r.valid_from_ms);
+        if age > REPUTATION_VALIDITY_MS {
+            return;
+        }
+        if r.valid_from_ms > now_ms.saturating_add(60_000) {
+            return;
+        }
+        // Dedup: forward only if strictly newer seq from this (observer, observed).
+        let is_newer = self.reputation.get(&r.observed)
+            .and_then(|m| m.get(&r.observer))
+            .map(|(prev_seq, _, _)| r.seq > *prev_seq)
+            .unwrap_or(true);
+        if !is_newer {
+            return;
+        }
+        self.record_reputation(r.observer, r.observed, r.seq, r.score(), Instant::now());
+
+        // Flood to other peers.
+        let encoded = r.encode();
+        let peer_keys: Vec<PeerId> = self.peers.keys().copied().collect();
+        for pk in peer_keys {
+            if pk != from {
+                self.send_to_peer(&pk, encoded.clone());
+            }
+        }
+    }
+
+    /// Handle a HolePunch frame.
+    ///
+    /// Two cases:
+    ///
+    /// 1. `target == us` — we are the destination of the punch. Verify
+    ///    the initiator's signature, log the observed endpoint so an
+    ///    operator (or the on_hole_punch callback, if set) can act on it.
+    /// 2. `target != us` AND we have a session with `target` — we are
+    ///    the rendezvous. Verify and forward the same HolePunch frame
+    ///    to `target` through the routed overlay.
+    ///
+    /// In all other cases the frame is dropped.
+    pub fn handle_hole_punch(&mut self, _from: PeerId, hp: HolePunch) {
+        // Sig binds initiator+target+endpoint+ts → rendezvous can't forge.
+        let vk = match VerifyingKey::from_bytes(&hp.initiator) {
+            Ok(v) => v,
+            Err(_) => return,
+        };
+        if vk.verify(&hp.sign_bytes(), &ed25519_dalek::Signature::from_bytes(&hp.sig)).is_err() {
+            warn!("invalid HolePunch sig from {:?}", &hp.initiator[..4]);
+            return;
+        }
+        // Freshness ±60s.
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64).unwrap_or(0);
+        let skew = (now_ms as i64 - hp.valid_from_ms as i64).unsigned_abs();
+        if skew > 60_000 {
+            debug!("HolePunch outside freshness window, dropping");
+            return;
+        }
+
+        if hp.target == self.pub_key {
+            // We're the destination — dispatch the callback if registered.
+            if let Some(cb) = &self.hole_punch_cb {
+                let cb = cb.clone();
+                let initiator = hp.initiator;
+                let endpoint = hp.endpoint.clone();
+                tokio::spawn(async move { cb(initiator, endpoint) });
+            } else {
+                debug!("HolePunch for us from {:?} at {}, but no on_hole_punch handler set",
+                    &hp.initiator[..4], hp.endpoint);
+            }
+        } else {
+            // Relay role: forward the *same* signed frame to target via
+            // session-layer traffic if we have a session with target. We
+            // wrap it in send_traffic_to which will route through whichever
+            // next-hop currently knows target.
+            let encoded = hp.encode();
+            // send_traffic_to wraps as PKT_CONTROL with our identity as
+            // source. The target's TRAFFIC handler unpads then sees the
+            // HolePunch byte and re-dispatches. (Implemented as a
+            // bypass: forward as a raw routing frame instead.)
+            if let Some(next_hop) = self.lookup(&hp.target) {
+                self.send_to_peer(&next_hop, encoded);
+            } else {
+                debug!("HolePunch: no route to target {:?}, dropping", &hp.target[..4]);
+            }
+        }
+    }
+
+    /// Insert/update one observation; bound the table size by per-peer.
+    fn record_reputation(
+        &mut self,
+        observer: [u8; 32],
+        observed: [u8; 32],
+        seq: u64,
+        score: f32,
+        recorded_at: Instant,
+    ) {
+        // Cap total observations to avoid memory exhaustion. We evict a
+        // whole per-observed bucket (least useful) when the total crosses
+        // the limit and we're inserting into a new bucket.
+        let total: usize = self.reputation.values().map(|m| m.len()).sum();
+        if total >= MAX_REPUTATION_OBSERVATIONS && !self.reputation.contains_key(&observed) {
+            // Evict an arbitrary non-peer observed entry.
+            let victim = self.reputation.keys()
+                .find(|k| !self.peers.contains_key(*k) && **k != self.pub_key)
+                .copied();
+            if let Some(v) = victim {
+                self.reputation.remove(&v);
+            } else {
+                return;
+            }
+        }
+        self.reputation
+            .entry(observed)
+            .or_default()
+            .insert(observer, (seq, score, recorded_at));
+    }
+
+    /// Compute consensus trust for `observed`: average of all observers'
+    /// scores, with stale entries (> validity window) skipped. Returns None
+    /// if we have no observations.
+    pub fn consensus_trust(&self, observed: &[u8; 32]) -> Option<f32> {
+        let bucket = self.reputation.get(observed)?;
+        let cutoff = Instant::now().checked_sub(Duration::from_millis(REPUTATION_VALIDITY_MS))
+            .unwrap_or(Instant::now());
+        let mut sum = 0.0f64;
+        let mut count = 0usize;
+        for (_, score, t) in bucket.values() {
+            if *t < cutoff {
+                continue;
+            }
+            // Linear remap from [0..1] back to [TRUST_MIN..TRUST_MAX].
+            let real_trust = TRUST_MIN + score * (TRUST_MAX - TRUST_MIN);
+            sum += real_trust as f64;
+            count += 1;
+        }
+        if count == 0 { None } else { Some((sum / count as f64) as f32) }
     }
 
     /// Record a (potentially new) remote onion key. Caps the table at
@@ -1682,7 +1921,14 @@ impl RouterState {
             }
             for tree_id in 0..K {
                 if peer.cuckoo[tree_id].contains(tag) {
-                    let cost = peer.trust_adjusted_cost();
+                    // Combine local trust with network-consensus trust if
+                    // available; consensus = NULL → use local trust alone.
+                    let local = peer.trust;
+                    let combined = match self.consensus_trust(peer_key) {
+                        Some(c) => (local + c) * 0.5,
+                        None    => local,
+                    };
+                    let cost = peer.trust_adjusted_cost_with(combined);
                     let better = best.is_none_or(|(_, bc)| cost < bc);
                     if better {
                         best = Some((*peer_key, cost));
@@ -1794,6 +2040,16 @@ fn dispatch(state: &Arc<Mutex<RouterState>>, from: PeerId, frame: Vec<u8>) {
         TYPE_ONION_KEY_ANNOUNCE => {
             if let Ok(ann) = OnionKeyAnnounce::decode(data) {
                 state.lock_or_recover().handle_onion_key_announce(from, ann);
+            }
+        }
+        TYPE_REPUTATION_REPORT => {
+            if let Ok(r) = ReputationReport::decode(data) {
+                state.lock_or_recover().handle_reputation_report(from, r);
+            }
+        }
+        TYPE_HOLE_PUNCH => {
+            if let Ok(hp) = HolePunch::decode(data) {
+                state.lock_or_recover().handle_hole_punch(from, hp);
             }
         }
         TYPE_ONION => {
@@ -2260,6 +2516,34 @@ impl PacketConn {
     #[mutants::skip]
     pub async fn set_path_notify<F: Fn([u8; 32]) + Send + Sync + 'static>(&self, f: F) {
         self.inner.lock_or_recover().path_notify = Some(Arc::new(f));
+    }
+
+    /// Install a callback fired when a HolePunch frame is received with us
+    /// as the target. The transport layer wires this to issue a
+    /// simultaneous outbound QUIC connect for symmetric-NAT traversal.
+    #[mutants::skip]
+    pub fn set_on_hole_punch<F: Fn([u8; 32], String) + Send + Sync + 'static>(&self, f: F) {
+        self.inner.lock_or_recover().hole_punch_cb = Some(Arc::new(f));
+    }
+
+    /// Send a signed HolePunch frame to one of our peers, asking them to
+    /// relay our endpoint to `target`. `endpoint` is the address we'd like
+    /// `target` to dial back (usually our observed public IP:port from a
+    /// STUN-like query or operator knowledge).
+    #[mutants::skip]
+    pub fn send_hole_punch(&self, rendezvous: &[u8; 32], target: [u8; 32], endpoint: String) {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64).unwrap_or(0);
+        let initiator = self.pub_key;
+        let unsigned = HolePunch {
+            initiator, target, valid_from_ms: now_ms, endpoint,
+            sig: [0u8; 64],
+        };
+        let sig = self.signing_key.sign(&unsigned.sign_bytes()).to_bytes();
+        let hp = HolePunch { sig, ..unsigned };
+        let encoded = hp.encode();
+        self.inner.lock_or_recover().send_to_peer(rendezvous, encoded);
     }
 
     // Skip mutations: sends PathLookup to all peers — mutation detection requires
@@ -3326,6 +3610,182 @@ mod tests {
     }
 
     // ── OnionKeyAnnounce flood ──────────────────────────────────────────────
+
+    // ── HolePunch relay ────────────────────────────────────────────────────
+
+    fn make_hole_punch(initiator_sk: &SigningKey, target: [u8; 32], endpoint: &str) -> HolePunch {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64).unwrap_or(0);
+        let unsigned = HolePunch {
+            initiator: initiator_sk.verifying_key().to_bytes(),
+            target,
+            valid_from_ms: now_ms,
+            endpoint: endpoint.to_string(),
+            sig: [0u8; 64],
+        };
+        let sig = initiator_sk.sign(&unsigned.sign_bytes()).to_bytes();
+        HolePunch { sig, ..unsigned }
+    }
+
+    #[tokio::test]
+    async fn hole_punch_for_us_fires_callback() {
+        let mut rs = make_router();
+        let initiator = SigningKey::generate(&mut OsRng);
+        let own_pub = rs.pub_key;
+        let hp = make_hole_punch(&initiator, own_pub, "10.0.0.5:9001");
+
+        let received: Arc<std::sync::Mutex<Option<(PeerId, String)>>> =
+            Arc::new(std::sync::Mutex::new(None));
+        let received_clone = received.clone();
+        rs.hole_punch_cb = Some(Arc::new(move |pk, ep| {
+            *received_clone.lock().unwrap() = Some((pk, ep));
+        }));
+
+        rs.handle_hole_punch([0u8; 32], hp);
+        // Callback dispatches via tokio::spawn — wait briefly.
+        for _ in 0..20 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            if received.lock().unwrap().is_some() { break; }
+        }
+        let r = received.lock().unwrap().clone();
+        assert!(r.is_some(), "callback must fire on for-us HolePunch");
+        let (pk, ep) = r.unwrap();
+        assert_eq!(pk, initiator.verifying_key().to_bytes());
+        assert_eq!(ep, "10.0.0.5:9001");
+    }
+
+    #[test]
+    fn hole_punch_invalid_sig_rejected() {
+        let mut rs = make_router();
+        let initiator = SigningKey::generate(&mut OsRng);
+        let own_pub = rs.pub_key;
+        let mut hp = make_hole_punch(&initiator, own_pub, "1.2.3.4:9001");
+        hp.sig[0] ^= 0xFF;
+
+        let fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let f = fired.clone();
+        rs.hole_punch_cb = Some(Arc::new(move |_, _| {
+            f.store(true, std::sync::atomic::Ordering::SeqCst);
+        }));
+        rs.handle_hole_punch([0u8; 32], hp);
+        assert!(!fired.load(std::sync::atomic::Ordering::SeqCst),
+            "callback must not fire on bad signature");
+    }
+
+    #[test]
+    fn hole_punch_for_other_target_no_route_drops() {
+        let mut rs = make_router();
+        let initiator = SigningKey::generate(&mut OsRng);
+        let other_target = [0xCCu8; 32];   // not a peer of ours
+        let hp = make_hole_punch(&initiator, other_target, "1.2.3.4:9001");
+        // No route → handle_hole_punch logs and returns; nothing observable
+        // here beyond "no panic". The point of the test is to exercise the
+        // relay-mode code path without an asserting outcome.
+        rs.handle_hole_punch([0u8; 32], hp);
+    }
+
+    #[test]
+    fn hole_punch_relays_to_peer_with_route() {
+        let mut rs = make_router();
+        let initiator = SigningKey::generate(&mut OsRng);
+        let target = [0xCCu8; 32];
+        let (tx, mut rx) = mpsc::channel(64);
+        // Add `target` as a peer so lookup() resolves directly.
+        rs.add_peer(target, tx, 0);
+
+        let hp = make_hole_punch(&initiator, target, "203.0.113.7:9001");
+        rs.handle_hole_punch([0xAAu8; 32], hp.clone());
+
+        let forwarded = rx.try_recv().expect("HolePunch must be forwarded to target peer");
+        assert_eq!(forwarded[0], TYPE_HOLE_PUNCH,
+            "forwarded frame must be of HolePunch type");
+        // Decode and confirm contents are preserved.
+        let decoded = HolePunch::decode(&forwarded[1..]).unwrap();
+        assert_eq!(decoded.initiator, hp.initiator);
+        assert_eq!(decoded.endpoint, hp.endpoint);
+    }
+
+    // ── Reputation gossip ──────────────────────────────────────────────────
+
+    fn make_report(observer_sk: &SigningKey, observed: [u8; 32], seq: u64, score: f32) -> ReputationReport {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let frac = ((score - TRUST_MIN) / (TRUST_MAX - TRUST_MIN)).clamp(0.0, 1.0);
+        let score_q16 = (frac * u16::MAX as f32) as u16;
+        let unsigned = ReputationReport {
+            observer: observer_sk.verifying_key().to_bytes(),
+            observed,
+            score_q16,
+            seq,
+            valid_from_ms: now_ms,
+            sig: [0u8; 64],
+        };
+        let sig = observer_sk.sign(&unsigned.sign_bytes()).to_bytes();
+        ReputationReport { sig, ..unsigned }
+    }
+
+    #[test]
+    fn reputation_report_valid_recorded() {
+        let mut rs = make_router();
+        let observer = SigningKey::generate(&mut OsRng);
+        let observed = [0x99u8; 32];
+        let r = make_report(&observer, observed, 1, 2.0);
+        rs.handle_reputation_report([0xFEu8; 32], r);
+        let c = rs.consensus_trust(&observed).unwrap();
+        assert!((c - 2.0).abs() < 0.05, "consensus must roughly equal reported score; got {c}");
+    }
+
+    #[test]
+    fn reputation_report_self_observed_rejected() {
+        let mut rs = make_router();
+        // observer == observed: meaningless self-praise.
+        let sk = SigningKey::generate(&mut OsRng);
+        let me = sk.verifying_key().to_bytes();
+        let mut r = make_report(&sk, me, 1, 3.0);
+        // Sign over the self-claim.
+        r.sig = sk.sign(&r.sign_bytes()).to_bytes();
+        rs.handle_reputation_report([0xFEu8; 32], r);
+        assert!(rs.consensus_trust(&me).is_none(),
+            "self-praise must not be accepted");
+    }
+
+    #[test]
+    fn reputation_report_invalid_sig_rejected() {
+        let mut rs = make_router();
+        let observer = SigningKey::generate(&mut OsRng);
+        let observed = [0xAAu8; 32];
+        let mut r = make_report(&observer, observed, 1, 1.5);
+        r.sig[0] ^= 0xFF;
+        rs.handle_reputation_report([0xFEu8; 32], r);
+        assert!(rs.consensus_trust(&observed).is_none());
+    }
+
+    #[test]
+    fn reputation_report_newer_seq_replaces() {
+        let mut rs = make_router();
+        let observer = SigningKey::generate(&mut OsRng);
+        let observed = [0xBBu8; 32];
+        rs.handle_reputation_report([0u8; 32], make_report(&observer, observed, 1, 0.5));
+        rs.handle_reputation_report([0u8; 32], make_report(&observer, observed, 2, 3.5));
+        let c = rs.consensus_trust(&observed).unwrap();
+        assert!(c > 1.5, "newer report must update consensus; got {c}");
+    }
+
+    #[test]
+    fn reputation_aggregates_across_observers() {
+        let mut rs = make_router();
+        let o1 = SigningKey::generate(&mut OsRng);
+        let o2 = SigningKey::generate(&mut OsRng);
+        let observed = [0xCCu8; 32];
+        rs.handle_reputation_report([0u8; 32], make_report(&o1, observed, 1, 1.0));
+        rs.handle_reputation_report([0u8; 32], make_report(&o2, observed, 1, 3.0));
+        let c = rs.consensus_trust(&observed).unwrap();
+        // Average of 1.0 and 3.0 is 2.0.
+        assert!((c - 2.0).abs() < 0.05, "consensus must be average across observers; got {c}");
+    }
 
     fn make_oka(sk: &SigningKey, seq: u64, eph: [u8; 32], age_ms: i64) -> OnionKeyAnnounce {
         let now_ms = std::time::SystemTime::now()

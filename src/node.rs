@@ -51,25 +51,33 @@ impl Node {
     pub async fn start(&self) -> Result<()> {
         let tcp_port = self.config.tcp_listen_port();
 
-        // ── TCP listeners ────────────────────────────────────────────────
+        // ── Listeners (TCP + QUIC, by URI scheme) ─────────────────────────
         for uri in &self.config.listen {
             let conn = self.conn.clone();
             let connected = self.connected.clone();
             let uri = uri.clone();
             tokio::spawn(async move {
-                if let Err(e) = crate::transport::listen(&uri, conn, connected).await {
+                if uri.starts_with("quic://") {
+                    if let Err(e) = crate::quic::listen(&uri, conn, connected).await {
+                        tracing::error!("QUIC listener {}: {}", uri, e);
+                    }
+                } else if let Err(e) = crate::transport::listen(&uri, conn, connected).await {
                     tracing::error!("TCP listener {}: {}", uri, e);
                 }
             });
         }
 
-        // ── Static peers ─────────────────────────────────────────────────
+        // ── Static peers (TCP or QUIC) ───────────────────────────────────
         for uri in &self.config.peers {
             let conn = self.conn.clone();
             let connected = self.connected.clone();
             let uri = uri.clone();
             tokio::spawn(async move {
-                crate::transport::dial(&uri, conn, connected).await;
+                if uri.starts_with("quic://") {
+                    crate::quic::dial(&uri, conn, connected).await;
+                } else {
+                    crate::transport::dial(&uri, conn, connected).await;
+                }
             });
         }
 
@@ -91,7 +99,11 @@ impl Node {
                 let connected = self.connected.clone();
                 let uri = uri.to_string();
                 tokio::spawn(async move {
-                    crate::transport::dial(&uri, conn, connected).await;
+                    if uri.starts_with("quic://") {
+                        crate::quic::dial(&uri, conn, connected).await;
+                    } else {
+                        crate::transport::dial(&uri, conn, connected).await;
+                    }
                 });
             }
         }

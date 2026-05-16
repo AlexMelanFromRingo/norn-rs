@@ -18,6 +18,8 @@ pub const TRAFFIC: u8 = 9;
 pub const TYPE_COORD_ANNOUNCE: u8 = 10;
 pub const TYPE_ONION: u8 = 11;
 pub const TYPE_ONION_KEY_ANNOUNCE: u8 = 12;
+pub const TYPE_REPUTATION_REPORT: u8 = 13;
+pub const TYPE_HOLE_PUNCH: u8 = 14;
 
 /// Encode a uvarint into a byte buffer.
 // Skip all mutations of this function: two are permanently untestable —
@@ -602,6 +604,160 @@ impl OnionKeyAnnounce {
         let mut sig = [0u8; 64];
         sig.copy_from_slice(&data[pos..pos + 64]);
         Ok(OnionKeyAnnounce { origin, seq, valid_from_ms, onion_eph_pub, sig })
+    }
+}
+
+/// Hole-punch coordination frame.
+///
+/// Sent A → rendezvous (a node connected to both A and B) carrying B's
+/// pub_key and A's externally-observed transport endpoint. The
+/// rendezvous, if connected to B, forwards the same payload to B. Both
+/// A and B then simultaneously initiate a QUIC connection to each other's
+/// reported endpoint. Symmetric NATs only — does nothing for full-cone /
+/// restricted-cone NATs, where the existing outbound dial already works.
+///
+/// The frame is signed by the *initiator* so the rendezvous can't forge an
+/// endpoint, and the target can verify before opening an outbound socket.
+///
+/// Wire layout (165 + varlen endpoint):
+///   [initiator: 32]              — A's pub_key
+///   [target: 32]                 — B's pub_key
+///   [valid_from_ms: u64 LE]      — wall clock at send
+///   [endpoint_len: u8]           — length of the endpoint string (e.g. "1.2.3.4:9001")
+///   [endpoint: endpoint_len]     — A's observed-public endpoint
+///   [sig: 64]                    — Ed25519 over the prefix
+#[derive(Clone, Debug)]
+pub struct HolePunch {
+    pub initiator: [u8; 32],
+    pub target: [u8; 32],
+    pub valid_from_ms: u64,
+    pub endpoint: String,
+    pub sig: [u8; 64],
+}
+
+impl HolePunch {
+    pub fn sign_bytes(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(32 + 32 + 8 + 1 + self.endpoint.len());
+        buf.extend_from_slice(&self.initiator);
+        buf.extend_from_slice(&self.target);
+        buf.extend_from_slice(&self.valid_from_ms.to_le_bytes());
+        buf.push(self.endpoint.len() as u8);
+        buf.extend_from_slice(self.endpoint.as_bytes());
+        buf
+    }
+
+    pub fn encode(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(1 + 32 + 32 + 8 + 1 + self.endpoint.len() + 64);
+        buf.push(TYPE_HOLE_PUNCH);
+        buf.extend_from_slice(&self.initiator);
+        buf.extend_from_slice(&self.target);
+        buf.extend_from_slice(&self.valid_from_ms.to_le_bytes());
+        let len = self.endpoint.len().min(u8::MAX as usize);
+        buf.push(len as u8);
+        buf.extend_from_slice(&self.endpoint.as_bytes()[..len]);
+        buf.extend_from_slice(&self.sig);
+        buf
+    }
+
+    /// Decode from bytes *without* the leading TYPE byte.
+    pub fn decode(data: &[u8]) -> Result<Self> {
+        // Minimum: initiator(32) + target(32) + ts(8) + len(1) + sig(64)
+        // with zero-length endpoint = 137 bytes.
+        let min = 32 + 32 + 8 + 1 + 64;
+        if data.len() < min {
+            bail!("HolePunch too short: got {} (need ≥ {})", data.len(), min);
+        }
+        let mut pos = 0;
+        let mut initiator = [0u8; 32];
+        initiator.copy_from_slice(&data[pos..pos + 32]); pos += 32;
+        let mut target = [0u8; 32];
+        target.copy_from_slice(&data[pos..pos + 32]); pos += 32;
+        let valid_from_ms = u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap()); pos += 8;
+        let endpoint_len = data[pos] as usize; pos += 1;
+        if data.len() < pos + endpoint_len + 64 {
+            bail!("HolePunch truncated: endpoint_len {} but only {} bytes left",
+                endpoint_len, data.len() - pos);
+        }
+        let endpoint = std::str::from_utf8(&data[pos..pos + endpoint_len])
+            .map_err(|_| anyhow::anyhow!("HolePunch endpoint not UTF-8"))?
+            .to_string();
+        pos += endpoint_len;
+        let mut sig = [0u8; 64];
+        sig.copy_from_slice(&data[pos..pos + 64]);
+        Ok(HolePunch { initiator, target, valid_from_ms, endpoint, sig })
+    }
+}
+
+/// Reputation report flooded through the mesh: observer's signed claim
+/// about an observed peer's local trust score. Receivers aggregate these
+/// per `observed` into a "consensus trust" used to bias routing lookups.
+///
+/// Wire layout (180 bytes):
+///   [observer: 32]
+///   [observed: 32]
+///   [score_q16: u16 LE]      — trust score in [0..1], quantised to u16 (×65535)
+///   [seq: u64 LE]            — strictly monotonic per (observer, observed)
+///   [valid_from_ms: u64 LE]  — observer wall-clock
+///   [sig: 64]                — Ed25519 sig by `observer` over the prefix
+///
+/// Signature covers everything except itself. Receivers dedup by
+/// (observer, observed, seq), drop stale (> 1h) reports, and forward
+/// strictly-newer-seq reports to all peers except the sender.
+#[derive(Clone, Debug)]
+pub struct ReputationReport {
+    pub observer: [u8; 32],
+    pub observed: [u8; 32],
+    pub score_q16: u16,
+    pub seq: u64,
+    pub valid_from_ms: u64,
+    pub sig: [u8; 64],
+}
+
+impl ReputationReport {
+    pub fn sign_bytes(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(32 + 32 + 2 + 8 + 8);
+        buf.extend_from_slice(&self.observer);
+        buf.extend_from_slice(&self.observed);
+        buf.extend_from_slice(&self.score_q16.to_le_bytes());
+        buf.extend_from_slice(&self.seq.to_le_bytes());
+        buf.extend_from_slice(&self.valid_from_ms.to_le_bytes());
+        buf
+    }
+
+    pub fn encode(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(1 + 32 + 32 + 2 + 8 + 8 + 64);
+        buf.push(TYPE_REPUTATION_REPORT);
+        buf.extend_from_slice(&self.observer);
+        buf.extend_from_slice(&self.observed);
+        buf.extend_from_slice(&self.score_q16.to_le_bytes());
+        buf.extend_from_slice(&self.seq.to_le_bytes());
+        buf.extend_from_slice(&self.valid_from_ms.to_le_bytes());
+        buf.extend_from_slice(&self.sig);
+        buf
+    }
+
+    /// Decode from bytes *without* the leading TYPE byte.
+    pub fn decode(data: &[u8]) -> Result<Self> {
+        let need = 32 + 32 + 2 + 8 + 8 + 64;
+        if data.len() < need {
+            bail!("ReputationReport too short: got {} (need {})", data.len(), need);
+        }
+        let mut pos = 0;
+        let mut observer = [0u8; 32];
+        observer.copy_from_slice(&data[pos..pos + 32]); pos += 32;
+        let mut observed = [0u8; 32];
+        observed.copy_from_slice(&data[pos..pos + 32]); pos += 32;
+        let score_q16 = u16::from_le_bytes(data[pos..pos + 2].try_into().unwrap()); pos += 2;
+        let seq = u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap()); pos += 8;
+        let valid_from_ms = u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap()); pos += 8;
+        let mut sig = [0u8; 64];
+        sig.copy_from_slice(&data[pos..pos + 64]);
+        Ok(ReputationReport { observer, observed, score_q16, seq, valid_from_ms, sig })
+    }
+
+    /// Score as f32 in [0, 1].
+    pub fn score(&self) -> f32 {
+        self.score_q16 as f32 / u16::MAX as f32
     }
 }
 
@@ -1191,6 +1347,90 @@ mod tests {
         assert!(res_size < 4 * req_size,
             "SigRes/SigReq amplification factor {} exceeds 4×; would be a UDP-reflection problem if any UDP path opened",
             res_size as f64 / req_size as f64);
+    }
+
+    // ── HolePunch ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn hole_punch_roundtrip() {
+        let hp = HolePunch {
+            initiator: [0x11u8; 32],
+            target: [0x22u8; 32],
+            valid_from_ms: 1_700_000_000_000,
+            endpoint: "203.0.113.5:9001".to_string(),
+            sig: [0x33u8; 64],
+        };
+        let enc = hp.encode();
+        assert_eq!(enc[0], TYPE_HOLE_PUNCH);
+        let dec = HolePunch::decode(&enc[1..]).unwrap();
+        assert_eq!(dec.initiator, hp.initiator);
+        assert_eq!(dec.target, hp.target);
+        assert_eq!(dec.valid_from_ms, hp.valid_from_ms);
+        assert_eq!(dec.endpoint, hp.endpoint);
+        assert_eq!(dec.sig, hp.sig);
+    }
+
+    #[test]
+    fn hole_punch_decode_too_short() {
+        let min = 32 + 32 + 8 + 1 + 64;
+        let data = vec![0u8; min - 1];
+        assert!(HolePunch::decode(&data).is_err());
+    }
+
+    #[test]
+    fn hole_punch_decode_truncated_endpoint() {
+        // Claims endpoint_len=10 but only provides 5 bytes after.
+        let mut data = Vec::new();
+        data.extend_from_slice(&[0u8; 32]); // initiator
+        data.extend_from_slice(&[0u8; 32]); // target
+        data.extend_from_slice(&[0u8; 8]);  // ts
+        data.push(10);                       // endpoint_len = 10
+        data.extend_from_slice(b"hello");    // only 5 bytes
+        data.extend_from_slice(&[0u8; 64]);  // sig
+        assert!(HolePunch::decode(&data).is_err(),
+            "truncated endpoint must be rejected");
+    }
+
+    // ── ReputationReport ────────────────────────────────────────────────────
+
+    #[test]
+    fn reputation_report_roundtrip() {
+        let r = ReputationReport {
+            observer: [0x11u8; 32],
+            observed: [0x22u8; 32],
+            score_q16: 32_768,
+            seq: 17,
+            valid_from_ms: 1_700_000_000_000,
+            sig: [0x33u8; 64],
+        };
+        let enc = r.encode();
+        assert_eq!(enc[0], TYPE_REPUTATION_REPORT);
+        let dec = ReputationReport::decode(&enc[1..]).unwrap();
+        assert_eq!(dec.observer, r.observer);
+        assert_eq!(dec.observed, r.observed);
+        assert_eq!(dec.score_q16, r.score_q16);
+        assert_eq!(dec.seq, r.seq);
+        assert_eq!(dec.valid_from_ms, r.valid_from_ms);
+        assert_eq!(dec.sig, r.sig);
+    }
+
+    #[test]
+    fn reputation_score_q16_dequantises_to_expected_range() {
+        let mut r = ReputationReport {
+            observer: [0u8; 32], observed: [0u8; 32], score_q16: 0,
+            seq: 0, valid_from_ms: 0, sig: [0u8; 64],
+        };
+        r.score_q16 = 0;
+        assert!((r.score() - 0.0).abs() < 1e-6);
+        r.score_q16 = u16::MAX;
+        assert!((r.score() - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn reputation_report_decode_too_short() {
+        let need = 32 + 32 + 2 + 8 + 8 + 64;
+        let data = vec![0u8; need - 1];
+        assert!(ReputationReport::decode(&data).is_err());
     }
 
     // ── OnionKeyAnnounce ────────────────────────────────────────────────────

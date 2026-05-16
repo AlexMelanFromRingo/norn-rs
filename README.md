@@ -39,6 +39,13 @@ norn-rs creates an encrypted IPv6 mesh network. Each node gets a unique `200::/7
 | `nornctl` admin CLI + shell completions | ✅ |
 | Property-based parser fuzzing (proptest) | ✅ |
 | Anti-amplification audit + size-pinning tests | ✅ |
+| QUIC transport (`quic://`) alongside TCP | ✅ |
+| mDNS / DNS-SD `_norn._tcp.local` discovery | ✅ |
+| Reputation gossip (TYPE 0x0D) for cross-mesh trust consensus | ✅ |
+| HolePunch (TYPE 0x0E) for symmetric-NAT traversal | ✅ |
+| Docker image + systemd-grade hardening | ✅ |
+| Network-namespace end-to-end CI harness | ✅ |
+| ProVerif formal model of session handshake | ✅ |
 | Sliding-window replay protection (64-slot) | ✅ |
 | Source privacy (encrypted enc_header) | ✅ |
 | Destination hiding (routing_tag + enc_header) | ✅ |
