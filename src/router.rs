@@ -13,17 +13,45 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{mpsc, watch};
 use tracing::{debug, warn};
 
+/// Process-wide counter of mutex-poison-recovery events. Exposed via
+/// `mutex_poison_count()` and surfaced in `/metrics` as
+/// `norn_mutex_poison_total`. Operators MUST treat any non-zero value as a
+/// red flag: a panic-while-holding-lock leaves the protected state in a
+/// potentially inconsistent intermediate form (e.g. tree partially
+/// rebalanced, peer half-removed), and silently recovering hides that
+/// damage. The counter exists so the damage shows up in alerts.
+pub static MUTEX_POISON_COUNT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Snapshot of the global mutex-poison-recovery counter. Wired into the
+/// Prometheus exposition (`norn_mutex_poison_total`).
+pub fn mutex_poison_count() -> u64 {
+    MUTEX_POISON_COUNT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Extension trait that recovers from poisoned mutexes instead of panicking.
-/// If a thread panicked while holding a lock, we log an error and continue —
-/// better than a cascade crash from an unrelated panic.
+/// If a thread panicked while holding a lock, we log an error, bump the
+/// poison counter, and continue — better than a cascade crash from an
+/// unrelated panic. Operators must monitor `norn_mutex_poison_total` and
+/// investigate any non-zero value: data behind the lock may be inconsistent.
 trait LockOrRecover<T> {
     fn lock_or_recover(&self) -> std::sync::MutexGuard<'_, T>;
 }
 
 impl<T> LockOrRecover<T> for std::sync::Mutex<T> {
+    #[track_caller]
     fn lock_or_recover(&self) -> std::sync::MutexGuard<'_, T> {
         self.lock().unwrap_or_else(|p| {
-            tracing::error!("mutex poisoned, recovering — data may be inconsistent");
+            // track_caller surfaces the lock_or_recover call site in the log
+            // so operators see WHERE the inconsistency was first observed.
+            let loc = std::panic::Location::caller();
+            MUTEX_POISON_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            tracing::error!(
+                file = loc.file(), line = loc.line(),
+                "mutex poisoned at {}:{} — RECOVERING but state may be inconsistent. \
+                 Check norn_mutex_poison_total in /metrics; non-zero is a red flag.",
+                loc.file(), loc.line(),
+            );
             p.into_inner()
         })
     }
@@ -2725,6 +2753,33 @@ impl PacketConn {
         let _ = self.shutdown_tx.send(true);
         // Drop all peer connections
         self.inner.lock_or_recover().peers.clear();
+    }
+
+    /// Inject ground-truth link statistics measured by the transport layer
+    /// (e.g. Linux `SO_TCP_INFO`, or quinn's connection.rtt() / lost_packets).
+    /// `rtt` overrides the EWMA `lag`; `loss_rate` is blended into the
+    /// running EWMA. Both are far more accurate than the application-layer
+    /// `SIG_REQ`/`SIG_RES` probe because they're not contaminated by
+    /// head-of-line blocking or by ACK coalescing.
+    ///
+    /// Safe to call from any thread. No-op if `peer` is not currently in our
+    /// peer table (concurrent disconnect race).
+    pub fn record_kernel_link_stats(
+        &self,
+        peer: &[u8; 32],
+        rtt: std::time::Duration,
+        loss_rate: f32,
+    ) {
+        let mut state = self.inner.lock_or_recover();
+        if let Some(p) = state.peers.get_mut(peer) {
+            // Direct replace — kernel telemetry is authoritative for this
+            // sample; the EWMA is only there to smooth one-shot jitter.
+            p.lag = rtt;
+            // Blend loss_rate with existing EWMA at α=0.25 to avoid a single
+            // burst spiking the cost — same smoothing as the SIG_RES path.
+            let clamped = loss_rate.clamp(0.0, 1.0);
+            p.loss_rate = p.loss_rate * 0.75 + clamped * 0.25;
+        }
     }
 
     pub fn get_peer_stats(&self) -> Vec<PeerStats> {

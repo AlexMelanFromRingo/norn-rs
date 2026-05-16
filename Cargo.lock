@@ -1272,6 +1272,7 @@ dependencies = [
  "ed25519-dalek",
  "hex",
  "hkdf",
+ "libc",
  "mdns-sd",
  "ml-kem",
  "mutants",

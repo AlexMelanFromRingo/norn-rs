@@ -121,6 +121,16 @@ pub fn render(conn: &PacketConn, started: Instant) -> String {
             "norn_peer_uptime_seconds{{peer=\"{}\"}} {:.3}\n", pk, p.uptime.as_secs_f64()));
     }
 
+    // Observability for the mutex-poison recovery path. Any non-zero value
+    // here means a thread panicked while holding a router lock and we
+    // recovered into possibly-inconsistent state — operators should alert.
+    out.push_str("# HELP norn_mutex_poison_total \
+                  Times a poisoned router/session mutex was silently recovered. \
+                  Non-zero values indicate a panic-while-holding-lock incident; \
+                  protected state may be inconsistent and should be investigated.\n");
+    out.push_str("# TYPE norn_mutex_poison_total counter\n");
+    out.push_str(&format!("norn_mutex_poison_total {}\n", crate::router::mutex_poison_count()));
+
     out
 }
 
@@ -198,6 +208,19 @@ mod tests {
         assert!(resp.contains("# TYPE norn_uptime_seconds gauge"),
             "expected Prometheus type header in body");
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn render_exposes_mutex_poison_counter() {
+        // The exposition MUST include the counter — operators rely on it to
+        // alert on inconsistent router state after a panic-while-holding-lock.
+        let sk = SigningKey::generate(&mut OsRng);
+        let conn = Arc::new(PacketConn::new(sk));
+        let body = render(&conn, Instant::now());
+        assert!(body.contains("# TYPE norn_mutex_poison_total counter"),
+            "mutex poison counter must be exposed as a Prometheus counter");
+        assert!(body.contains("norn_mutex_poison_total "),
+            "counter sample line must be present");
     }
 
     #[tokio::test]

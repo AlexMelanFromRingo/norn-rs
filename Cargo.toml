@@ -49,6 +49,11 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 rustls-pki-types = { version = "1", features = ["std"] }
 rcgen = { version = "0.14", default-features = false, features = ["pem", "ring"] }
 
+# Linux-only: SO_TCP_INFO ground-truth RTT/loss reader in src/tcp_info.rs.
+# Bypasses application-layer probe contamination from TCP HoL blocking.
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
 tempfile = "3"

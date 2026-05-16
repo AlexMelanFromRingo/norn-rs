@@ -63,6 +63,49 @@ impl Drop for PerIpGuard {
     }
 }
 
+/// Spawn a background task that polls `SO_TCP_INFO` on Linux every 5s and
+/// pushes kernel-side RTT / loss into the router's `peer.lag` and
+/// `peer.loss_rate`. On non-Linux it returns an immediately-completed handle
+/// — the router falls back to the application-layer SIG_REQ probe.
+///
+/// The returned `JoinHandle` should be `abort()`ed once `handle_conn`
+/// returns so the poller doesn't outlive the connection.
+#[cfg(target_os = "linux")]
+fn spawn_tcp_info_poller(
+    fd: std::os::fd::RawFd,
+    peer: [u8; 32],
+    conn: Arc<PacketConn>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(5));
+        // Discard the immediate tick so we don't sample before any traffic
+        // has flowed.
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            match crate::tcp_info::read_tcp_info(fd) {
+                Some(stats) => {
+                    conn.record_kernel_link_stats(&peer, stats.rtt(), stats.loss_rate());
+                }
+                None => {
+                    // getsockopt failed — usually means the socket is closed.
+                    // Exit; the connection task is on its way out anyway.
+                    break;
+                }
+            }
+        }
+    })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn spawn_tcp_info_poller(
+    _fd: i32,
+    _peer: [u8; 32],
+    _conn: Arc<PacketConn>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async {})
+}
+
 /// Apply TCP_NODELAY and SO_KEEPALIVE to a connected TcpStream.
 ///
 /// Keepalive settings: first probe after 10s idle, retries every 3s, 3 retries.
@@ -325,8 +368,20 @@ pub async fn listen(
                 set.insert(remote_pub);
             }
             info!("accepted peer {:?} from {}", &remote_pub[..4], peer_addr);
+            // Capture the OS fd BEFORE split — used by the Linux kernel-stats
+            // poller below. On Windows this resolves to a no-op handle.
+            #[cfg(target_os = "linux")]
+            let fd = {
+                use std::os::fd::AsRawFd;
+                stream.as_raw_fd()
+            };
+            #[cfg(not(target_os = "linux"))]
+            let fd: i32 = 0;
+
             let (reader, writer) = stream.into_split();
+            let poller = spawn_tcp_info_poller(fd, remote_pub, conn.clone());
             conn.handle_conn(remote_pub, reader, writer, 0).await;
+            poller.abort();
             connected.lock().unwrap().remove(&remote_pub);
         });
     }
@@ -404,8 +459,19 @@ pub async fn dial(uri: &str, conn: Arc<PacketConn>, connected: ConnectedPeers) {
                             connected.lock().unwrap().insert(remote_pub);
                         }
                         info!("connected to peer {:?} at {}", &remote_pub[..4], addr);
+                        // Kernel TCP-info poller (Linux); no-op elsewhere.
+                        #[cfg(target_os = "linux")]
+                        let fd = {
+                            use std::os::fd::AsRawFd;
+                            stream.as_raw_fd()
+                        };
+                        #[cfg(not(target_os = "linux"))]
+                        let fd: i32 = 0;
+
                         let (reader, writer) = stream.into_split();
+                        let poller = spawn_tcp_info_poller(fd, remote_pub, conn.clone());
                         conn.handle_conn(remote_pub, reader, writer, 0).await;
+                        poller.abort();
                         // handle_conn spawns reader/writer tasks and returns.
                         // The reader task calls remove_peer on disconnect.
                         connected.lock().unwrap().remove(&remote_pub);

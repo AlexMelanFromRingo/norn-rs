@@ -461,7 +461,16 @@ pub const SESSION_ACK_MAGIC: u8 = 0x62;  // 'b' (v3, PQ hybrid)
 /// Maximum clock skew tolerated for SessionInit/Ack timestamps, milliseconds.
 /// Inits older than this (relative to local wall clock) are rejected as replays;
 /// inits from too far in the future are also rejected (forward-skew abuse).
-pub const HANDSHAKE_TIME_WINDOW_MS: u64 = 60_000; // 60s
+///
+/// 5 minutes (not 60 s). Rationale: in the open Internet many real peers
+/// have CMOS-drained clocks or no NTP (IoT, fresh VM clones, embedded
+/// gear); a 60 s window silently excludes them from the mesh forever, which
+/// is much worse than letting through a slightly stale Init. The actual
+/// replay-protection comes from the per-session 64-bit seq + sliding window
+/// in `SessionInfo` — a replayed Init only burns one ML-KEM encap on the
+/// receiver (rate-limited by `SessionManager::rate_limited`), it cannot
+/// resurrect any old session state because every Init has fresh keys.
+pub const HANDSHAKE_TIME_WINDOW_MS: u64 = 5 * 60 * 1_000; // 5 min
 
 /// SessionInit (v3, PQ hybrid) wire format:
 ///   [magic:1][ed_pub:32][sig:64][x25519_pub:32][timestamp_ms:8 LE]
