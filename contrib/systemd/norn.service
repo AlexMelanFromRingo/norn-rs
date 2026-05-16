@@ -1,0 +1,68 @@
+[Unit]
+Description=norn-rs mesh overlay daemon
+Documentation=man:nornd(8) https://github.com/anthropics/norn-rs
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/nornd -c /etc/norn/norn.toml
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=10s
+
+# ── User + permissions ────────────────────────────────────────────────────
+# nornd needs CAP_NET_ADMIN to manage the TUN interface; everything else
+# runs as the unprivileged `norn` user. Create the user with:
+#   useradd -r -s /usr/sbin/nologin -d /var/lib/norn norn
+User=norn
+Group=norn
+AmbientCapabilities=CAP_NET_ADMIN
+CapabilityBoundingSet=CAP_NET_ADMIN
+
+# ── Filesystem hardening ──────────────────────────────────────────────────
+# The daemon needs:
+#   - read /etc/norn/norn.toml (private key)
+#   - bind /var/run/norn.sock
+#   - manage the TUN device (covered by CAP_NET_ADMIN, no FS mount)
+# Everything else is read-only or invisible.
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=false                  # need /dev/net/tun
+DeviceAllow=/dev/net/tun rw
+ReadOnlyPaths=/etc/norn
+RuntimeDirectory=norn                  # creates /run/norn (chmod 0700, owner norn)
+RuntimeDirectoryMode=0700
+# admin_socket in config should point to /run/norn/norn.sock to match.
+
+# ── Process hardening ─────────────────────────────────────────────────────
+NoNewPrivileges=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectHostname=true
+ProtectClock=true
+ProtectProc=invisible
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+
+# ── Resource limits ───────────────────────────────────────────────────────
+LimitNOFILE=65535
+LimitNPROC=4096
+
+# ── Logging ───────────────────────────────────────────────────────────────
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=nornd
+
+[Install]
+WantedBy=multi-user.target

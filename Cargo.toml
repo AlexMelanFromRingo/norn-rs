@@ -1,6 +1,6 @@
 [package]
 name = "norn-rs"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2024"
 description = "Next-generation mesh routing protocol — hyperbolic routing, K=3 spanning trees, ChaCha20-Poly1305 sessions"
 license = "MIT"
@@ -8,6 +8,10 @@ license = "MIT"
 [[bin]]
 name = "nornd"
 path = "src/bin/nornd.rs"
+
+[[bin]]
+name = "nornctl"
+path = "src/bin/nornctl.rs"
 
 [features]
 default = ["tun-support"]
@@ -35,7 +39,24 @@ tun2 = { version = "3", features = ["async"], optional = true }
 clap = { version = "4", features = ["derive"] }
 mutants = "0.0.3"
 zeroize = { version = "1.8", features = ["zeroize_derive"] }
+ml-kem = { version = "0.3", features = ["zeroize", "getrandom"] }
+hkdf = "0.12"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
 tempfile = "3"
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "bench"
+harness = false
+
+# Speed up tests: ML-KEM-768 ops are ~100× faster at opt-level=2 vs 0.
+# Without this the parallel integration test suite serialises on the
+# crypto operations and times out under contention.
+[profile.test]
+opt-level = 2
+
+[profile.dev]
+# Match — keeps `cargo run` of nornd usable for manual testing.
+opt-level = 2

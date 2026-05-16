@@ -22,7 +22,16 @@ norn-rs creates an encrypted IPv6 mesh network. Each node gets a unique `200::/7
 | Hyperbolic geometric routing (Kleinberg/Sarkar) | ✅ |
 | Cuckoo filter gossip (2-byte fingerprints, FPR 0.012%) | ✅ |
 | ChaCha20-Poly1305 session encryption | ✅ |
-| X25519 DH + double-ratchet key rotation | ✅ |
+| X25519 + ML-KEM-768 PQ-hybrid session keys | ✅ |
+| Per-send X25519 key rotation (classical FS) | ✅ |
+| Rotating onion ephemeral keys (post-quantum-relay FS) | ✅ |
+| Fixed-size onion cells (1280 B, Tor-style) | ✅ |
+| Onion replay LRU per relay | ✅ |
+| Active route-validation prober (cuckoo anti-poison) | ✅ |
+| Per-peer trust scoring biases routing | ✅ |
+| Hyperbolic coord consistency check | ✅ |
+| Authenticated TCP handshake (NRN1 magic) | ✅ |
+| `nornctl` admin CLI | ✅ |
 | Sliding-window replay protection (64-slot) | ✅ |
 | Source privacy (encrypted enc_header) | ✅ |
 | Destination hiding (routing_tag + enc_header) | ✅ |

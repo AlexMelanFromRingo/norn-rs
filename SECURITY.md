@@ -19,7 +19,7 @@ is and is not designed to resist.
 | Compromise of *all* relays on a circuit                   |    ✗     | This deanonymises the flow — a property shared with Tor. |
 | Compromise of node’s long-term ed25519 private key        |    ◐     | Address derivation makes the key the identity; loss of the key = loss of the identity *going forward*. Past traffic is largely forward-secret: session-layer x25519 rotates every 100 sends, and onion-layer keys are now a rotating ephemeral keypair separate from the long-term identity (rotated hourly with a one-rotation graceful window). The remaining gap is the *fallback* onion path used when the sender hasn't yet learned the recipient's advertised ephemeral pub. |
 | Global passive adversary observing all link-level traffic |    ◐     | Padding (256-byte blocks), forwarding jitter, and cover traffic make timing/size correlation harder but not infeasible. |
-| Quantum adversary                                         |    ✗     | All asymmetric primitives are classical (ed25519, x25519). |
+| Quantum adversary                                         |    ◐     | Sessions use a PQ-hybrid X25519 + ML-KEM-768 key (HKDF-Extract). Confidential as long as either primitive holds. Authentication (Ed25519 signatures on announces and handshakes) is still classical — a CRQC would break identity forgery for newly-issued messages. |
 
 ### Properties claimed
 
@@ -40,53 +40,57 @@ is and is not designed to resist.
   * Pending PathLookup dedup set capped at 10 000 entries; coord table at 16 384.
   * Idle sessions expire after 5 min.
 
-### Resolved in this release (v0.3 onion v3)
+### Resolved in this release (v0.3)
 
-These items were on the previous "Known weaknesses" list and are now closed:
+All previously-listed "Known weaknesses" are closed:
 
-* **Onion-layer forward secrecy** (CLOSED — partial). Onion peel now uses a
-  rotating per-node ephemeral X25519 keypair, distinct from the long-term
-  Ed25519 identity. The keypair rotates every hour; the prior key is held
-  for one further rotation period for in-flight onions, then zeroized. Past
-  onion traffic becomes undecryptable two rotations later.
-  *Remaining gap:* the identity-derived key is kept as a peel fallback for
-  cells from senders that haven't yet learned the relay's current ephemeral.
-  Closing this fully requires network-wide propagation of onion ephemeral
-  pubs (current propagation is one-hop via CoordAnnounce).
+* **Onion-layer forward secrecy** (CLOSED). Onion peel now uses a rotating
+  per-node ephemeral X25519 keypair distinct from the Ed25519 identity.
+  Rotates every hour; the prior key is held one further rotation period for
+  in-flight onions, then zeroized. Past onion traffic becomes undecryptable
+  two rotations later.
+* **Network-wide ephemeral-pub propagation** (CLOSED). New
+  `OnionKeyAnnounce` (0x0C) frame is signed by the origin and flooded
+  through the mesh, so senders learn the current ephemeral pub of *any*
+  node (not just direct neighbours). The identity-derived key remains a
+  peel fallback purely for warm-start scenarios.
 * **Variable-size onion cells** (CLOSED). Every onion frame is padded to a
   constant `ONION_CELL_SIZE = 1280` bytes regardless of remaining depth.
-  Removes the per-hop size signal that previously let a global observer
-  count circuit length.
 * **Onion replay** (CLOSED). Each relay keeps a 4 096-entry LRU of recent
-  cell digests and silently drops duplicates. Prevents tagging-by-replay.
-* **Cuckoo gossip poisoning** (PARTIAL). Per-peer trust scores bias routing
-  lookups: peers that miss keepalives or otherwise misbehave are
-  de-prioritised. An auto-prober that issues PathLookups to verify advertised
-  routes remains future work.
+  cell digests and silently drops duplicates.
+* **Cuckoo gossip poisoning** (CLOSED). Per-peer trust scoring + an
+  *active prober* that picks a (peer P, identity Q) pair where P claims to
+  reach Q, sends a PathLookup(Q) only via P, and decays P's trust on
+  timeout / boosts on success. Routing lookups rank by trust-adjusted
+  cost — a lying peer falls to the bottom of the list within minutes.
+* **Hyperbolic coordinate spoofing** (CLOSED). CoordAnnounce coords MUST
+  match `from_tree_depth(claimed_depth, sender_pub)` exactly; mismatches
+  are rejected and trigger a trust decay. The claimed `tree_depth` is
+  cross-checked against the depth on file from the sender's most recent
+  Announce (±2 tolerance for transient races).
+* **Post-quantum hybrid** (CLOSED). Session handshake v3 carries an
+  ML-KEM-768 encapsulation key in the Init and a ciphertext in the Ack;
+  both sides derive a 32-byte `pq_shared` that mixes into every per-packet
+  AEAD key via HKDF-Extract+Expand-SHA256. The session is confidential as
+  long as EITHER X25519 OR ML-KEM-768 holds.
 
 ### Known weaknesses (open issues)
 
-These are *deliberately* unresolved in the current release; PRs welcome.
+These are intentionally outside the v0.3 release; tracked for follow-up.
 
-1. **Network-wide ephemeral-pub propagation** — CoordAnnounce only reaches
-   direct peers, so an onion sender that wants to use a non-neighbour as
-   destination falls back to the identity-derived key. This degrades FS for
-   that hop.
-   *Fix:* a signed `OnionKeyAnnounce` flooded like Announce, or piggyback
-   the announce on PathNotify.
-2. **Hyperbolic coordinate spoofing** — peers self-report their coordinates.
-   A malicious peer can claim a coordinate close to any target, biasing
-   greedy routing.
-   *Mitigation in current code:* coord signatures are verified; non-finite
-   coords are rejected; coord-table size is bounded.
-3. **Active route validation for cuckoo poisoning** — the trust framework
-   exists but trust currently moves only on liveness probes (SigReq/Res).
-   A peer that responds to pings but lies about route claims escapes
-   detection.
-   *Fix:* periodic PathLookup probes against a random claimed tag; decay
-   trust on missing PathNotify.
-4. **No post-quantum hybrid** — when this becomes practical (e.g. X-Wing or
-   ML-KEM-768), the session handshake should add a PQ KEM alongside x25519.
+1. **Long-term ML-KEM keypair rotation** — the ML-KEM decapsulation key
+   currently lives for the process lifetime. Compromising it allows
+   retroactive decryption of all session-init-time PQ secrets it received.
+   *Fix:* daily ML-KEM rotation with a graceful overlap window, analogous
+   to the onion-ephemeral rotation already in place.
+2. **Sybil resistance** — three-tree XOR-metric root selection helps but
+   cannot stop a well-funded attacker spinning up many identities. We rely
+   on `trust` to degrade misbehavers but do not bound them up-front.
+   *Fix:* gossip-graph proof-of-uniqueness, or stake-based admission.
+3. **Side-channel hardening of crypto** — RustCrypto primitives we use
+   document constant-time properties, but the host's CPU / compiler
+   pipeline can leak via cache timing. No explicit countermeasures (e.g.
+   wbox, blinding) are applied at the session layer.
 
 ## Reporting a vulnerability
 

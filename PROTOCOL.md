@@ -94,6 +94,7 @@ first byte selects the type:
 | 0x09 | TRAFFIC          | Encrypted user payload (`§8`).             |
 | 0x0A | COORD_ANNOUNCE   | Hyperbolic coordinate broadcast (`§9`).    |
 | 0x0B | ONION            | Onion-wrapped Traffic packet (`§10`).      |
+| 0x0C | ONION_KEY_ANNOUNCE | Network-wide onion ephemeral pub flood (`§14`). |
 
 ## 4. Sig request / response
 
@@ -267,34 +268,49 @@ from relay side) to one of:
 Onion-forwarding is subject to the same in-flight cap, 2-cycle rejection,
 and 0–49 ms jitter as TRAFFIC forwarding.
 
-## 11. Session handshake (v2)
+## 11. Session handshake (v3 — PQ hybrid)
 
-Carried inside TRAFFIC packets with `pkt_type = 0x00`. Two messages:
+Carried inside TRAFFIC packets with `pkt_type = 0x00`. Two messages, both
+sign-then-encapsulate.
 
-### 11.1 SessionInit
+### 11.1 SessionInit (1353 bytes)
 
 ```
-[magic: 1 = 0x73 's']
-[ed_pub: 32]                  — sender's identity
+[magic: 1 = 0x74 't' (v3)]
+[ed_pub: 32]                       — sender's identity
 [signature: 64]
-[x25519_pub: 32]              — sender's current x25519 pub
+[x25519_pub: 32]                   — sender's current x25519 pub
 [timestamp_ms: u64 LE]
-[recipient_ed_pub: 32]        — intended responder's identity
+[recipient_ed_pub: 32]             — intended responder's identity
+[ml_kem_pub: 1184]                 — sender's ML-KEM-768 encapsulation key
 ```
 
-`signature` covers:
-`magic || ed_pub || x25519_pub || timestamp_ms || recipient_ed_pub`.
+`signature` covers everything except the sig field itself:
+`magic || ed_pub || x25519_pub || timestamp_ms || recipient_ed_pub || ml_kem_pub`.
 
 Receivers MUST:
 * match `recipient_ed_pub` against their own pub_key;
 * reject if `|now - timestamp_ms| > 60 000 ms`;
-* verify the signature.
+* verify the Ed25519 signature;
+* ML-KEM-encapsulate a fresh shared secret against `ml_kem_pub`; the
+  resulting ciphertext goes into the Ack and the shared secret becomes
+  `pq_shared` on the responder's side.
 
-### 11.2 SessionAck
+### 11.2 SessionAck (1257 bytes)
 
-Identical layout with `magic = 0x61` ('a'). Receivers MUST only accept an
-Ack for which a corresponding `initiate()` is pending — unsolicited Acks
-are dropped.
+Same layout but with `magic = 0x62` ('b') and the trailing field replaced:
+
+```
+[ml_kem_ct: 1088]                  — ciphertext from responder's encap
+```
+
+Initiators MUST:
+* only accept an Ack for which a corresponding `initiate()` is pending —
+  unsolicited Acks are dropped;
+* ML-KEM-decapsulate `ml_kem_ct` with their long-term decapsulation key;
+  the resulting shared secret becomes `pq_shared` on the initiator's side.
+
+Both sides now hold the same 32-byte `pq_shared`.
 
 ## 12. Session encryption
 
@@ -304,14 +320,58 @@ Every data-carrying packet is:
 [sender_x25519_pub: 32][seq: u64 LE][ciphertext: payload + 16-byte tag]
 ```
 
-Key = `DH(local_x25519_priv, remote_x25519_pub)`.
-Nonce = `[seq: u64 LE | 0u32]`. AAD = `sender_x25519_pub`.
+Key derivation (PQ hybrid):
+
+```
+x25519_shared = DH(local_x25519_priv, sender_x25519_pub_from_packet)
+aead_key      = HKDF-Extract+Expand-SHA256(
+                    salt = pq_shared,        # 32 bytes, from §11
+                    ikm  = x25519_shared,
+                    info = "norn:session-key:v3",
+                    L    = 32)
+```
+
+`aead_key` feeds ChaCha20-Poly1305 with `nonce = [seq: u64 LE | 0u32]` and
+`AAD = sender_x25519_pub`.
+
+Hybrid security guarantee: the session is confidential against any adversary
+unable to break BOTH X25519 (classical DH) AND ML-KEM-768 (post-quantum
+KEM). A future quantum break of X25519 alone does not compromise the
+session.
 
 Receivers maintain a 64-slot sliding replay window per session, anchored at
 the highest `seq` accepted.
 
-X25519 keypairs are rotated every 100 sends. The previous key is dropped
-immediately (and zeroized by `x25519-dalek`).
+X25519 keypairs are rotated every 100 sends (forward secrecy at the
+classical layer). The ML-KEM keypair is long-term per process; rotating it
+on a daily cadence (with a graceful overlap window) is a recommended
+operational hardening.
+
+## 14. ONION_KEY_ANNOUNCE (0x0C)
+
+Network-wide flood that advertises a node's current onion ephemeral X25519
+public key. Without this, an onion sender can only build a forward-secret
+onion to a *direct* neighbour (the only nodes whose ephemeral pub it learns
+via CoordAnnounce). Multi-hop FS onions require this frame.
+
+Wire layout (145 bytes):
+
+```
+[origin: 32]              — announcing node's identity
+[seq: u64 LE]             — strictly monotonic per origin
+[valid_from_ms: u64 LE]   — sender wall-clock
+[onion_eph_pub: 32]       — current ephemeral pub
+[sig: 64]                 — Ed25519 sig over (origin||seq||valid_from_ms||onion_eph_pub)
+```
+
+Forwarding rules:
+* Reject if `origin == own pub_key` (anti-spoof/self-loop).
+* Verify the Ed25519 signature against `origin`.
+* Drop if `now - valid_from_ms` exceeds 24 h (stale).
+* Drop if `valid_from_ms` is more than 60 s in the future (skew abuse).
+* Keep per-origin only the highest `seq` seen.
+* On first-sight of a strictly newer `(origin, seq)`, forward to every
+  peer except the sender.
 
 ## 13. Discovery
 

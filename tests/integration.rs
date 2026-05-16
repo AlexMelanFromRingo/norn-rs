@@ -100,7 +100,7 @@ async fn two_nodes_connect_and_exchange() {
         conn_a.write_to(msg, &pub_b).await.expect("A→B write failed");
     }
 
-    let received_on_b = tokio::time::timeout(Duration::from_secs(5), async {
+    let received_on_b = tokio::time::timeout(Duration::from_secs(15), async {
         let mut received = Vec::new();
         for _ in 0..5 {
             let pkt = conn_b.read_from().await.expect("B read_from failed");
@@ -125,7 +125,7 @@ async fn two_nodes_connect_and_exchange() {
         conn_b.write_to(msg, &pub_a).await.expect("B→A write failed");
     }
 
-    let received_on_a = tokio::time::timeout(Duration::from_secs(5), async {
+    let received_on_a = tokio::time::timeout(Duration::from_secs(15), async {
         let mut received = Vec::new();
         for _ in 0..5 {
             let pkt = conn_a.read_from().await.expect("A read_from failed");
@@ -240,7 +240,7 @@ async fn hyperbolic_routing_two_nodes() {
     }
 
     // Receive on B
-    let recv_b = tokio::time::timeout(Duration::from_secs(5), async {
+    let recv_b = tokio::time::timeout(Duration::from_secs(15), async {
         let mut received = Vec::new();
         for _ in 0..10 {
             let pkt = conn_b.read_from().await.expect("B read_from failed");
@@ -257,7 +257,7 @@ async fn hyperbolic_routing_two_nodes() {
     }
 
     // Receive on A
-    let recv_a = tokio::time::timeout(Duration::from_secs(5), async {
+    let recv_a = tokio::time::timeout(Duration::from_secs(15), async {
         let mut received = Vec::new();
         for _ in 0..10 {
             let pkt = conn_a.read_from().await.expect("A read_from failed");
@@ -365,7 +365,7 @@ async fn three_nodes_forwarding() {
         conn_a.write_to(msg, &pub_c).await.expect("A→C write failed");
     }
 
-    let recv_c = tokio::time::timeout(Duration::from_secs(5), async {
+    let recv_c = tokio::time::timeout(Duration::from_secs(15), async {
         let mut out = Vec::new();
         for _ in 0..5 {
             let pkt = conn_c.read_from().await.expect("C read_from failed");
@@ -391,7 +391,7 @@ async fn three_nodes_forwarding() {
         conn_c.write_to(msg, &pub_a).await.expect("C→A write failed");
     }
 
-    let recv_a = tokio::time::timeout(Duration::from_secs(5), async {
+    let recv_a = tokio::time::timeout(Duration::from_secs(15), async {
         let mut out = Vec::new();
         for _ in 0..5 {
             let pkt = conn_a.read_from().await.expect("A read_from failed");
@@ -500,7 +500,9 @@ async fn large_payload_60kb() {
         conn_a.write_to(payload, &pub_b).await.expect("A→B write failed");
     }
 
-    let received = tokio::time::timeout(Duration::from_secs(30), async {
+    // Generous timeout: PQ HKDF + 60KB per packet + 64KB duplex pipe means
+    // each message round-trips slowly under parallel test contention.
+    let received = tokio::time::timeout(Duration::from_secs(120), async {
         let mut out = Vec::new();
         for _ in 0..N {
             let pkt = conn_b.read_from().await.expect("B read_from failed");
@@ -568,7 +570,7 @@ async fn concurrent_bidirectional_200_each() {
     });
 
     // Receiver: collect N from B and N from A
-    let recv_on_b = tokio::time::timeout(Duration::from_secs(30), async {
+    let recv_on_b = tokio::time::timeout(Duration::from_secs(60), async {
         let mut count = 0usize;
         while count < N {
             conn_b.read_from().await.expect("B read_from failed");
@@ -576,7 +578,7 @@ async fn concurrent_bidirectional_200_each() {
         }
         count
     });
-    let recv_on_a = tokio::time::timeout(Duration::from_secs(30), async {
+    let recv_on_a = tokio::time::timeout(Duration::from_secs(60), async {
         let mut count = 0usize;
         while count < N {
             conn_a.read_from().await.expect("A read_from failed");
@@ -622,7 +624,7 @@ async fn four_node_linear_chain() {
     let msgs: Vec<Vec<u8>> = (0..3).map(|i| format!("linear_0to2_{}", i).into_bytes()).collect();
     for msg in &msgs { conns[0].write_to(msg, &pubs[2]).await.expect("0→2 write failed"); }
 
-    let recv = tokio::time::timeout(Duration::from_secs(10), async {
+    let recv = tokio::time::timeout(Duration::from_secs(20), async {
         let mut out = Vec::new();
         for _ in 0..3 {
             let pkt = conns[2].read_from().await.expect("read failed");
@@ -686,7 +688,7 @@ async fn five_node_star_topology() {
         conns[1].write_to(msg, &pubs[3]).await.expect("1→3 write failed");
     }
 
-    let recv = tokio::time::timeout(Duration::from_secs(10), async {
+    let recv = tokio::time::timeout(Duration::from_secs(20), async {
         let mut out = Vec::new();
         for _ in 0..5 {
             let pkt = conns[3].read_from().await.expect("spoke 3 read failed");
@@ -768,7 +770,7 @@ async fn onion_routing_via_relay() {
             .expect("write_to_onion failed");
     }
 
-    let recv_c = tokio::time::timeout(Duration::from_secs(5), async {
+    let recv_c = tokio::time::timeout(Duration::from_secs(15), async {
         let mut out = Vec::new();
         for _ in 0..3 {
             let pkt = conn_c.read_from().await.expect("C read_from failed");

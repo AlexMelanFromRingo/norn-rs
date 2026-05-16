@@ -1,0 +1,72 @@
+.TH NORNCTL 8 "2026-05-16" "norn-rs 0.3" "norn-rs Manual"
+.SH NAME
+nornctl \- administer a running nornd daemon
+.SH SYNOPSIS
+.B nornctl
+[\fI\-s SOCKET\fR] [\fI\-\-json\fR] \fICOMMAND\fR [\fIARGS\fR]
+.SH DESCRIPTION
+.B nornctl
+is a thin client over the JSON UNIX-socket interface exposed by
+.BR nornd (8).
+By default it formats output for humans; pass \fB\-\-json\fR for machine-
+readable output.
+.SH OPTIONS
+.TP
+\fB\-s\fR \fIPATH\fR, \fB\-\-socket\fR \fIPATH\fR
+Admin socket path. Default: \fI/var/run/norn.sock\fR.
+.TP
+\fB\-\-json\fR
+Emit raw JSON instead of a human-readable table.
+.SH COMMANDS
+.TP
+.B status
+Show this node's identity (pub_key, address) and connected peer count.
+.TP
+.B peers
+List currently-connected peers with link metrics: lag, jitter, loss rate,
+trust score, traffic counters, uptime.
+.TP
+\fBaddpeer\fR \fIURI\fR
+Dial a new peer at the given URI (\fBtcp://host:port\fR). Returns once the
+dial has been queued; check \fBpeers\fR to confirm establishment.
+.TP
+\fBshowaddr\fR \fIPUB_KEY_HEX\fR
+Compute the 200::/7 IPv6 address derived from a 64-char hex Ed25519 pub key.
+Runs locally; does not touch the admin socket.
+.SH EXAMPLES
+.PP
+Show identity:
+.RS
+.nf
+$ nornctl status
+pub_key:    a8b7…
+address:    200:1cb8:c754:7af0:e2b6:ba5e:1177:69c0
+peer_count: 3
+.fi
+.RE
+.PP
+List peers as JSON for consumption by a monitoring system:
+.RS
+.nf
+$ nornctl --json peers | jq '.[].address'
+.fi
+.RE
+.PP
+Add a peer at runtime:
+.RS
+.nf
+$ nornctl addpeer tcp://203.0.113.42:9001
+dialing: tcp://203.0.113.42:9001
+.fi
+.RE
+.SH EXIT STATUS
+.TP
+.B 0
+Command succeeded.
+.TP
+.B 1
+Could not connect to the socket, or the daemon returned an error response.
+.SH SEE ALSO
+.BR nornd (8)
+.SH AUTHORS
+norn-rs contributors.

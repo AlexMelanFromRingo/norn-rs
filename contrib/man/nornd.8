@@ -1,0 +1,113 @@
+.\" Manpage for nornd (groff -man)
+.\" View with: man -l contrib/man/nornd.8
+.TH NORND 8 "2026-05-16" "norn-rs 0.3" "norn-rs Manual"
+.SH NAME
+nornd \- norn-rs mesh overlay daemon
+.SH SYNOPSIS
+.B nornd
+[\fI\-c CONFIG\fR]
+.br
+.B nornd genconfig
+[\fI\-o OUTPUT\fR]
+.br
+.B nornd showaddr
+[\fI\-c CONFIG\fR]
+.SH DESCRIPTION
+.B nornd
+runs a node in the norn-rs encrypted overlay mesh. Each node has a stable
+Ed25519 identity and a corresponding deterministic IPv6 address in the
+.B 200::/7
+range. Traffic between nodes is end-to-end encrypted with X25519 + ML-KEM-768
+(post-quantum hybrid) session keys; intermediate hops see only ciphertext.
+.PP
+The daemon optionally creates a TUN device so that arbitrary IPv6 traffic
+addressed to other mesh participants is transparently routed through the overlay.
+.PP
+Onion routing wraps Traffic packets in N concentric AEAD layers so that no
+single relay learns both endpoints; fixed-size cells prevent global passive
+observers from correlating packets across hops by size.
+.SH OPTIONS
+.TP
+\fB\-c\fR \fICONFIG\fR, \fB\-\-config\fR \fICONFIG\fR
+Path to the TOML config file (default: \fI/etc/norn/norn.toml\fR). The
+file MUST have mode 0o600 or stricter (no group/other access) because it
+contains the node's private key; nornd refuses to start otherwise.
+.SH SUBCOMMANDS
+.TP
+.B genconfig [\-o OUTPUT]
+Generate a fresh config with a random private key. Writes to \fIOUTPUT\fR
+(mode 0600, O_EXCL — refuses to overwrite) or stdout if \fI\-o\fR is omitted.
+.TP
+.B showaddr [\-c CONFIG]
+Print the pub key and 200::/7 address derived from the configured private key.
+.SH CONFIG FORMAT
+.PP
+The TOML config supports:
+.RS
+.TP
+.B private_key
+64-char hex Ed25519 private key. KEEP THIS SECRET.
+.TP
+.B listen
+Array of TCP listen URIs. Default: \fB["tcp://0.0.0.0:9001"]\fR.
+.TP
+.B peers
+Array of static peer URIs to dial on startup.
+.TP
+.B tun_name
+TUN interface name. Omit to disable kernel-side routing (routing-only mode).
+.TP
+.B admin_socket
+Path to the admin UNIX socket. Default: \fI/var/run/norn.sock\fR.
+.TP
+.B multicast_enabled
+Whether to discover LAN peers via UDP multicast. Default: \fBtrue\fR.
+.TP
+.B multicast_port
+UDP port for multicast beacons. Default: \fB9001\fR.
+.TP
+.B log_level
+One of \fIerror\fR / \fIwarn\fR / \fIinfo\fR / \fIdebug\fR / \fItrace\fR.
+.RE
+.SH ENVIRONMENT
+.TP
+.B RUST_LOG
+Overrides log filter (e.g. \fBnorn_rs=debug\fR). Takes precedence over the
+\fIlog_level\fR config setting.
+.TP
+.B NORN_ALLOW_EPHEMERAL_KEY
+If set to \fI1\fR, nornd starts without a configured private key by
+generating a fresh ephemeral one each run. The node's identity and IPv6
+address change every restart. Do NOT use this in production; the default
+policy refuses ephemeral keys to avoid silent identity churn.
+.SH FILES
+.TP
+.I /etc/norn/norn.toml
+Default config path.
+.TP
+.I /var/run/norn.sock
+Default admin UNIX socket.
+.TP
+.I /dev/net/tun
+TUN device (requires \fBCAP_NET_ADMIN\fR or root).
+.SH SECURITY
+The config file holds the node's long-term Ed25519 private key. nornd
+refuses to load a config with group- or world-readable permissions. The
+admin socket is created with mode 0o600 atomically (umask narrowed before
+\fBbind\fR(2) to close the TOCTOU window).
+.PP
+See SECURITY.md in the source distribution for the full threat model.
+.SH EXIT STATUS
+.TP
+.B 0
+Clean shutdown (SIGTERM / Ctrl-C).
+.TP
+.B 1
+Configuration or startup error (also: refused to load a permissive config).
+.SH SEE ALSO
+.BR nornctl (8)
+.SH BUGS
+Report security issues per SECURITY.md. Functional issues to the project
+tracker.
+.SH AUTHORS
+norn-rs contributors.
