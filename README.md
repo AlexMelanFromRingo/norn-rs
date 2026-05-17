@@ -226,6 +226,39 @@ With it, every dead route is evicted from the per-link negative cache
 within seconds of the first failed forward — visible as the
 sub-30-second steady-state recovery in `convergence.svg`.
 
+### Adversarial run: 1 cuckoo-poisoning attacker among 100 honest nodes
+
+`MALICIOUS_NODES=0 bash tests/cluster/run.sh` plants a node that runs
+in `NORN_MALICIOUS_MODE=cuckoo_poison`: every outgoing CuckooMsg gets
+64 random 16-byte routing_tags injected, so every neighbour believes
+the attacker can route those tags. Traffic sent through it falls into
+a black hole — the canonical cuckoo-poisoning attack.
+
+Observed mesh response (100 nodes, NetEm WAN physics, 120 s run):
+
+| Time window | Mean trust observers→attacker | Notes |
+|---|---|---|
+| 0-20 s | 0.558 | First probe timeouts already decaying trust |
+| 20-40 s | 0.288 | Multiplicative ×0.5 decay compounding |
+| 40-60 s | 0.228 | Pre-chaos steady-state |
+| 60-80 s | 0.540 | Brief bump from chaos-restart noise |
+| **100-120 s** | **0.193** | Final — max-trust across observers = 0.5 |
+
+The three direct neighbours of the attacker all collapsed from `trust=1.0`
+to `trust=0.03–0.06` — a ~96 % reduction. With
+`adjusted_cost = base_cost / trust`, that pushes the attacker's
+effective cost up by **~30×**, evicting it from the lowest-cost
+candidate set in every `lookup_by_tag` call. The attacker is still
+*online*, but the rest of the mesh routes around it as if it had a
+permanent 30× latency penalty.
+
+![Trust collapse against the planted attacker](docs/cluster/malicious_trust.svg)
+
+This is the trust system doing exactly what the audit demanded: a peer
+that lies about reachable tags decays out of the routing fast-path
+without needing operator intervention. No quorum / Byzantine voting
+involved — just per-link probe success and PathNegative back-pressure.
+
 ![Convergence — peer count per node](docs/cluster/convergence.svg)
 ![Per-peer latency over time](docs/cluster/latency.svg)
 ![Per-peer loss rate](docs/cluster/loss.svg)

@@ -116,6 +116,9 @@ async fn main() -> Result<()> {
     // Loud warning if the test-only rotation acceleration knob is set —
     // operators who flipped it by accident will see it in the daemon log.
     norn_rs::router::warn_if_rotation_accelerated();
+    // Same for malicious-test mode (cuckoo poisoning) — fires the warning
+    // immediately on startup so log scrapers + operators notice.
+    norn_rs::router::warn_if_malicious();
 
     // Start node
     let node = Node::new(config).await?;

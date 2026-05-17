@@ -65,7 +65,14 @@ except ImportError:
                 return line.split()[1]
         raise SystemExit("topology.py: failed to derive pub_key via nornd showaddr")
 
-N_NODES = 300
+N_NODES = 100
+# Indices that should run with NORN_MALICIOUS_MODE=cuckoo_poison.
+# Set via env so a single topology.py can produce either an all-honest
+# cluster (default) or one with planted attackers for the trust-ejection
+# experiment.
+MALICIOUS_NODES: set[int] = set(
+    int(x) for x in os.environ.get("MALICIOUS_NODES", "").split(",") if x.strip().isdigit()
+)
 # Aim for a low-degree mesh that still routes interestingly.
 # RING_DEGREE = 1 → 2 ring-adjacent peers per node (forward + back).
 # SHORTCUT_DEGREE = 1 → 1 random long-distance peer per node (one direction;
@@ -172,6 +179,15 @@ def write_compose(n: int, pubs: list[str]) -> None:
             f'    ports:\n      - "{METRICS_PORT + i}:{METRICS_PORT}"\n'
             if expose_host_ports else ""
         )
+        # Conditional malicious-mode env. The honest path keeps env list
+        # short so a quick grep over the compose file tells operators
+        # exactly which nodes are planted attackers.
+        malicious_env = ""
+        if i in MALICIOUS_NODES:
+            malicious_env = (
+                "      - NORN_MALICIOUS_MODE=cuckoo_poison\n"
+                "      - NORN_MALICIOUS_POISON_TAGS=64\n"
+            )
         services.append(
             f"""  norn-{i:02d}:
     image: norn-testnode:latest
@@ -195,6 +211,7 @@ def write_compose(n: int, pubs: list[str]) -> None:
       - NORN_TEST_TRAFFIC_TO_HEX={dest_hex}
       - NORN_TEST_TRAFFIC_RATE_MS=500
       - NORN_TEST_TRAFFIC_PAYLOAD=64
+{malicious_env}
     restart: "no"
     tmpfs:
       - /var/run:size=4M"""
@@ -230,9 +247,17 @@ def main() -> int:
     adj = small_world_peers(N_NODES, RING_DEGREE, SHORTCUT_DEGREE, rng)
     keys = [gen_ed25519_priv_hex() for _ in range(N_NODES)]
     pubs = [derive_pub_hex(k) for k in keys]
-    # Persist pub_keys for postmortem analysis tools (e.g. find_path.py).
+    # Persist pub_keys + malicious node list for postmortem analysis
+    # tools (e.g. plot.py uses them to render the "trust against attacker"
+    # plot).
     (HERE / "pub_keys.json").write_text(
-        json.dumps({f"n{i:02d}": pubs[i] for i in range(N_NODES)}, indent=2)
+        json.dumps(
+            {
+                "pub_keys": {f"n{i:02d}": pubs[i] for i in range(N_NODES)},
+                "malicious": sorted(MALICIOUS_NODES),
+            },
+            indent=2,
+        )
     )
     write_configs(adj, keys)
     write_compose(N_NODES, pubs)

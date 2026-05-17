@@ -13,6 +13,39 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{mpsc, watch};
 use tracing::{debug, warn};
 
+/// Test-only env knob that turns this node into a cuckoo-filter poisoner.
+/// When `NORN_MALICIOUS_MODE=cuckoo_poison`, every outgoing CuckooMsg gets
+/// `NORN_MALICIOUS_POISON_TAGS` (default 64) random 16-byte routing_tags
+/// injected. Neighbours that consult the poisoned filter will pick this
+/// node as next-hop for tags it can't actually reach → forward fails →
+/// PathNegative back → trust decays on this node. This is the canonical
+/// route-poisoning attack — useful to verify the cluster ejects bad actors.
+///
+/// Returns the number of tags to inject; 0 disables. Loud warning at
+/// startup; MUST NOT be set in production.
+pub fn malicious_cuckoo_poison_tags() -> usize {
+    let mode = std::env::var("NORN_MALICIOUS_MODE").ok();
+    if mode.as_deref() != Some("cuckoo_poison") {
+        return 0;
+    }
+    std::env::var("NORN_MALICIOUS_POISON_TAGS")
+        .ok().and_then(|s| s.parse().ok()).unwrap_or(64)
+}
+
+/// Log a startup warning if any malicious mode is active. Called from
+/// daemon main so an operator who flipped the knob notices immediately.
+pub fn warn_if_malicious() {
+    let n = malicious_cuckoo_poison_tags();
+    if n > 0 {
+        tracing::warn!(
+            "NORN_MALICIOUS_MODE=cuckoo_poison — this node will inject {} random \
+             routing_tags into every outgoing CuckooMsg. NEIGHBOURS WILL ROUTE TRAFFIC \
+             TOWARD US THAT WE CANNOT DELIVER. This MUST NOT be used in production.",
+            n,
+        );
+    }
+}
+
 /// Test-only env knob that compresses every "rotate every N hours/days"
 /// interval down to a configurable number of seconds. Set to a positive
 /// integer via `NORN_ACCELERATE_ROTATIONS_SECS=30` to verify rotation
@@ -949,6 +982,22 @@ impl RouterState {
             }
             // Merge peer's cuckoo (downstream)
             merged.merge(&peer.cuckoo[tree_id]);
+        }
+
+        // MALICIOUS test mode: inject random routing_tags so neighbours
+        // route traffic toward us that we can't deliver. This is the canonical
+        // cuckoo-poisoning attack — used by the test harness to verify the
+        // mesh's PathNegative + trust-decay stack actually ejects bad actors.
+        // No-op when NORN_MALICIOUS_MODE is unset (production path).
+        let poison_count = malicious_cuckoo_poison_tags();
+        if poison_count > 0 {
+            // New random tags every emission so victims can't dedupe.
+            let mut rng = OsRng;
+            for _ in 0..poison_count {
+                let mut tag = [0u8; 16];
+                rand::RngCore::fill_bytes(&mut rng, &mut tag);
+                merged.add(&tag);
+            }
         }
 
         // Send to parent (upstream)
@@ -4897,6 +4946,53 @@ mod tests {
         let v = accelerate_rotations_secs();
         unsafe { std::env::remove_var("NORN_ACCELERATE_ROTATIONS_SECS"); }
         assert_eq!(v, Some(30));
+    }
+
+    // ── NORN_MALICIOUS_MODE env knob ─────────────────────────────────────────
+
+    #[test]
+    fn malicious_unset_returns_zero() {
+        unsafe {
+            std::env::remove_var("NORN_MALICIOUS_MODE");
+            std::env::remove_var("NORN_MALICIOUS_POISON_TAGS");
+        }
+        assert_eq!(malicious_cuckoo_poison_tags(), 0,
+            "unset env must yield 0 (= no poisoning, production path)");
+    }
+
+    #[test]
+    fn malicious_wrong_mode_returns_zero() {
+        unsafe {
+            std::env::set_var("NORN_MALICIOUS_MODE", "bad_mouthing");
+        }
+        let n = malicious_cuckoo_poison_tags();
+        unsafe { std::env::remove_var("NORN_MALICIOUS_MODE"); }
+        assert_eq!(n, 0, "unrecognised mode must yield 0");
+    }
+
+    #[test]
+    fn malicious_cuckoo_poison_default_64() {
+        unsafe {
+            std::env::set_var("NORN_MALICIOUS_MODE", "cuckoo_poison");
+            std::env::remove_var("NORN_MALICIOUS_POISON_TAGS");
+        }
+        let n = malicious_cuckoo_poison_tags();
+        unsafe { std::env::remove_var("NORN_MALICIOUS_MODE"); }
+        assert_eq!(n, 64, "cuckoo_poison without count override must default to 64");
+    }
+
+    #[test]
+    fn malicious_cuckoo_poison_custom_count() {
+        unsafe {
+            std::env::set_var("NORN_MALICIOUS_MODE", "cuckoo_poison");
+            std::env::set_var("NORN_MALICIOUS_POISON_TAGS", "200");
+        }
+        let n = malicious_cuckoo_poison_tags();
+        unsafe {
+            std::env::remove_var("NORN_MALICIOUS_MODE");
+            std::env::remove_var("NORN_MALICIOUS_POISON_TAGS");
+        }
+        assert_eq!(n, 200);
     }
 
     // ── PathNegative cuckoo-FP backtrack ────────────────────────────────────

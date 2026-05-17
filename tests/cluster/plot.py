@@ -170,6 +170,51 @@ def plot_convergence_time(series: dict, out: Path) -> None:
     print(f"  wrote {out}")
 
 
+def plot_malicious_trust(series: dict, out: Path, pubs_path: Path) -> None:
+    """How fast did the mesh's trust score for the planted attacker(s) decay?
+    One line per (observer, malicious_peer) — should collapse toward
+    TRUST_MIN=0.01 within minutes if the system works."""
+    if not pubs_path.exists():
+        print(f"  skipping {out.name} — no {pubs_path.name}")
+        return
+    meta = __import__("json").loads(pubs_path.read_text())
+    pubs = meta.get("pub_keys", meta)  # back-compat
+    malicious = meta.get("malicious", [])
+    if not malicious:
+        print(f"  skipping {out.name} — no malicious nodes recorded")
+        return
+    mal_hex = {pubs[f"n{i:02d}"] for i in malicious}
+
+    fig, ax = plt.subplots(figsize=(9, 5))
+    # Find every trust series where the peer label IS a malicious pub.
+    keys = [k for k in series
+            if k[0] == "norn_peer_trust" and k[2] in mal_hex]
+    if not keys:
+        print(f"  skipping {out.name} — no trust observations of attacker yet")
+        plt.close(fig)
+        return
+    for k in keys:
+        pts = series[k]
+        xs = [p[0] for p in pts]
+        ys = [p[1] for p in pts]
+        ax.plot(xs, ys, alpha=0.45, linewidth=0.9, color="crimson")
+    ax.axhline(0.01, color="black", linestyle=":", alpha=0.5,
+               label="TRUST_MIN (0.01)")
+    ax.axhline(1.0, color="black", linestyle="--", alpha=0.5,
+               label="initial baseline (1.0)")
+    ax.set_xlabel("time since cluster start (s)")
+    ax.set_ylabel("trust score from observer → attacker")
+    ax.set_title(f"Trust collapse against {len(malicious)} planted "
+                 f"cuckoo-poisoner(s) — {len(keys)} observer/attacker pairs")
+    ax.set_yscale("log")  # log y makes the collapse legible
+    ax.legend(loc="lower left", fontsize=8)
+    ax.grid(True, which="both", alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(out, format="svg")
+    plt.close(fig)
+    print(f"  wrote {out}")
+
+
 def plot_poison(series: dict, out: Path) -> None:
     """Global mutex_poison_total per node over time — should be flat 0.
     Any nonzero value flags a panic-while-holding-lock incident."""
@@ -226,6 +271,8 @@ def main() -> int:
                   OUT_DIR / "trust.svg")
     plot_cuckoo_storm(series, OUT_DIR / "cuckoo_storm.svg")
     plot_poison(series, OUT_DIR / "mutex_poison.svg")
+    plot_malicious_trust(series, OUT_DIR / "malicious_trust.svg",
+                         HERE / "pub_keys.json")
     return 0
 
 
