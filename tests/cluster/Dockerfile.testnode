@@ -1,0 +1,62 @@
+# syntax=docker/dockerfile:1.7
+#
+# Test-cluster node image. Like the production Dockerfile but:
+#   - builds nornd WITHOUT tun-support (overlay-only, no /dev/net/tun needed
+#     → no special privileges, runs cleanly under stock docker-compose).
+#   - keeps a real shell + sleep so docker-compose can hold containers up
+#     even when nornd crashes (we want to diff metrics, not just lose data).
+#   - uses debian:bookworm-slim so curl is one apt-get away if a debugger
+#     needs to probe a running container.
+
+FROM rust:1.90-slim-bookworm AS build
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends pkg-config ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /src
+
+# Dependency layer (cached on source-only changes).
+COPY Cargo.toml Cargo.lock ./
+RUN mkdir -p src/bin benches \
+ && echo "fn main(){}" > src/bin/nornd.rs \
+ && echo "fn main(){}" > src/bin/nornctl.rs \
+ && echo "" > src/lib.rs \
+ && echo "fn main(){}" > benches/bench.rs \
+ && cargo build --release --no-default-features --bin nornd --bin nornctl \
+ && rm -rf src benches
+
+# Real source.
+COPY . .
+RUN touch src/lib.rs src/bin/nornd.rs src/bin/nornctl.rs \
+ && cargo build --release --no-default-features --bin nornd --bin nornctl \
+ && strip target/release/nornd target/release/nornctl
+
+FROM debian:bookworm-slim AS runtime
+
+# iproute2 lets the entrypoint set up a NetEm qdisc on eth0 — adds
+# realistic WAN delay/jitter/loss so the routing layer actually exercises
+# its cost-aware path selection, PathNegative backtrack and trust scoring.
+# Without this the docker bridge gives sub-ms RTT with 0 % loss and every
+# anti-poisoning / FP-recovery code path is dead.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends ca-certificates curl iproute2 \
+ && rm -rf /var/lib/apt/lists/*
+
+COPY --from=build /src/target/release/nornd   /usr/local/bin/nornd
+COPY --from=build /src/target/release/nornctl /usr/local/bin/nornctl
+COPY tests/cluster/entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+
+# Each node mounts its own config to /etc/norn/norn.toml
+ENV NORND_CONFIG=/etc/norn/norn.toml
+# Defaults can be overridden per-service in docker-compose.yml.
+ENV NETEM_DELAY_MS=50
+ENV NETEM_JITTER_MS=10
+ENV NETEM_LOSS_PCT=2
+
+EXPOSE 9001/tcp
+EXPOSE 9090/tcp
+
+ENTRYPOINT ["/entrypoint.sh"]
+CMD ["-c", "/etc/norn/norn.toml"]

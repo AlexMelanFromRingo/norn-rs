@@ -13,6 +13,44 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{mpsc, watch};
 use tracing::{debug, warn};
 
+/// Test-only env knob that compresses every "rotate every N hours/days"
+/// interval down to a configurable number of seconds. Set to a positive
+/// integer via `NORN_ACCELERATE_ROTATIONS_SECS=30` to verify rotation
+/// end-to-end inside a CI run instead of waiting for the production
+/// 1h / 24h intervals. Returns `None` when not set or zero.
+///
+/// Affects:
+///   - `ML_KEM_KEY_ROTATION_MS` (session.rs)        — daily PQ key rotation
+///   - `ML_KEM_KEY_OVERLAP_MS`  (session.rs)        — prev_dk grace window
+///   - `ONION_KEY_ROTATION_TICKS`                    — hourly onion key rotation
+///   - `CUCKOO_GEN_TICKS`                            — cuckoo filter generation rollover
+///
+/// MUST NOT be set in production: short rotation cadence reduces forward
+/// secrecy headroom and bumps CPU. The setter logs a loud warning at
+/// startup so an operator who flipped it by mistake notices.
+pub fn accelerate_rotations_secs() -> Option<u64> {
+    // Read every call — env vars are cheap, and a test can flip the
+    // value at runtime via std::env::set_var. The OnceLock cached path
+    // would make that impossible.
+    let raw = std::env::var("NORN_ACCELERATE_ROTATIONS_SECS").ok()?;
+    let n: u64 = raw.trim().parse().ok()?;
+    if n == 0 { None } else { Some(n) }
+}
+
+/// Log a startup warning if the rotation accelerator is active. Called
+/// once from the daemon main; idempotent if called multiple times because
+/// it just emits a tracing event.
+pub fn warn_if_rotation_accelerated() {
+    if let Some(secs) = accelerate_rotations_secs() {
+        tracing::warn!(
+            "NORN_ACCELERATE_ROTATIONS_SECS={} — ALL key rotation intervals \
+             compressed to {} seconds. This MUST NOT be used in production. \
+             Unset the variable to restore normal cadence.",
+            secs, secs,
+        );
+    }
+}
+
 /// Process-wide counter of mutex-poison-recovery events. Exposed via
 /// `mutex_poison_count()` and surfaced in `/metrics` as
 /// `norn_mutex_poison_total`. Operators MUST treat any non-zero value as a
@@ -883,7 +921,12 @@ impl RouterState {
     /// Cuckoo filter maintenance for tree `tree_id`.
     fn cuckoo_do_maintenance(&mut self, tree_id: usize) {
         // Every CUCKOO_GEN_TICKS, advance our generation (evicts stale entries).
-        if self.tick.is_multiple_of(CUCKOO_GEN_TICKS) && self.tick > 0 {
+        // Under accelerated-rotation mode the interval drops to N seconds for
+        // test-cluster purposes (does not affect production).
+        let interval = accelerate_rotations_secs()
+            .map(|s| s.max(1) as u32)
+            .unwrap_or(CUCKOO_GEN_TICKS);
+        if self.tick.is_multiple_of(interval) && self.tick > 0 {
             self.cuckoo_generation[tree_id] += 1;
         }
         let generation = self.cuckoo_generation[tree_id];
@@ -1031,10 +1074,16 @@ impl RouterState {
     /// neighbours don't keep building onions with our about-to-expire pub.
     #[mutants::skip]
     fn rotate_onion_keys_if_due(&mut self) {
-        if self.tick.is_multiple_of(ONION_KEY_ROTATION_TICKS) && self.tick > 0 {
+        // Under NORN_ACCELERATE_ROTATIONS_SECS, treat that env value as the
+        // tick interval directly (1 tick = 1s). At default this stays at
+        // ONION_KEY_ROTATION_TICKS = 3600 (1h).
+        let interval = accelerate_rotations_secs()
+            .map(|s| s.max(1) as u32)
+            .unwrap_or(ONION_KEY_ROTATION_TICKS);
+        if self.tick.is_multiple_of(interval) && self.tick > 0 {
             self.onion_keys.rotate();
             self.broadcast_onion_key_announce();
-            debug!("onion keys rotated at tick {}", self.tick);
+            debug!("onion keys rotated at tick {} (interval {})", self.tick, interval);
         }
     }
 
@@ -4802,6 +4851,52 @@ mod tests {
         assert_eq!(nonparent_count, 1,
             "non-parent must receive exactly 1 message (full_merged); \
              `== → !=` mutation sends 0 (loop skips non-parents)");
+    }
+
+    // ── NORN_ACCELERATE_ROTATIONS_SECS env knob ─────────────────────────────
+
+    #[test]
+    fn accelerate_rotations_secs_unset_returns_none() {
+        // SAFETY: env vars are process-global; clear it explicitly so the
+        // test result doesn't depend on outer test environment.
+        unsafe {
+            std::env::remove_var("NORN_ACCELERATE_ROTATIONS_SECS");
+        }
+        assert!(accelerate_rotations_secs().is_none(),
+            "unset env var must yield None (= production cadence)");
+    }
+
+    #[test]
+    fn accelerate_rotations_secs_zero_treated_as_unset() {
+        // "0" is the same as "not set" — operators can clear the knob
+        // without unsetting by just writing 0.
+        unsafe {
+            std::env::set_var("NORN_ACCELERATE_ROTATIONS_SECS", "0");
+        }
+        let v = accelerate_rotations_secs();
+        unsafe { std::env::remove_var("NORN_ACCELERATE_ROTATIONS_SECS"); }
+        assert!(v.is_none(), "0 must be treated the same as unset; got {:?}", v);
+    }
+
+    #[test]
+    fn accelerate_rotations_secs_garbage_returns_none() {
+        // Bad values are silently ignored — better than failing to start.
+        unsafe {
+            std::env::set_var("NORN_ACCELERATE_ROTATIONS_SECS", "not-a-number");
+        }
+        let v = accelerate_rotations_secs();
+        unsafe { std::env::remove_var("NORN_ACCELERATE_ROTATIONS_SECS"); }
+        assert!(v.is_none(), "non-numeric must yield None; got {:?}", v);
+    }
+
+    #[test]
+    fn accelerate_rotations_secs_parses_valid_value() {
+        unsafe {
+            std::env::set_var("NORN_ACCELERATE_ROTATIONS_SECS", "30");
+        }
+        let v = accelerate_rotations_secs();
+        unsafe { std::env::remove_var("NORN_ACCELERATE_ROTATIONS_SECS"); }
+        assert_eq!(v, Some(30));
     }
 
     // ── PathNegative cuckoo-FP backtrack ────────────────────────────────────

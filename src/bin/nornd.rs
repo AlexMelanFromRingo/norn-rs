@@ -113,6 +113,10 @@ async fn main() -> Result<()> {
         .with_target(false)
         .init();
 
+    // Loud warning if the test-only rotation acceleration knob is set —
+    // operators who flipped it by accident will see it in the daemon log.
+    norn_rs::router::warn_if_rotation_accelerated();
+
     // Start node
     let node = Node::new(config).await?;
     node.start().await?;

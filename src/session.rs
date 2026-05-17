@@ -51,6 +51,30 @@ pub const ML_KEM_KEY_ROTATION_MS: u64 = 24 * 60 * 60 * 1000; // 24h
 /// already in flight against the just-replaced pub.
 pub const ML_KEM_KEY_OVERLAP_MS: u64 = 60_000; // 60s
 
+/// Active rotation interval — accounts for the `NORN_ACCELERATE_ROTATIONS_SECS`
+/// test knob. In production this equals `ML_KEM_KEY_ROTATION_MS`. In a
+/// test cluster (see tests/cluster/) it can be cranked down to seconds so
+/// rotation can be observed end-to-end inside a single CI run.
+fn effective_ml_kem_rotation_ms() -> u64 {
+    if let Some(secs) = crate::router::accelerate_rotations_secs() {
+        return secs.saturating_mul(1000);
+    }
+    ML_KEM_KEY_ROTATION_MS
+}
+
+/// Active overlap window — scales down similarly under acceleration so the
+/// prev_dk clear-out doesn't take a full real-minute when rotation runs
+/// every few seconds.
+fn effective_ml_kem_overlap_ms() -> u64 {
+    if let Some(secs) = crate::router::accelerate_rotations_secs() {
+        // Overlap = max(1s, 1/4 of rotation interval) — keeps overlap short
+        // enough to actually trigger eviction in a test, long enough to
+        // catch genuinely in-flight Acks.
+        return (secs.saturating_mul(250)).max(1_000);
+    }
+    ML_KEM_KEY_OVERLAP_MS
+}
+
 impl PqKeys {
     fn generate() -> Self {
         let (dk, ek) = MlKem768::generate_keypair();
@@ -100,13 +124,13 @@ impl PqKeys {
 
         // Clear prev_dk after overlap window so it can't decap any longer
         // (and so the StaticSecret is dropped / zeroized).
-        if self.prev_dk.is_some() && elapsed_ms > ML_KEM_KEY_OVERLAP_MS {
+        if self.prev_dk.is_some() && elapsed_ms > effective_ml_kem_overlap_ms() {
             self.prev_dk = None;
             changed = true;
         }
 
         // Rotate when key has aged past ROTATION_MS.
-        if elapsed_ms > ML_KEM_KEY_ROTATION_MS {
+        if elapsed_ms > effective_ml_kem_rotation_ms() {
             let (new_dk, new_ek) = MlKem768::generate_keypair();
             let new_ek_arr = new_ek.to_bytes();
             let mut new_ek_bytes = [0u8; ML_KEM_PUB_BYTES];
