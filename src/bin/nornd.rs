@@ -121,6 +121,16 @@ async fn main() -> Result<()> {
     let node = Node::new(config).await?;
     node.start().await?;
 
+    // Optional built-in test-traffic generator. Activated only when the
+    // env knob NORN_TEST_TRAFFIC_TO_HEX (comma-separated 64-char ed25519
+    // pub_keys) is set. Sends a tiny payload to each listed destination
+    // every NORN_TEST_TRAFFIC_RATE_MS (default 500). Loud warning at
+    // startup; MUST NOT be used in production — it's only here so cluster
+    // tests can exercise the routing layer end-to-end (PathNegative
+    // backtrack, trust decay on probe failure, cuckoo gossip propagation)
+    // without needing a full TUN deployment.
+    spawn_test_traffic(node.conn.clone());
+
     // Run forever (Ctrl-C to exit)
     tracing::info!("nornd running — Ctrl-C to stop");
     tokio::signal::ctrl_c().await.context("waiting for Ctrl-C")?;
@@ -128,6 +138,78 @@ async fn main() -> Result<()> {
     node.conn.close().await;
 
     Ok(())
+}
+
+/// Spawn a periodic write_to() loop driven by env vars. Returns silently
+/// if NORN_TEST_TRAFFIC_TO_HEX is unset → zero overhead in production.
+///
+/// Vars:
+///   NORN_TEST_TRAFFIC_TO_HEX   — comma-separated 64-char hex ed25519 pub_keys.
+///   NORN_TEST_TRAFFIC_RATE_MS  — interval between sends (default 500).
+///   NORN_TEST_TRAFFIC_PAYLOAD  — payload bytes per send (default 64).
+fn spawn_test_traffic(conn: std::sync::Arc<norn_rs::router::PacketConn>) {
+    let raw = match std::env::var("NORN_TEST_TRAFFIC_TO_HEX") {
+        Ok(v) if !v.trim().is_empty() => v,
+        _ => return,
+    };
+    let mut dests: Vec<[u8; 32]> = Vec::new();
+    for token in raw.split(',') {
+        let t = token.trim();
+        if t.len() != 64 {
+            tracing::warn!(
+                "NORN_TEST_TRAFFIC_TO_HEX entry not 64 hex chars, skipping: {}",
+                t,
+            );
+            continue;
+        }
+        let mut bytes = [0u8; 32];
+        match hex::decode_to_slice(t, &mut bytes) {
+            Ok(()) => dests.push(bytes),
+            Err(_) => tracing::warn!(
+                "NORN_TEST_TRAFFIC_TO_HEX entry not valid hex, skipping: {}", t,
+            ),
+        }
+    }
+    if dests.is_empty() {
+        tracing::warn!("NORN_TEST_TRAFFIC_TO_HEX parsed empty — no destinations");
+        return;
+    }
+    let rate_ms: u64 = std::env::var("NORN_TEST_TRAFFIC_RATE_MS")
+        .ok().and_then(|s| s.parse().ok()).unwrap_or(500);
+    let payload_len: usize = std::env::var("NORN_TEST_TRAFFIC_PAYLOAD")
+        .ok().and_then(|s| s.parse().ok()).unwrap_or(64);
+
+    tracing::warn!(
+        "NORN_TEST_TRAFFIC ACTIVE — {} destinations, every {}ms, {}B payload. \
+         This MUST NOT be used in production.",
+        dests.len(), rate_ms, payload_len,
+    );
+
+    tokio::spawn(async move {
+        let payload = vec![0xAAu8; payload_len];
+        let mut interval = tokio::time::interval(std::time::Duration::from_millis(rate_ms));
+        // Discard the immediate tick so we don't fire before sessions
+        // could plausibly be established.
+        interval.tick().await;
+        let mut sent: u64 = 0;
+        let mut errs: u64 = 0;
+        loop {
+            interval.tick().await;
+            for dst in &dests {
+                match conn.write_to(&payload, dst).await {
+                    Ok(()) => sent += 1,
+                    Err(_) => errs += 1,
+                }
+            }
+            // Periodic summary so log volume stays bounded — debug-level
+            // for chatty per-send detail elsewhere.
+            if sent.is_multiple_of(50) || errs.is_multiple_of(50) {
+                tracing::debug!(
+                    "test traffic: sent={} errs={}", sent, errs,
+                );
+            }
+        }
+    });
 }
 
 fn format_ipv6(bytes: &[u8; 16]) -> String {

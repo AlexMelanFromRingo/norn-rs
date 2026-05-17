@@ -51,15 +51,28 @@ docker compose -f "$HERE/docker-compose.yml" logs -f scraper > "$HERE/out/scrape
 SCRAPER_TAIL=$!
 
 (
+    # Detect cluster size from generated compose so chaos scales with N.
+    NODE_COUNT=$(grep -cE '^  norn-[0-9]+:' "$HERE/docker-compose.yml" || echo 0)
+    # Kill ~10 % of the cluster (rounded up to even). 8% to 12% gives
+    # enough churn to trigger cuckoo FPs / PathNegative storms without
+    # collapsing connectivity entirely.
+    KILL_COUNT=$(( (NODE_COUNT + 9) / 10 ))
+    [ "$KILL_COUNT" -lt 4 ] && KILL_COUNT=4
+
     sleep 60
-    echo "  [chaos] killing half the nodes at t=60s"
-    for i in 0 2 4 6 8 10 12 14; do
-        docker kill -s SIGTERM "norn-test-$(printf '%02d' "$i")" >/dev/null 2>&1 || true
+    echo "  [chaos] killing $KILL_COUNT of $NODE_COUNT nodes at t=60s"
+    KILLED=""
+    for k in $(seq 0 $((KILL_COUNT - 1))); do
+        i=$((k * NODE_COUNT / KILL_COUNT))
+        name=$(printf "norn-test-%02d" "$i")
+        svc=$(printf "norn-%02d" "$i")
+        KILLED="$KILLED $svc"
+        docker kill -s SIGTERM "$name" >/dev/null 2>&1 || true
     done
     sleep 10
-    echo "  [chaos] restoring killed nodes at t=70s"
-    docker compose -f "$HERE/docker-compose.yml" up -d --no-deps \
-        norn-00 norn-02 norn-04 norn-06 norn-08 norn-10 norn-12 norn-14 \
+    echo "  [chaos] restoring at t=70s:$KILLED"
+    # shellcheck disable=SC2086
+    docker compose -f "$HERE/docker-compose.yml" up -d --no-deps $KILLED \
         >/dev/null 2>&1 || true
 ) &
 CHAOS_PID=$!

@@ -11,3 +11,5 @@ mutants.out.old/
 /tests/cluster/docker-compose.rotation.yml
 /tests/cluster/out/
 /tests/cluster/rotation/
+/tests/cluster/pub_keys.json
+/tests/cluster/.probe.toml

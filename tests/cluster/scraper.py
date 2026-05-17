@@ -23,6 +23,7 @@ import re
 import time
 import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 # Match Prometheus sample lines:  metric_name{labels} value
@@ -53,13 +54,40 @@ def parse_exposition(body: str):
         yield m.group("name"), labels, value
 
 
-def scrape_one(host: str, port: int, timeout: float = 2.0) -> str | None:
+def scrape_one(host: str, port: int, timeout: float = 1.5) -> str | None:
+    # Host is already an IP at this point — see resolve_hosts() — so this
+    # is a pure connect+GET with no DNS lookup in the hot path. At 300
+    # nodes Docker's embedded DNS becomes the dominant cost otherwise.
     url = f"http://{host}:{port}/metrics"
     try:
         with urllib.request.urlopen(url, timeout=timeout) as r:
             return r.read().decode("utf-8", errors="replace")
     except (urllib.error.URLError, ConnectionError, TimeoutError, OSError):
         return None
+
+
+def resolve_hosts(names: list[str], retries: int = 30, delay: float = 1.0) -> dict[str, str]:
+    """Resolve each name to an IP via getaddrinfo. Retries until every
+    name resolves (docker bridge sometimes lags by a few seconds during
+    cluster start). Returns name -> ip."""
+    import socket
+    ips: dict[str, str] = {}
+    pending = list(names)
+    for _ in range(retries):
+        still: list[str] = []
+        for n in pending:
+            try:
+                ip = socket.getaddrinfo(n, None)[0][4][0]
+                ips[n] = ip
+            except (socket.gaierror, OSError):
+                still.append(n)
+        pending = still
+        if not pending:
+            return ips
+        time.sleep(delay)
+    print(f"[scraper] WARN {len(pending)} hosts never resolved; proceeding with rest",
+          flush=True)
+    return ips
 
 
 def main() -> int:
@@ -88,6 +116,18 @@ def main() -> int:
           f"@ {args.coldstart_interval}s, then {args.interval}s "
           f"for total {args.duration}s -> {csv_path}", flush=True)
 
+    # Parallel scraping: on a 300-node cluster sequential urlopen() takes
+    # 15-30 s per cycle. We pre-resolve every hostname to its IP via
+    # getaddrinfo (one-time cost) so the hot loop has no DNS overhead —
+    # docker's embedded DNS becomes the bottleneck otherwise.
+    names = [f"norn-{i:02d}" for i in range(args.nodes)]
+    print(f"[scraper] resolving {args.nodes} hostnames...", flush=True)
+    name_to_ip = resolve_hosts(names)
+    hosts = list(name_to_ip.values())  # IPs only
+    host_to_name = {ip: name for name, ip in name_to_ip.items()}
+    print(f"[scraper] resolved {len(hosts)}/{args.nodes} hosts", flush=True)
+    pool = ThreadPoolExecutor(max_workers=min(128, max(16, args.nodes)))
+
     started = time.monotonic()
     with csv_path.open("w", newline="") as f:
         w = csv.writer(f)
@@ -100,9 +140,15 @@ def main() -> int:
             if elapsed >= args.duration:
                 break
             wrote = 0
-            for i in range(args.nodes):
-                host = f"norn-{i:02d}"
-                body = scrape_one(host, args.metrics_port)
+            futs = {
+                pool.submit(scrape_one, h, args.metrics_port): h
+                for h in hosts
+            }
+            for fut in as_completed(futs):
+                body = fut.result()
+                # Write the user-visible HOSTNAME, not the IP — plots
+                # group by name and 172.18.0.NN doesn't sort intuitively.
+                host = host_to_name.get(futs[fut], futs[fut])
                 if body is None:
                     continue
                 for name, labels, value in parse_exposition(body):
@@ -124,6 +170,7 @@ def main() -> int:
             next_tick += interval
             sleep_for = max(0.0, next_tick - time.monotonic())
             time.sleep(sleep_for)
+    pool.shutdown(wait=False)
     print(f"[scraper] done -> {csv_path}", flush=True)
     return 0
 

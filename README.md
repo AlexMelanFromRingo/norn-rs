@@ -173,31 +173,58 @@ Node 2: 200:bd10:1247:9dd6:a86a:186e:5b8d:90d1
 rtt min/avg/max/mdev = 4.0/4.1/4.7/0.1 ms
 ```
 
-### 30-node live mesh telemetry
+### 300-node live mesh telemetry
 
-`tests/cluster/run.sh` brings up a 30-node Watts–Strogatz small-world mesh
-in Docker, injects realistic WAN physics (NetEm: 50 ms ± 10 ms delay, 2 %
+`tests/cluster/run.sh` brings up a Watts–Strogatz small-world mesh in
+Docker, injects realistic WAN physics (NetEm: 50 ms ± 10 ms delay, 2 %
 loss), runs a 120 s scraper that hits every node's `/metrics`, and
-mid-run kills + restores half the cluster to exercise reconvergence.
+mid-run kills + restores ~10 % of the cluster to exercise reconvergence.
+Cluster size is configurable in `tests/cluster/topology.py` (`N_NODES`).
 
-Total hardware footprint on a Ryzen 5 5500: **~76 MiB RAM and ~5 % of one
-CPU core for all 30 nodes** — the daemon's overhead is dominated by the
-Tokio runtime, not the cryptography.
+A built-in test-traffic generator (env-gated `NORN_TEST_TRAFFIC_TO_HEX`)
+makes every node send a 64-byte payload to two far-away peers every
+500 ms, so the routing layer actually exercises forward + lookup_by_tag
++ PathNegative backtrack + trust evolution without needing a full TUN
+deployment.
 
-Headline numbers from the latest run (30 nodes, ~4-peer avg degree,
-4-hop diameter, NetEm 50 ms ± 10 ms / 2 %):
+Total hardware footprint on a Ryzen 5 5500 (6C/12T, 16 GB):
+
+| Cluster size | Total RAM | Total CPU | Per-node RAM | Per-node CPU |
+|---|---|---|---|---|
+| 30 | 76 MiB | 5 % of one core | 2.5 MiB | 0.17 % |
+| 100 | 262 MiB | 15.4 % of one core | 2.6 MiB | 0.15 % |
+| 300 | 756 MiB | 176 % of one core (~15 % per core) | 2.5 MiB | 0.59 % |
+
+Scaling is essentially flat — the daemon's overhead is dominated by the
+Tokio runtime + ML-KEM-768 handshake state, not the routing logic.
+
+Headline numbers from the latest **300-node** run (4-peer avg degree,
+7-hop diameter, NetEm 50 ms ± 10 ms / 2 %, ~30 nodes killed + restored
+mid-run):
 
 | Metric | Value |
 |---|---|
-| Steady-state RTT (p50 / p95 / max) | 103 / 119 / 149 ms |
-| Steady-state loss rate (p50 / p95) | 0 % / 26 % |
+| `PathNegative` backtrack events | **909 across 165 nodes** |
+| `no route` precursors (each triggers PathNegative) | 634 across 125 nodes |
+| Trust scores decayed below 1.0 baseline | 608 samples |
+| Trust scores hitting the floor (TRUST_MIN = 0.01) | 51 samples |
+| Mutex-poison-recovery events | **0** (2770 samples) |
 | Tree convergence after cold start | < 1 s |
-| Reconvergence after 8-node SIGTERM | ~15 s |
-| `norn_mutex_poison_total` (final) | 0 |
+| Reconvergence after 30-node SIGTERM | ~15 s |
 
-The lag distribution matches NetEm physics exactly (RTT ≈ 2× 50 ms one-way),
-which confirms the kernel-side `SO_TCP_INFO` reader is feeding ground-truth
-data into the routing cost rather than getting blocked by HoL retransmits.
+The lag distribution matches NetEm physics exactly (RTT ≈ 2× 50 ms one-way)
+— that confirms the kernel-side `SO_TCP_INFO` reader is feeding
+ground-truth data into the routing cost rather than getting blocked by
+HoL retransmits.
+
+The 909 PathNegative events are particularly telling: after the chaos
+event killed 30 nodes, their cuckoo-filter tags lived on for ≥ 5 min
+(one `CUCKOO_GEN_TICKS` interval) in every surviving neighbour's view.
+Without PathNegative the cluster would burn 5 min of bandwidth + CPU
+forwarding packets toward dead targets and dropping them silently.
+With it, every dead route is evicted from the per-link negative cache
+within seconds of the first failed forward — visible as the
+sub-30-second steady-state recovery in `convergence.svg`.
 
 ![Convergence — peer count per node](docs/cluster/convergence.svg)
 ![Per-peer latency over time](docs/cluster/latency.svg)

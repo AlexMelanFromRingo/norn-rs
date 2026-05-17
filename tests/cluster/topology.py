@@ -14,14 +14,58 @@ Run: python3 tests/cluster/topology.py
 """
 
 from __future__ import annotations
+import hashlib
+import json
 import os
 import random
 import secrets
-import subprocess
 import sys
 from pathlib import Path
 
-N_NODES = 30
+# We need ed25519 pub_key derivation in the topology generator so the
+# test-traffic env var on each node can list every other node's pub_key
+# by hex. Use cryptography lib if present; fall back to a tiny pure-Python
+# Ed25519 SLOWLY (only 100×30 = 3000 derivations max, < 1 s on any CPU).
+try:
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import (
+        Ed25519PrivateKey,
+    )
+    from cryptography.hazmat.primitives import serialization as _ser
+
+    def derive_pub_hex(priv_hex: str) -> str:
+        sk = Ed25519PrivateKey.from_private_bytes(bytes.fromhex(priv_hex))
+        raw = sk.public_key().public_bytes(
+            encoding=_ser.Encoding.Raw,
+            format=_ser.PublicFormat.Raw,
+        )
+        return raw.hex()
+except ImportError:
+    # Minimal fall-back: shell out to `nornctl showaddr`. Requires the
+    # binary to be on PATH; emits a clearer error than the cryptography
+    # ImportError if it's missing.
+    import subprocess
+
+    def derive_pub_hex(priv_hex: str) -> str:
+        # We can ask nornd directly via genconfig + a tiny showaddr probe,
+        # but the easiest path is `nornd showaddr -c <tmp>`. The build
+        # script puts a fresh nornd binary at target/release/nornd.
+        bin_path = Path(__file__).resolve().parents[2] / "target" / "release" / "nornd"
+        if not bin_path.exists():
+            raise SystemExit(
+                "topology.py: no `cryptography` Python module and no "
+                f"{bin_path}. Install cryptography or `cargo build --release`."
+            )
+        tmp = Path(__file__).resolve().parent / ".probe.toml"
+        tmp.write_text(f'private_key = "{priv_hex}"\n')
+        os.chmod(tmp, 0o600)
+        out = subprocess.check_output([str(bin_path), "-c", str(tmp), "showaddr"], text=True)
+        tmp.unlink(missing_ok=True)
+        for line in out.splitlines():
+            if line.startswith("pub_key:"):
+                return line.split()[1]
+        raise SystemExit("topology.py: failed to derive pub_key via nornd showaddr")
+
+N_NODES = 300
 # Aim for a low-degree mesh that still routes interestingly.
 # RING_DEGREE = 1 → 2 ring-adjacent peers per node (forward + back).
 # SHORTCUT_DEGREE = 1 → 1 random long-distance peer per node (one direction;
@@ -101,15 +145,33 @@ metrics_addr      = "0.0.0.0:{METRICS_PORT}"
 # Sybil resistance is exercised by dedicated unit tests.
 min_peer_difficulty_bits = 0
 
-log_level = "info"
+log_level = "norn_rs=debug,info"
 """
         (CONFIGS / f"n{i:02d}.toml").write_text(cfg)
 
 
-def write_compose(n: int) -> None:
-    """Emit docker-compose.yml: N nornd services + 1 scraper service."""
+def write_compose(n: int, pubs: list[str]) -> None:
+    """Emit docker-compose.yml: N nornd services + 1 scraper service.
+    `pubs[i]` is node-i's ed25519 public key in hex; we inject it into
+    each peer's traffic-generator env var so the routing layer actually
+    sees overlay traffic (and hence exercises PathNegative + trust)."""
     services = []
+    # Above ~64 nodes the per-service host port-map becomes noisy in `ss`
+    # output and starts eating into the ephemeral-port pool. We expose
+    # ports only for the FIRST 16 nodes so ad-hoc `curl 127.0.0.1:9090`
+    # debugging still works from the host without flooding the host's
+    # NAT table on big runs.
+    expose_host_ports = n <= 32
     for i in range(n):
+        # Pick a small set of distant traffic destinations so packets
+        # have to multi-hop through the mesh. Picking far-away ring
+        # indices guarantees the traffic crosses several intermediates.
+        dest_idx = [(i + n // 3) % n, (i + 2 * n // 3) % n]
+        dest_hex = ",".join(pubs[j] for j in dest_idx if j != i)
+        ports_block = (
+            f'    ports:\n      - "{METRICS_PORT + i}:{METRICS_PORT}"\n'
+            if expose_host_ports else ""
+        )
         services.append(
             f"""  norn-{i:02d}:
     image: norn-testnode:latest
@@ -119,14 +181,20 @@ def write_compose(n: int) -> None:
       - mesh
     volumes:
       - ./configs/n{i:02d}.toml:/etc/norn/norn.toml:ro
-    # Per-node metrics also reachable from the host on this port for ad-hoc curl.
-    ports:
-      - "{METRICS_PORT + i}:{METRICS_PORT}"
+{ports_block}
     # NET_ADMIN lets the entrypoint install a NetEm qdisc on eth0 so the
     # routing layer experiences realistic wide-area delay/jitter/loss
     # instead of docker bridge's idealised 0ms / 0% link.
     cap_add:
       - NET_ADMIN
+    environment:
+      # Each node sends a tiny payload to two distant peers every 500 ms
+      # so the routing layer actually exercises forward + lookup_by_tag
+      # + PathNegative backtrack + trust evolution. With overlay-only
+      # nornd (TUN off) this is the ONLY traffic source available.
+      - NORN_TEST_TRAFFIC_TO_HEX={dest_hex}
+      - NORN_TEST_TRAFFIC_RATE_MS=500
+      - NORN_TEST_TRAFFIC_PAYLOAD=64
     restart: "no"
     tmpfs:
       - /var/run:size=4M"""
@@ -140,8 +208,11 @@ def write_compose(n: int) -> None:
     volumes:
       - ./scraper.py:/scraper.py:ro
       - ./out:/out
+    # coldstart-interval+interval picked so a 64-thread pool comfortably
+    # finishes a full N-node scrape inside the budget, even at N=300.
     command: ["python3", "/scraper.py", "--nodes", "{n}",
-              "--interval", "1", "--duration", "120",
+              "--coldstart-interval", "0.5", "--coldstart-secs", "20",
+              "--interval", "2", "--duration", "120",
               "--metrics-port", "{METRICS_PORT}", "--out-dir", "/out"]
     depends_on: [{', '.join(f'norn-{i:02d}' for i in range(n))}]"""
     )
@@ -158,8 +229,13 @@ def main() -> int:
     rng = random.Random(RNG_SEED)
     adj = small_world_peers(N_NODES, RING_DEGREE, SHORTCUT_DEGREE, rng)
     keys = [gen_ed25519_priv_hex() for _ in range(N_NODES)]
+    pubs = [derive_pub_hex(k) for k in keys]
+    # Persist pub_keys for postmortem analysis tools (e.g. find_path.py).
+    (HERE / "pub_keys.json").write_text(
+        json.dumps({f"n{i:02d}": pubs[i] for i in range(N_NODES)}, indent=2)
+    )
     write_configs(adj, keys)
-    write_compose(N_NODES)
+    write_compose(N_NODES, pubs)
     (HERE / "out").mkdir(exist_ok=True)
     # Lock down config perms (nornd refuses world-readable configs).
     for f in CONFIGS.glob("*.toml"):
