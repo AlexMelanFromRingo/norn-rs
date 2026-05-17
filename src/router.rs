@@ -4947,96 +4947,90 @@ mod tests {
     }
 
     // ── NORN_ACCELERATE_ROTATIONS_SECS env knob ─────────────────────────────
+    //
+    // env vars are process-global, so cargo test's default parallelism
+    // races multiple env-poking tests against each other (one's `set_var`
+    // gets clobbered by another's `remove_var` between two adjacent
+    // statements). We collapse all four cases into ONE function with a
+    // static Mutex — the mutex serialises us against the OTHER env-poking
+    // test below (`malicious_*`), and the single-function layout
+    // serialises the four assertions against each other.
+
+    /// Process-wide lock used by every env-mutating test in this module.
+    /// Without it, two tests touching the SAME env var race; with it,
+    /// they queue.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
-    fn accelerate_rotations_secs_unset_returns_none() {
-        // SAFETY: env vars are process-global; clear it explicitly so the
-        // test result doesn't depend on outer test environment.
-        unsafe {
-            std::env::remove_var("NORN_ACCELERATE_ROTATIONS_SECS");
-        }
+    fn accelerate_rotations_secs_env_parsing() {
+        // Hold the lock for the full set/check/clear cycle so no other
+        // test can observe a half-applied env state.
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+
+        // 1. Unset → None.
+        unsafe { std::env::remove_var("NORN_ACCELERATE_ROTATIONS_SECS"); }
         assert!(accelerate_rotations_secs().is_none(),
             "unset env var must yield None (= production cadence)");
-    }
 
-    #[test]
-    fn accelerate_rotations_secs_zero_treated_as_unset() {
-        // "0" is the same as "not set" — operators can clear the knob
-        // without unsetting by just writing 0.
-        unsafe {
-            std::env::set_var("NORN_ACCELERATE_ROTATIONS_SECS", "0");
-        }
-        let v = accelerate_rotations_secs();
+        // 2. "0" treated as unset (operators clear the knob with 0).
+        unsafe { std::env::set_var("NORN_ACCELERATE_ROTATIONS_SECS", "0"); }
+        assert!(accelerate_rotations_secs().is_none(),
+            "0 must be treated the same as unset");
         unsafe { std::env::remove_var("NORN_ACCELERATE_ROTATIONS_SECS"); }
-        assert!(v.is_none(), "0 must be treated the same as unset; got {:?}", v);
-    }
 
-    #[test]
-    fn accelerate_rotations_secs_garbage_returns_none() {
-        // Bad values are silently ignored — better than failing to start.
-        unsafe {
-            std::env::set_var("NORN_ACCELERATE_ROTATIONS_SECS", "not-a-number");
-        }
-        let v = accelerate_rotations_secs();
+        // 3. Garbage → None (silent ignore is safer than refuse-to-start).
+        unsafe { std::env::set_var("NORN_ACCELERATE_ROTATIONS_SECS", "not-a-number"); }
+        assert!(accelerate_rotations_secs().is_none(),
+            "non-numeric must yield None");
         unsafe { std::env::remove_var("NORN_ACCELERATE_ROTATIONS_SECS"); }
-        assert!(v.is_none(), "non-numeric must yield None; got {:?}", v);
-    }
 
-    #[test]
-    fn accelerate_rotations_secs_parses_valid_value() {
-        unsafe {
-            std::env::set_var("NORN_ACCELERATE_ROTATIONS_SECS", "30");
-        }
-        let v = accelerate_rotations_secs();
+        // 4. Valid positive integer → Some(N).
+        unsafe { std::env::set_var("NORN_ACCELERATE_ROTATIONS_SECS", "30"); }
+        assert_eq!(accelerate_rotations_secs(), Some(30));
         unsafe { std::env::remove_var("NORN_ACCELERATE_ROTATIONS_SECS"); }
-        assert_eq!(v, Some(30));
     }
 
     // ── NORN_MALICIOUS_MODE env knob ─────────────────────────────────────────
+    //
+    // Same collapse-into-one-test pattern as the rotation knob above —
+    // ENV_LOCK serialises us against any other env-poking test in the
+    // module, and the single-function layout serialises the four cases
+    // against each other.
 
     #[test]
-    fn malicious_unset_returns_zero() {
+    fn malicious_mode_env_parsing() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+
+        // 1. Unset → 0 (no poisoning, production path).
         unsafe {
             std::env::remove_var("NORN_MALICIOUS_MODE");
             std::env::remove_var("NORN_MALICIOUS_POISON_TAGS");
         }
         assert_eq!(malicious_cuckoo_poison_tags(), 0,
-            "unset env must yield 0 (= no poisoning, production path)");
-    }
+            "unset env must yield 0 (production path)");
 
-    #[test]
-    fn malicious_wrong_mode_returns_zero() {
-        unsafe {
-            std::env::set_var("NORN_MALICIOUS_MODE", "bad_mouthing");
-        }
-        let n = malicious_cuckoo_poison_tags();
-        unsafe { std::env::remove_var("NORN_MALICIOUS_MODE"); }
-        assert_eq!(n, 0, "unrecognised mode must yield 0");
-    }
+        // 2. Wrong mode → 0.
+        unsafe { std::env::set_var("NORN_MALICIOUS_MODE", "bad_mouthing"); }
+        assert_eq!(malicious_cuckoo_poison_tags(), 0,
+            "unrecognised mode must yield 0");
 
-    #[test]
-    fn malicious_cuckoo_poison_default_64() {
+        // 3. cuckoo_poison without count override → default 64.
         unsafe {
             std::env::set_var("NORN_MALICIOUS_MODE", "cuckoo_poison");
             std::env::remove_var("NORN_MALICIOUS_POISON_TAGS");
         }
-        let n = malicious_cuckoo_poison_tags();
-        unsafe { std::env::remove_var("NORN_MALICIOUS_MODE"); }
-        assert_eq!(n, 64, "cuckoo_poison without count override must default to 64");
-    }
+        assert_eq!(malicious_cuckoo_poison_tags(), 64,
+            "cuckoo_poison without count override must default to 64");
 
-    #[test]
-    fn malicious_cuckoo_poison_custom_count() {
-        unsafe {
-            std::env::set_var("NORN_MALICIOUS_MODE", "cuckoo_poison");
-            std::env::set_var("NORN_MALICIOUS_POISON_TAGS", "200");
-        }
-        let n = malicious_cuckoo_poison_tags();
+        // 4. Explicit count.
+        unsafe { std::env::set_var("NORN_MALICIOUS_POISON_TAGS", "200"); }
+        assert_eq!(malicious_cuckoo_poison_tags(), 200);
+
+        // Clean up so we don't poison other tests.
         unsafe {
             std::env::remove_var("NORN_MALICIOUS_MODE");
             std::env::remove_var("NORN_MALICIOUS_POISON_TAGS");
         }
-        assert_eq!(n, 200);
     }
 
     // ── PathNegative cuckoo-FP backtrack ────────────────────────────────────
