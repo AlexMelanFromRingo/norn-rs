@@ -259,6 +259,48 @@ that lies about reachable tags decays out of the routing fast-path
 without needing operator intervention. No quorum / Byzantine voting
 involved — just per-link probe success and PathNegative back-pressure.
 
+### Live mesh topology — physical graph + per-tree overlays
+
+Every node exposes its current spanning-tree state via the same
+`/metrics` endpoint (`norn_tree_root`, `norn_tree_parent`,
+`norn_tree_depth`, `norn_tree_is_root`). After the chaos run completes,
+`snapshot_trees.py` pulls one snapshot per container and `plot_graph.py`
+renders both the physical mesh and each of the K=3 spanning trees.
+
+Physical mesh — 100 nodes, 200 TCP-level links, no isolated components
+(node degree from the small-world wiring; isolation count = 0):
+
+![Physical mesh](docs/cluster/network.svg)
+
+The three spanning trees use different XOR seeds (`[0u8; 8]`,
+`b"Verdandi"`, `b"Skuld___"`) so each picks a **different** root —
+which is exactly the redundancy property: take out the Urd root and
+Verdandi + Skuld stay intact.
+
+| Tree | XOR seed | Dominant root | Consensus | Distinct candidates seen |
+|---|---|---|---|---|
+| Urd | `0x00…` | `norn-33` | 81 / 100 | 12 |
+| Verdandi | `b"Verdandi"` | `norn-80` | 81 / 100 | 12 |
+| Skuld | `b"Skuld___"` | `norn-10` | 81 / 100 | 12 |
+
+![Tree Urd](docs/cluster/tree_urd.svg)
+![Tree Verdandi](docs/cluster/tree_verdandi.svg)
+![Tree Skuld](docs/cluster/tree_skuld.svg)
+![Tree root-election consensus](docs/cluster/tree_balance.svg)
+
+The 81 % consensus is achieved under simultaneous NetEm 50 ms ± 10 ms / 2 %
+loss AND mid-run chaos (~10 % of nodes killed and restored). Without
+churn, all 100 nodes converge on one root per tree.
+
+**Known limitation** — `own_depth` (the local hop-distance estimate
+tracked for tree 0) inflates well past the true mesh diameter under
+rapid parent changes — a classic distance-vector count-to-infinity
+artefact. The routing layer doesn't depend on `own_depth` for correctness
+(it only feeds the optional hyperbolic-coord initialisation), so this
+shows up only in `/metrics` rather than as functional breakage. Fixing
+it cleanly needs a separate split-horizon / poisoned-reverse pass and
+is tracked separately.
+
 ![Convergence — peer count per node](docs/cluster/convergence.svg)
 ![Per-peer latency over time](docs/cluster/latency.svg)
 ![Per-peer loss rate](docs/cluster/loss.svg)

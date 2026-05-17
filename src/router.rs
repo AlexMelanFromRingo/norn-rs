@@ -281,6 +281,25 @@ struct TreeState {
     parent_cost: u64,
 }
 
+/// Public snapshot of one tree's current state — returned by
+/// `PacketConn::get_tree_state` and rendered into `/metrics` so a scraper
+/// can reconstruct the global per-tree topology across all nodes.
+#[derive(Clone, Debug)]
+pub struct TreeStat {
+    pub tree_id: u8,
+    /// Pub_key of the current root candidate this node sees.
+    pub root: [u8; 32],
+    /// Direct parent in this tree. `None` means we ARE the root.
+    pub parent: Option<[u8; 32]>,
+    /// Hop distance from root, as derived from received Announces.
+    /// Only meaningful for tree 0 (we only track own_depth there).
+    pub depth: u32,
+    /// Cost of the best path to root (us → parent → … → root).
+    pub parent_cost: u64,
+    /// Whether we are the root in this tree right now.
+    pub is_root: bool,
+}
+
 struct PeerData {
     pub_key: PeerId,
     lag: Duration,
@@ -2878,6 +2897,31 @@ impl PacketConn {
             let clamped = loss_rate.clamp(0.0, 1.0);
             p.loss_rate = p.loss_rate * 0.75 + clamped * 0.25;
         }
+    }
+
+    /// Snapshot the per-tree state for all K spanning trees. Exposed via
+    /// `/metrics` so a cluster-wide scraper can reconstruct the global
+    /// shape of every tree (root, parent edges, depths) — basically
+    /// "what would a graph viewer plot if it asked every node".
+    ///
+    /// `depth` is only tracked for tree 0 (`own_depth`); the other trees
+    /// return 0 there. That's a known shortcoming of the current
+    /// implementation, not a metric exposure issue.
+    pub fn get_tree_state(&self) -> Vec<TreeStat> {
+        let state = self.inner.lock_or_recover();
+        let mut out = Vec::with_capacity(K);
+        for (tree_id, tree) in state.trees.iter().enumerate() {
+            let is_root = tree.parent.is_none();
+            out.push(TreeStat {
+                tree_id: tree_id as u8,
+                root: tree.root,
+                parent: tree.parent,
+                depth: if tree_id == 0 { state.own_depth } else { 0 },
+                parent_cost: tree.parent_cost,
+                is_root,
+            });
+        }
+        out
     }
 
     pub fn get_peer_stats(&self) -> Vec<PeerStats> {

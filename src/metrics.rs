@@ -61,6 +61,17 @@ pub fn render(conn: &PacketConn, started: Instant) -> String {
 
     // # HELP and # TYPE per metric (Prometheus requires these only once
     // per metric name across the exposition).
+    // Self-identification: a single label-only sample so a scraper can
+    // map (host: norn-NN) → ed25519 pub_key without an extra admin call.
+    // Critical for the network-graph renderer that has to join per-node
+    // metric labels (peer="hex...") back to a host name.
+    out.push_str("# HELP norn_self_pub_key This node's ed25519 public key (label only).\n");
+    out.push_str("# TYPE norn_self_pub_key gauge\n");
+    out.push_str(&format!(
+        "norn_self_pub_key{{pub_key=\"{}\"}} 1\n",
+        hex::encode(conn.pub_key),
+    ));
+
     out.push_str("# HELP norn_uptime_seconds Time since the daemon started.\n");
     out.push_str("# TYPE norn_uptime_seconds gauge\n");
     out.push_str(&format!("norn_uptime_seconds {:.3}\n", uptime));
@@ -130,6 +141,59 @@ pub fn render(conn: &PacketConn, started: Instant) -> String {
                   protected state may be inconsistent and should be investigated.\n");
     out.push_str("# TYPE norn_mutex_poison_total counter\n");
     out.push_str(&format!("norn_mutex_poison_total {}\n", crate::router::mutex_poison_count()));
+
+    // ── Per-tree spanning-tree state ──────────────────────────────────────
+    // Three labelled gauges per K=3 trees — enough for a cluster-wide
+    // scraper to reconstruct each tree:
+    //   norn_tree_root{tree, root}     1   — this node currently has `root`
+    //                                         as the candidate root of tree.
+    //   norn_tree_parent{tree, parent} 1   — direct parent edge; absent
+    //                                         when we ARE the root.
+    //   norn_tree_depth{tree}          N   — hop count to root (tree 0 only;
+    //                                         other trees report 0 today).
+    let trees = conn.get_tree_state();
+    out.push_str("# HELP norn_tree_root Current root pub_key for this tree (1 = this node's view).\n");
+    out.push_str("# TYPE norn_tree_root gauge\n");
+    for t in &trees {
+        out.push_str(&format!(
+            "norn_tree_root{{tree=\"{}\",root=\"{}\"}} 1\n",
+            t.tree_id, hex::encode(t.root),
+        ));
+    }
+    out.push_str("# HELP norn_tree_parent Direct parent pub_key in this tree (1 sample = one outgoing edge).\n");
+    out.push_str("# TYPE norn_tree_parent gauge\n");
+    for t in &trees {
+        if let Some(parent) = t.parent {
+            out.push_str(&format!(
+                "norn_tree_parent{{tree=\"{}\",parent=\"{}\"}} 1\n",
+                t.tree_id, hex::encode(parent),
+            ));
+        }
+    }
+    out.push_str("# HELP norn_tree_depth Hop count from this node to its tree's root.\n");
+    out.push_str("# TYPE norn_tree_depth gauge\n");
+    for t in &trees {
+        out.push_str(&format!(
+            "norn_tree_depth{{tree=\"{}\"}} {}\n",
+            t.tree_id, t.depth,
+        ));
+    }
+    out.push_str("# HELP norn_tree_parent_cost Loss-adjusted cost of the parent edge.\n");
+    out.push_str("# TYPE norn_tree_parent_cost gauge\n");
+    for t in &trees {
+        out.push_str(&format!(
+            "norn_tree_parent_cost{{tree=\"{}\"}} {}\n",
+            t.tree_id, t.parent_cost,
+        ));
+    }
+    out.push_str("# HELP norn_tree_is_root 1 if this node is the current root of the tree.\n");
+    out.push_str("# TYPE norn_tree_is_root gauge\n");
+    for t in &trees {
+        out.push_str(&format!(
+            "norn_tree_is_root{{tree=\"{}\"}} {}\n",
+            t.tree_id, if t.is_root { 1 } else { 0 },
+        ));
+    }
 
     out
 }
@@ -208,6 +272,38 @@ mod tests {
         assert!(resp.contains("# TYPE norn_uptime_seconds gauge"),
             "expected Prometheus type header in body");
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn render_exposes_tree_state_for_all_k_trees() {
+        // K=3 spanning trees → every tree-state metric should appear with
+        // tree="0", tree="1", tree="2". Critical for the cluster-graph
+        // visualiser that reconstructs the global topology from /metrics.
+        let sk = SigningKey::generate(&mut OsRng);
+        let conn = Arc::new(PacketConn::new(sk));
+        let body = render(&conn, Instant::now());
+        assert!(body.contains("# TYPE norn_tree_root gauge"));
+        assert!(body.contains("# TYPE norn_tree_depth gauge"));
+        for t in 0..3 {
+            assert!(
+                body.contains(&format!("norn_tree_depth{{tree=\"{}\"}}", t)),
+                "must expose depth for tree {}", t,
+            );
+            assert!(
+                body.contains(&format!("norn_tree_root{{tree=\"{}\",root=", t)),
+                "must expose root for tree {}", t,
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn render_exposes_self_pub_key() {
+        // The graph renderer joins (host → pub_key) on this label.
+        let sk = SigningKey::generate(&mut OsRng);
+        let conn = Arc::new(PacketConn::new(sk));
+        let body = render(&conn, Instant::now());
+        assert!(body.contains("# TYPE norn_self_pub_key gauge"));
+        assert!(body.contains("norn_self_pub_key{pub_key=\""));
     }
 
     #[tokio::test]

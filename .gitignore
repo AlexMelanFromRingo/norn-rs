@@ -13,3 +13,4 @@ mutants.out.old/
 /tests/cluster/rotation/
 /tests/cluster/pub_keys.json
 /tests/cluster/.probe.toml
+/tests/cluster/.venv/
