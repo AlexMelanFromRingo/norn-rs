@@ -869,6 +869,26 @@ impl RouterState {
                 tree.parent_cost = 0;
             }
         }
+        // Drop the cached encryption session too.
+        //
+        // Without this, when the peer reconnects (handle_conn picks
+        // up a fresh TCP after the old one died), the new SessionInit
+        // takes the "existing session" branch in `SessionManager::
+        // handle_init` and reuses the OLD `local_x25519_priv`. That's
+        // structurally OK for crossing-init convergence, BUT every
+        // intervening write_to call hits `is_established(dst) == true`
+        // and encrypts with the still-cached keys. The bytes go into
+        // a dead TCP socket / phantom session and disappear without
+        // ever surfacing a "session not established" error that the
+        // mux's write_with_session_wait would retry on. End result:
+        // the data plane silently stops working until the daemon is
+        // restarted.
+        //
+        // Real-WAN repro on 2026-05-19: ping through bifrost-vpnd
+        // tunnel kept failing 4/4 after exit restart even though the
+        // TCP reconnected. Caching the session prevented the natural
+        // retry path that already worked for cold-start cases.
+        self.sessions.lock_or_recover().remove(pub_key);
     }
 
     fn update_landmarks(&mut self) {
