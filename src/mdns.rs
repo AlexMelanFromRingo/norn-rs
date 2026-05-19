@@ -112,7 +112,13 @@ fn handle_event(
             Ok(()) => {}
             Err(_) => { debug!("mDNS pub_key not valid hex, skipping"); return; }
         }
-        if connected.lock().unwrap().contains(&pub_bytes) {
+        // mDNS only dials peers we haven't seen at all yet. With
+        // multi-TCP bonding, an existing link count > 0 is still
+        // enough to skip the rediscover dial here; the multi-link
+        // pathway is driven from the static peer list in NodeConfig
+        // (where the user explicitly lists the URI N times), not
+        // from mDNS auto-discovery.
+        if connected.lock().unwrap().contains_key(&pub_bytes) {
             return;
         }
 

@@ -312,7 +312,18 @@ struct PeerData {
     /// When generation advances, we replace the stored filter entirely.
     peer_cuckoo_gen: [u64; K],
     trees: [Option<TreeAnnounce>; K],
-    tx: mpsc::Sender<Vec<u8>>,
+    /// Parallel write channels. One per underlying TCP/QUIC link this
+    /// peer is connected over. `send_to_peer` round-robins across them
+    /// so a single peer pair can saturate more than one kernel TCP
+    /// flow — each link runs its own CUBIC cwnd, so on a long-fat WAN
+    /// where one flow caps at the loss-driven steady-state, N flows
+    /// aggregate to N× before any one of them collides with the same
+    /// loss event. v0.1 (single-tx) was a degenerate `txs.len() == 1`.
+    txs: Vec<mpsc::Sender<Vec<u8>>>,
+    /// Round-robin counter for picking the next tx slot. Wrapping
+    /// usize so it's free of atomics on the sync `&mut self` send
+    /// path.
+    next_tx: usize,
     priority: u8,
     rx_bytes: u64,
     tx_bytes: u64,
@@ -333,6 +344,13 @@ struct PeerData {
     /// fall to the bottom of the lookup ranking.
     trust: f32,
 }
+
+/// Maximum number of parallel write channels we'll register for one
+/// peer pub_key. The default-1 (no-multi) case still works because a
+/// vec-of-1 just round-robins to itself. Cap is set high enough to
+/// accommodate sane multi-TCP / multi-QUIC bonding (8 cores, 8 flows)
+/// without letting a misbehaving peer redial unbounded.
+pub const MAX_PARALLEL_LINKS_PER_PEER: usize = 8;
 
 /// Starting trust for a new peer.
 const TRUST_INITIAL: f32 = 1.0;
@@ -790,10 +808,27 @@ impl RouterState {
             }
     }
 
+    /// Register a write channel for a peer. If the peer already exists
+    /// (multi-link case — same pub_key over a second TCP connection),
+    /// the new sender is appended to the existing `txs` list so
+    /// `send_to_peer` can spread traffic round-robin across both
+    /// links. Caps the per-peer link count at `MAX_PARALLEL_LINKS_PER_PEER`
+    /// to bound memory and writer-task count even if a misbehaving
+    /// peer keeps redialing.
     fn add_peer(&mut self, pub_key: PeerId, tx: mpsc::Sender<Vec<u8>>, priority: u8) {
-        // Guard against overwriting an existing peer (e.g. duplicate connection race).
-        if self.peers.contains_key(&pub_key) {
-            debug!("add_peer: {:?} already present, ignoring duplicate", &pub_key[..4]);
+        if let Some(existing) = self.peers.get_mut(&pub_key) {
+            if existing.txs.len() >= MAX_PARALLEL_LINKS_PER_PEER {
+                debug!(
+                    "add_peer: {:?} already at the {}-link cap, ignoring extra link",
+                    &pub_key[..4], MAX_PARALLEL_LINKS_PER_PEER
+                );
+                return;
+            }
+            existing.txs.push(tx);
+            debug!(
+                "add_peer: {:?} now has {} parallel link(s)",
+                &pub_key[..4], existing.txs.len()
+            );
             return;
         }
         let peer = PeerData {
@@ -806,7 +841,8 @@ impl RouterState {
             cuckoo: std::array::from_fn(|_| CuckooFilter::new()),
             peer_cuckoo_gen: [0u64; K],
             trees: std::array::from_fn(|_| None),
-            tx,
+            txs: vec![tx],
+            next_tx: 0,
             priority,
             rx_bytes: 0,
             tx_bytes: 0,
@@ -962,30 +998,58 @@ impl RouterState {
 
     fn send_to_peer(&mut self, peer_key: &PeerId, data: Vec<u8>) {
         if let Some(peer) = self.peers.get_mut(peer_key) {
+            if peer.txs.is_empty() {
+                debug!(
+                    "send_to_peer: {:?} has zero link channels — peer is mid-teardown, drop",
+                    &peer_key[..4]
+                );
+                return;
+            }
             let len = data.len() as u64;
-            match peer.tx.try_send(data) {
-                Ok(()) => {
-                    peer.tx_bytes += len;
-                    peer.last_tx_time = Instant::now();
+            // Round-robin across the parallel link channels. The starting
+            // slot is the wrapping `next_tx` cursor; on TrySendError::Full
+            // we walk the remaining slots once before giving up, so a single
+            // saturated link doesn't drop the frame as long as one of the
+            // siblings has headroom. This is the "spillover" piece of
+            // bonding — without it, three healthy 8K-slot channels plus one
+            // wedged channel would still drop 25% of frames.
+            let n = peer.txs.len();
+            let start = peer.next_tx % n;
+            peer.next_tx = peer.next_tx.wrapping_add(1);
+            let mut last_full = false;
+            for offset in 0..n {
+                let idx = (start + offset) % n;
+                let tx = &peer.txs[idx];
+                match tx.try_send(data.clone()) {
+                    Ok(()) => {
+                        peer.tx_bytes += len;
+                        peer.last_tx_time = Instant::now();
+                        return;
+                    }
+                    Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                        last_full = true;
+                    }
+                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                        // Closed channel = writer task exited (peer link
+                        // died). Drop it from the rotation so we don't
+                        // keep trying it. Walk the rest, then GC outside
+                        // the loop.
+                    }
                 }
-                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                    // Surface the drop so operators can spot saturation —
-                    // bulk Data writes go through the awaiting path in
-                    // `write_to`, so anything that gets here is control
-                    // / telemetry and the drop is unexpected.
-                    warn!(
-                        "send_to_peer: dropping frame for peer {:?} (channel full)",
-                        &peer_key[..4]
-                    );
-                }
-                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                    // Peer's writer task exited — usually means the TCP
-                    // connection is gone and `connected` will repaper.
-                    debug!(
-                        "send_to_peer: peer {:?} channel closed (writer task gone)",
-                        &peer_key[..4]
-                    );
-                }
+            }
+            // Sweep closed senders out.
+            peer.txs.retain(|tx| !tx.is_closed());
+            if peer.txs.is_empty() {
+                debug!(
+                    "send_to_peer: peer {:?} lost all links, awaiting reconnect",
+                    &peer_key[..4]
+                );
+            } else if last_full {
+                // All remaining links were full at the moment we tried.
+                warn!(
+                    "send_to_peer: dropping frame for peer {:?} (all {} channels full)",
+                    &peer_key[..4], peer.txs.len()
+                );
             }
         }
     }

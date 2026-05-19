@@ -348,16 +348,29 @@ async fn handle_one(
     }
 
     {
-        let mut set = connected.lock().unwrap();
-        if set.contains(&remote_pub) {
-            debug!("QUIC duplicate inbound from {:?}", &remote_pub[..4]);
+        use crate::router::MAX_PARALLEL_LINKS_PER_PEER;
+        let mut map = connected.lock().unwrap();
+        let count = map.entry(remote_pub).or_insert(0);
+        if (*count as usize) >= MAX_PARALLEL_LINKS_PER_PEER {
+            debug!(
+                "QUIC inbound from {:?} at cap ({} links), dropping",
+                &remote_pub[..4], *count
+            );
             return;
         }
-        set.insert(remote_pub);
+        *count += 1;
     }
     info!("QUIC peer {:?} from {}", &remote_pub[..4], peer_label);
     conn.handle_conn(remote_pub, reader, writer, 0).await;
-    connected.lock().unwrap().remove(&remote_pub);
+    {
+        let mut map = connected.lock().unwrap();
+        if let Some(count) = map.get_mut(&remote_pub) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                map.remove(&remote_pub);
+            }
+        }
+    }
 }
 
 // ── AsyncRead / AsyncWrite adapters around quinn's typed streams ──────────
@@ -438,7 +451,7 @@ mod tests {
         // other dialling it via the QUIC transport. Confirm the NRN1
         // handshake completes — both sides see the other in get_peer_stats.
         use ed25519_dalek::SigningKey;
-        use std::collections::HashSet;
+        use std::collections::HashMap;
         use std::sync::Mutex as StdMutex;
 
         let sk_a = SigningKey::generate(&mut rand::rngs::OsRng);
@@ -448,8 +461,8 @@ mod tests {
         let conn_a = Arc::new(PacketConn::new(sk_a));
         let conn_b = Arc::new(PacketConn::new(sk_b));
 
-        let connected_a: ConnectedPeers = Arc::new(StdMutex::new(HashSet::new()));
-        let connected_b: ConnectedPeers = Arc::new(StdMutex::new(HashSet::new()));
+        let connected_a: ConnectedPeers = Arc::new(StdMutex::new(HashMap::new()));
+        let connected_b: ConnectedPeers = Arc::new(StdMutex::new(HashMap::new()));
 
         // B listens on a kernel-chosen port. Pick one and read it back via
         // a small probe: we use a fixed loopback port range.

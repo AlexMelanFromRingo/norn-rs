@@ -9,7 +9,7 @@ use anyhow::{bail, Context, Result};
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use rand::rngs::OsRng;
 use rand::RngCore;
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -41,7 +41,14 @@ const MAX_PENDING_HANDSHAKES: usize = 256;
 const MAX_PER_IP_HANDSHAKES: usize = 4;
 
 /// Shared set of currently-connected peer pub keys (for dedup).
-pub type ConnectedPeers = Arc<Mutex<HashSet<[u8; 32]>>>;
+/// Per-peer connection counter. Replaces the historical
+/// `HashSet<PubKey>` that allowed exactly one TCP/QUIC link per peer.
+/// Multi-TCP bonding (one logical peer pair, N parallel TCPs to
+/// aggregate cwnd past the single-flow ceiling) needs the counter:
+/// dial / accept gates only refuse the (N+1)-th attempt, not the
+/// 2nd-through-N. The cap is `MAX_PARALLEL_LINKS_PER_PEER` from
+/// `router.rs`; same number governs `PeerData::txs.len()`.
+pub type ConnectedPeers = Arc<Mutex<HashMap<[u8; 32], u32>>>;
 
 /// RAII guard that decrements a per-IP handshake counter on drop. Ensures we
 /// release the slot whether the spawned task exits via success, error, or
@@ -371,14 +378,24 @@ pub async fn listen(
                 }
             }
 
-            // Dedup: skip if already connected
+            // Per-peer link cap: accept up to MAX_PARALLEL_LINKS_PER_PEER
+            // inbound connections from the same pub_key (multi-TCP
+            // bonding). Each link runs its own NRN1 handshake and gets
+            // its own writer task on the PacketConn side; the link
+            // count grows here and shrinks in the cleanup at function
+            // exit.
             {
-                let mut set = connected.lock().unwrap();
-                if set.contains(&remote_pub) {
-                    debug!("duplicate inbound from {:?}, dropping", &remote_pub[..4]);
+                use crate::router::MAX_PARALLEL_LINKS_PER_PEER;
+                let mut map = connected.lock().unwrap();
+                let count = map.entry(remote_pub).or_insert(0);
+                if (*count as usize) >= MAX_PARALLEL_LINKS_PER_PEER {
+                    debug!(
+                        "inbound from {:?} at cap ({} links), dropping",
+                        &remote_pub[..4], *count
+                    );
                     return;
                 }
-                set.insert(remote_pub);
+                *count += 1;
             }
             info!("accepted peer {:?} from {}", &remote_pub[..4], peer_addr);
             // Capture the OS fd BEFORE split — used by the Linux kernel-stats
@@ -395,7 +412,18 @@ pub async fn listen(
             let poller = spawn_tcp_info_poller(fd, remote_pub, conn.clone());
             conn.handle_conn(remote_pub, reader, writer, 0).await;
             poller.abort();
-            connected.lock().unwrap().remove(&remote_pub);
+            // Decrement link count; remove the entry when it hits 0
+            // so subsequent dials don't see a stale zero blocking
+            // them on the cap.
+            {
+                let mut map = connected.lock().unwrap();
+                if let Some(count) = map.get_mut(&remote_pub) {
+                    *count = count.saturating_sub(1);
+                    if *count == 0 {
+                        map.remove(&remote_pub);
+                    }
+                }
+            }
         });
     }
 }
@@ -461,15 +489,28 @@ pub async fn dial(uri: &str, conn: Arc<PacketConn>, connected: ConnectedPeers) {
                             continue;
                         }
 
-                        // Dedup: drop the guard before any await
-                        let already = connected.lock().unwrap().contains(&remote_pub);
-                        if already {
-                            debug!("already connected to {:?}, not adding duplicate", &remote_pub[..4]);
+                        // Per-peer link cap: refuse dial only when we
+                        // already have MAX_PARALLEL_LINKS_PER_PEER live
+                        // links to this pub_key (multi-TCP bonding).
+                        // Take + release the MutexGuard in a tight scope
+                        // before the `await` below — `MutexGuard` isn't
+                        // `Send` so it can't live across an await point.
+                        let count_now = {
+                            let map = connected.lock().unwrap();
+                            map.get(&remote_pub).copied().unwrap_or(0)
+                        };
+                        use crate::router::MAX_PARALLEL_LINKS_PER_PEER;
+                        if (count_now as usize) >= MAX_PARALLEL_LINKS_PER_PEER {
+                            debug!(
+                                "already at {} links to {:?}, not adding more",
+                                count_now, &remote_pub[..4]
+                            );
                             tokio::time::sleep(Duration::from_secs(30)).await;
                             continue;
                         }
                         {
-                            connected.lock().unwrap().insert(remote_pub);
+                            let mut map = connected.lock().unwrap();
+                            *map.entry(remote_pub).or_insert(0) += 1;
                         }
                         info!("connected to peer {:?} at {}", &remote_pub[..4], addr);
                         // Kernel TCP-info poller (Linux); no-op elsewhere.
@@ -486,8 +527,17 @@ pub async fn dial(uri: &str, conn: Arc<PacketConn>, connected: ConnectedPeers) {
                         conn.handle_conn(remote_pub, reader, writer, 0).await;
                         poller.abort();
                         // handle_conn spawns reader/writer tasks and returns.
-                        // The reader task calls remove_peer on disconnect.
-                        connected.lock().unwrap().remove(&remote_pub);
+                        // Decrement link count on disconnect so re-dials
+                        // can grab the slot back.
+                        {
+                            let mut map = connected.lock().unwrap();
+                            if let Some(count) = map.get_mut(&remote_pub) {
+                                *count = count.saturating_sub(1);
+                                if *count == 0 {
+                                    map.remove(&remote_pub);
+                                }
+                            }
+                        }
                         // Reset backoff on successful connect
                         delay = Duration::from_secs(5);
                     }

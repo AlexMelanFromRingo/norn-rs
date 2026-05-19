@@ -32,7 +32,7 @@ impl Node {
         // Register our own key so TUN knows our address
         key_store.lock().unwrap().register(conn.pub_key);
 
-        let connected = Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
+        let connected = Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
 
         let addr = crate::address::address_from_key(&conn.pub_key);
         info!(
