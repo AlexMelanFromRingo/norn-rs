@@ -1822,7 +1822,7 @@ mod tests {
         // queued at flush time.
         let payload = vec![0x42u8; 137];
         let mut batched = Vec::new();
-        write_frames_batched(&mut batched, &[payload.clone()]).await.unwrap();
+        write_frames_batched(&mut batched, std::slice::from_ref(&payload)).await.unwrap();
         let mut single = Vec::new();
         write_frame(&mut single, &payload).await.unwrap();
         assert_eq!(batched, single);
