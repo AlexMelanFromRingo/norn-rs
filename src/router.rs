@@ -1692,8 +1692,13 @@ impl RouterState {
     // to observe the rotation — that setup is complex and tested separately in session.rs.
     #[mutants::skip]
     fn rotate_session_keys(&self) {
-        let mut sm = self.sessions.lock_or_recover();
-        for info in sm.sessions.values_mut() {
+        let sm = self.sessions.lock_or_recover();
+        // Snapshot the per-peer handles first so we don't hold the
+        // outer SessionManager lock while doing per-peer rotation.
+        let handles: Vec<_> = sm.sessions.values().cloned().collect();
+        drop(sm);
+        for handle in handles {
+            let mut info = handle.lock().unwrap();
             if info.established && info.local_seq > 0 && info.local_seq % KEY_ROTATION_INTERVAL == 0 {
                 info.rotate_local_key();
             }
@@ -1819,7 +1824,11 @@ impl RouterState {
     fn cleanup_stale_sessions(&self) {
         let now = Instant::now();
         let mut sm = self.sessions.lock_or_recover();
-        sm.sessions.retain(|_, info| {
+        sm.sessions.retain(|_, handle| {
+            // Per-peer lock: nobody else is allowed to be inside
+            // this session's crypto while we read `last_used`, so
+            // the lock is uncontended in practice.
+            let info = handle.lock().unwrap();
             now.duration_since(info.last_used) < SESSION_IDLE_EXPIRY
         });
     }
@@ -2123,14 +2132,28 @@ impl RouterState {
                             return;
                         }
                     };
-                    let padded_pt = {
-                        let mut sm = self.sessions.lock_or_recover();
-                        match sm.decrypt(&source, &traffic.payload) {
+                    // Hot path: acquire the SessionManager mutex
+                    // only long enough to clone the per-peer
+                    // `SessionHandle`, then drop it before the
+                    // ChaCha20-Poly1305 work. That way N peers can
+                    // decrypt on N cores concurrently — the
+                    // contended part is the hashmap lookup, not
+                    // the AEAD (Roadmap #2).
+                    let handle = self
+                        .sessions
+                        .lock_or_recover()
+                        .get_session(&source);
+                    let padded_pt = match handle {
+                        Some(h) => match h.lock().unwrap().decrypt(&traffic.payload) {
                             Ok(d) => d,
                             Err(e) => {
                                 debug!("session decrypt failed from {:?}: {}", &source[..4], e);
                                 return;
                             }
+                        },
+                        None => {
+                            debug!("session decrypt: no session for {:?}", &source[..4]);
+                            return;
                         }
                     };
                     let payload = match unpad_payload(&padded_pt) {
@@ -2799,9 +2822,18 @@ impl PacketConn {
         // Pad plaintext before encryption so ciphertext sizes are multiples of PAD_BLOCK.
         // This hides message length from observers.
         let padded = pad_payload(payload);
-        let ciphertext = {
+        // Per-peer session lock: acquire the SessionManager mutex
+        // only long enough to clone the SessionHandle, then drop
+        // it so concurrent encrypts to OTHER peers don't queue
+        // behind us (Roadmap #2).
+        let handle = {
             let state = self.inner.lock_or_recover();
-            state.sessions.lock_or_recover().encrypt(dst, &padded)?
+            let sm = state.sessions.lock_or_recover();
+            sm.get_session(dst)
+        };
+        let ciphertext = match handle {
+            Some(h) => h.lock().unwrap().encrypt(&padded)?,
+            None => bail!("session not established with {:?}", &dst[..4]),
         };
 
         let pub_key = self.pub_key;
@@ -2879,18 +2911,26 @@ impl PacketConn {
             bail!("session not established with {:?}", &dst[..4]);
         }
 
-        // Encrypt + envelope all payloads under a single session-
-        // manager lock acquire. Each per-payload encrypt is fast;
-        // the lock acquire/release dance is what we're saving.
+        // Per-peer session lock: clone the SessionHandle once,
+        // drop the SessionManager mutex, then encrypt all payloads
+        // under one acquire of the per-peer mutex. Other peers'
+        // encrypt/decrypt paths stay unblocked (Roadmap #2).
         let pub_key = self.pub_key;
         let (enc_header, tag) = encrypt_header(&pub_key, dst);
-        let encoded_frames: Vec<Vec<u8>> = {
+        let handle = {
             let state = self.inner.lock_or_recover();
-            let mut sm = state.sessions.lock_or_recover();
+            let sm = state.sessions.lock_or_recover();
+            sm.get_session(dst)
+        };
+        let Some(handle) = handle else {
+            bail!("session not established with {:?}", &dst[..4]);
+        };
+        let encoded_frames: Vec<Vec<u8>> = {
+            let mut info = handle.lock().unwrap();
             let mut out = Vec::with_capacity(payloads.len());
             for p in payloads {
                 let padded = pad_payload(p);
-                let ciphertext = sm.encrypt(dst, &padded)?;
+                let ciphertext = info.encrypt(&padded)?;
                 let traffic = Traffic {
                     path: vec![],
                     from: pub_key,
@@ -5017,7 +5057,9 @@ mod tests {
             .checked_sub(SESSION_IDLE_EXPIRY + Duration::from_secs(10))
             .expect("instant subtraction must succeed on any system that has been up 310s+");
         rs.sessions.lock_or_recover()
-            .sessions.get_mut(&remote_key).unwrap().last_used = stale_time;
+            .sessions.get(&remote_key).unwrap()
+            .lock().unwrap()
+            .last_used = stale_time;
 
         rs.cleanup_stale_sessions();
 

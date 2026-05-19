@@ -733,8 +733,15 @@ impl SessionAck {
 // SessionManager
 // ──────────────────────────────────────────────
 
+/// Reference-counted handle to one peer's session state. Returned
+/// by [`SessionManager::get_session`] so callers can drop the outer
+/// `SessionManager` lock before doing the expensive ChaCha20-Poly1305
+/// work — which means N peers can decrypt on N cores concurrently
+/// instead of serialising through one global mutex. Roadmap #2.
+pub type SessionHandle = std::sync::Arc<std::sync::Mutex<SessionInfo>>;
+
 pub struct SessionManager {
-    pub sessions: HashMap<[u8; 32], SessionInfo>,
+    pub sessions: HashMap<[u8; 32], SessionHandle>,
     our_signing_key: SigningKey,
     /// Long-term ML-KEM-768 keypair, generated once per process. The encap
     /// pub is advertised in every outbound SessionInit; the dk is used to
@@ -893,7 +900,8 @@ impl SessionManager {
         // With both rules, the four crossing-init micro-events always
         // converge on the same secret on both sides — see the
         // pq_shared_crossing_init_converges test below.
-        if let Some(existing) = self.sessions.get_mut(&init.ed_pub) {
+        if let Some(existing_arc) = self.sessions.get(&init.ed_pub) {
+            let mut existing = existing_arc.lock().unwrap();
             existing.remote_x25519_pub = remote_x25519_pub;
             existing.established = true;
             let adopt = existing.pq_shared.is_none() || init.ed_pub < our_pub;
@@ -914,7 +922,8 @@ impl SessionManager {
         info.established = true;
         // Fresh session (no prior pq_shared) — always adopt.
         info.pq_shared = Some(pq_shared);
-        self.sessions.insert(init.ed_pub, info);
+        self.sessions
+            .insert(init.ed_pub, std::sync::Arc::new(std::sync::Mutex::new(info)));
 
         let ack = SessionAck::create(
             &self.our_signing_key, &local_pub, &init.ed_pub, &ml_kem_ct,
@@ -940,8 +949,9 @@ impl SessionManager {
         let pq_shared = self.pq_keys.decap(&ack.ml_kem_ct)?;
         let pq_shared_fallback = self.pq_keys.decap_prev(&ack.ml_kem_ct);
 
-        match self.sessions.get_mut(&ack.ed_pub) {
-            Some(info) => {
+        match self.sessions.get(&ack.ed_pub) {
+            Some(info_arc) => {
+                let mut info = info_arc.lock().unwrap();
                 info.remote_x25519_pub = remote_x_pub;
                 info.established = true;
                 // Symmetric counterpart of the handle_init rule (see comments
@@ -968,22 +978,38 @@ impl SessionManager {
         let local_pub = X25519PublicKey::from(&local_priv);
         let remote_x_placeholder = X25519PublicKey::from([0u8; 32]);
         let info = SessionInfo::new(*remote_ed_pub, local_priv, remote_x_placeholder);
-        self.sessions.insert(*remote_ed_pub, info);
+        self.sessions.insert(
+            *remote_ed_pub,
+            std::sync::Arc::new(std::sync::Mutex::new(info)),
+        );
         SessionInit::create(
             &self.our_signing_key, &local_pub, remote_ed_pub, self.pq_keys.pub_bytes(),
         ).encode()
     }
 
-    pub fn encrypt(&mut self, remote_ed_pub: &[u8; 32], plaintext: &[u8]) -> Result<Vec<u8>> {
-        let info = self.sessions.get_mut(remote_ed_pub).context("no session")?;
+    /// Return a refcounted handle to one peer's session.
+    ///
+    /// The crypto hot path uses this to drop the outer
+    /// `SessionManager` lock before doing ChaCha20-Poly1305 work
+    /// (multi-core parallelism — Roadmap #2). The returned
+    /// `SessionHandle` carries its own per-peer mutex; lock it
+    /// briefly to encrypt/decrypt.
+    pub fn get_session(&self, remote_ed_pub: &[u8; 32]) -> Option<SessionHandle> {
+        self.sessions.get(remote_ed_pub).cloned()
+    }
+
+    pub fn encrypt(&self, remote_ed_pub: &[u8; 32], plaintext: &[u8]) -> Result<Vec<u8>> {
+        let handle = self.sessions.get(remote_ed_pub).context("no session")?;
+        let mut info = handle.lock().unwrap();
         if !info.established {
             bail!("session not established");
         }
         info.encrypt(plaintext)
     }
 
-    pub fn decrypt(&mut self, remote_ed_pub: &[u8; 32], ciphertext: &[u8]) -> Result<Vec<u8>> {
-        let info = self.sessions.get_mut(remote_ed_pub).context("no session")?;
+    pub fn decrypt(&self, remote_ed_pub: &[u8; 32], ciphertext: &[u8]) -> Result<Vec<u8>> {
+        let handle = self.sessions.get(remote_ed_pub).context("no session")?;
+        let mut info = handle.lock().unwrap();
         if !info.established {
             bail!("session not established");
         }
@@ -991,7 +1017,10 @@ impl SessionManager {
     }
 
     pub fn is_established(&self, remote_ed_pub: &[u8; 32]) -> bool {
-        self.sessions.get(remote_ed_pub).map(|s| s.established).unwrap_or(false)
+        self.sessions
+            .get(remote_ed_pub)
+            .map(|s| s.lock().unwrap().established)
+            .unwrap_or(false)
     }
 
     pub fn remove(&mut self, remote_ed_pub: &[u8; 32]) {
@@ -1492,9 +1521,9 @@ mod tests {
         mgr_a.handle_ack(&ack).unwrap();
 
         // Both sides should have pq_shared set, AND it should be identical.
-        let pq_a = mgr_a.sessions.get(&pub_b).unwrap().pq_shared
+        let pq_a = mgr_a.sessions.get(&pub_b).unwrap().lock().unwrap().pq_shared
             .expect("initiator must have pq_shared after Ack");
-        let pq_b = mgr_b.sessions.get(&pub_a).unwrap().pq_shared
+        let pq_b = mgr_b.sessions.get(&pub_a).unwrap().lock().unwrap().pq_shared
             .expect("responder must have pq_shared after Init");
         assert_eq!(pq_a, pq_b,
             "PQ hybrid: both sides MUST derive the same pq_shared from ML-KEM");
@@ -1528,10 +1557,12 @@ mod tests {
 
         // pq_shared on I should be set; pq_shared_fallback may be set if
         // decap_prev was invoked (it is, since prev_dk exists).
-        let info_i = mgr_i.sessions.get(&pub_r).unwrap();
-        assert!(info_i.pq_shared.is_some());
-        assert!(info_i.pq_shared_fallback.is_some(),
-            "decap_prev must be tried during overlap window");
+        {
+            let info_i = mgr_i.sessions.get(&pub_r).unwrap().lock().unwrap();
+            assert!(info_i.pq_shared.is_some());
+            assert!(info_i.pq_shared_fallback.is_some(),
+                "decap_prev must be tried during overlap window");
+        }
 
         // Encrypt + decrypt roundtrip must work. The first decrypt on I's
         // side should pick the fallback (because R encap'd against I's OLD
@@ -1541,8 +1572,10 @@ mod tests {
         assert_eq!(pt_i, b"hello-cross-rotation");
 
         // After promotion, fallback is cleared.
-        assert!(mgr_i.sessions.get(&pub_r).unwrap().pq_shared_fallback.is_none(),
-            "fallback must be cleared after first successful decrypt");
+        assert!(
+            mgr_i.sessions.get(&pub_r).unwrap().lock().unwrap().pq_shared_fallback.is_none(),
+            "fallback must be cleared after first successful decrypt"
+        );
     }
 
     #[test]
@@ -1630,8 +1663,8 @@ mod tests {
                           &init_a, &init_b);
             }
 
-            let pq_a = mgr_a.sessions.get(&pub_b).unwrap().pq_shared.unwrap();
-            let pq_b = mgr_b.sessions.get(&pub_a).unwrap().pq_shared.unwrap();
+            let pq_a = mgr_a.sessions.get(&pub_b).unwrap().lock().unwrap().pq_shared.unwrap();
+            let pq_b = mgr_b.sessions.get(&pub_a).unwrap().lock().unwrap().pq_shared.unwrap();
             assert_eq!(pq_a, pq_b,
                 "crossing-init order ({},{},{},{}) with A.pub_cmp_B = {:?}: sides MUST converge",
                 e0, e1, e2, e3, pub_a.cmp(&pub_b));
@@ -1656,14 +1689,14 @@ mod tests {
         let init1 = mgr_a.initiate(&pub_b);
         let ack1 = mgr_b.handle_init(&init1).unwrap();
         mgr_a.handle_ack(&ack1).unwrap();
-        let pq1 = mgr_a.sessions.get(&pub_b).unwrap().pq_shared.unwrap();
+        let pq1 = mgr_a.sessions.get(&pub_b).unwrap().lock().unwrap().pq_shared.unwrap();
 
         // Tear down and redo.
         mgr_a.remove(&pub_b);
         let init2 = mgr_a.initiate(&pub_b);
         let ack2 = mgr_b.handle_init(&init2).unwrap();
         mgr_a.handle_ack(&ack2).unwrap();
-        let pq2 = mgr_a.sessions.get(&pub_b).unwrap().pq_shared.unwrap();
+        let pq2 = mgr_a.sessions.get(&pub_b).unwrap().lock().unwrap().pq_shared.unwrap();
 
         assert_ne!(pq1, pq2,
             "Each session must derive a fresh pq_shared (PQ ephemeral via fresh encapsulation)");
