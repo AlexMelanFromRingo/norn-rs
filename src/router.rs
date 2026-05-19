@@ -2832,6 +2832,7 @@ impl PacketConn {
     /// * Order is preserved: the writer task's
     ///   `write_frames_batched` keeps them in submission order on
     ///   the wire.
+    ///
     /// Returns the number of payloads actually queued for the peer.
     #[mutants::skip]
     pub async fn write_to_batch(
