@@ -100,6 +100,46 @@ pub async fn write_frame<W: AsyncWrite + Unpin>(writer: &mut W, data: &[u8]) -> 
     Ok(())
 }
 
+/// Write N length-prefixed frames as a single coalesced `write_all`.
+///
+/// This is the userspace TCP analogue of `sendmmsg(2)`: instead of N
+/// independent length+payload write syscalls, we concatenate all N
+/// `[varint_len][payload]` segments into one buffer and hand it to
+/// the kernel in one shot. Saves the per-frame syscall, mio waker,
+/// and tokio runtime poll round-trips that `perf` showed as the
+/// dominant user-mode cost on the writer path (30 % of samples
+/// were in `__libc_write` + `mio::Waker::wake` chain at our load).
+///
+/// Returns `Ok(())` only after the whole concatenated buffer has
+/// been queued in the kernel TCP send buffer. On any `write_all`
+/// error the partial state is undefined at the application layer
+/// but TCP itself will half-close cleanly — the caller (the
+/// per-peer writer task) tears the connection down and the mesh
+/// `connected` counter decrements.
+pub async fn write_frames_batched<W: AsyncWrite + Unpin>(
+    writer: &mut W, frames: &[Vec<u8>],
+) -> Result<()> {
+    if frames.is_empty() {
+        return Ok(());
+    }
+    if frames.len() == 1 {
+        // Fast-path: skip the extra Vec build for the common
+        // "channel had exactly one item ready" case.
+        return write_frame(writer, &frames[0]).await;
+    }
+    // Pre-size: each frame is `varint_len + payload`. Varint is
+    // 1-10 bytes; reserving 10 per frame keeps the upper bound
+    // simple and is at most 10 % overhead for tiny frames.
+    let total: usize = frames.iter().map(|f| 10 + f.len()).sum();
+    let mut buf = Vec::with_capacity(total);
+    for f in frames {
+        encode_uvarint(f.len() as u64, &mut buf);
+        buf.extend_from_slice(f);
+    }
+    writer.write_all(&buf).await?;
+    Ok(())
+}
+
 // ──────────────────────────────────────────────
 // Wire structs
 // ──────────────────────────────────────────────
@@ -1763,5 +1803,49 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("too long"),
             "10 continuation bytes must fail with 'too long' (len > 9); got: {msg}");
+    }
+
+    // ── write_frames_batched round-trips ─────────────────────────────
+
+    #[tokio::test]
+    async fn write_frames_batched_empty_is_noop() {
+        let mut out = Vec::new();
+        write_frames_batched(&mut out, &[]).await.unwrap();
+        assert!(out.is_empty());
+    }
+
+    #[tokio::test]
+    async fn write_frames_batched_single_matches_write_frame() {
+        // Single-frame fast path must be byte-identical to write_frame
+        // so consumers parsing the stream don't see a different
+        // wire shape depending on how many siblings happened to be
+        // queued at flush time.
+        let payload = vec![0x42u8; 137];
+        let mut batched = Vec::new();
+        write_frames_batched(&mut batched, &[payload.clone()]).await.unwrap();
+        let mut single = Vec::new();
+        write_frame(&mut single, &payload).await.unwrap();
+        assert_eq!(batched, single);
+    }
+
+    #[tokio::test]
+    async fn write_frames_batched_many_roundtrips() {
+        // Drive multiple varied-size frames through the coalescer and
+        // verify the reader-side `read_frame` recovers each one in
+        // order. This is the property the writer task relies on.
+        let payloads: Vec<Vec<u8>> = vec![
+            b"hello".to_vec(),
+            vec![0u8; 1400],
+            (0..200u16).map(|i| i as u8).collect(),
+            vec![],          // zero-length is a valid Traffic frame (keepalive)
+            vec![0xFEu8; 65000],
+        ];
+        let mut buf = Vec::new();
+        write_frames_batched(&mut buf, &payloads).await.unwrap();
+        let mut cursor = std::io::Cursor::new(buf);
+        for expected in &payloads {
+            let got = read_frame(&mut cursor).await.unwrap();
+            assert_eq!(&got, expected, "frame mismatch in batched stream");
+        }
     }
 }

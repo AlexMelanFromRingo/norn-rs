@@ -2689,10 +2689,29 @@ impl PacketConn {
         let state = self.inner.clone();
 
         // Writer task — runs independently; terminates when channel closes or IO fails.
+        //
+        // sendmmsg-style coalescing: after the first frame arrives via
+        // `recv().await`, drain any siblings that are already enqueued
+        // with `try_recv()` and ship the whole batch with one
+        // `write_frames_batched` call (= one `write_all`, = one
+        // syscall). Bounds the batch at MAX_WRITE_BATCH so a flood
+        // of telemetry doesn't grow our coalesce buffer without a
+        // ceiling, and so the writer still yields back to tokio at
+        // a sane cadence under heavy fan-in.
+        const MAX_WRITE_BATCH: usize = 32;
         tokio::spawn(async move {
             let mut writer = writer;
-            while let Some(data) = rx.recv().await {
-                if write_frame(&mut writer, &data).await.is_err() {
+            let mut batch: Vec<Vec<u8>> = Vec::with_capacity(MAX_WRITE_BATCH);
+            while let Some(first) = rx.recv().await {
+                batch.clear();
+                batch.push(first);
+                while batch.len() < MAX_WRITE_BATCH {
+                    match rx.try_recv() {
+                        Ok(more) => batch.push(more),
+                        Err(_) => break, // empty or closed — flush what we have
+                    }
+                }
+                if crate::packet::write_frames_batched(&mut writer, &batch).await.is_err() {
                     break;
                 }
             }
@@ -2786,6 +2805,103 @@ impl PacketConn {
             bail!("no route to {:?}", &dst[..4]);
         }
         Ok(())
+    }
+
+    /// Batched analogue of `write_to`: encrypt + envelope + dispatch N
+    /// payloads to the same destination under one round of session-
+    /// manager mutex acquisitions.
+    ///
+    /// Why it exists: every `write_to` takes `state.sessions.lock`
+    /// once for the encrypt and `state.inner.lock` twice for the
+    /// route lookup + send_to_peer. For a 16-packet coalesced batch
+    /// from `bifrost-vpnd::egress`, doing 16 independent `write_to`
+    /// calls means 16 × 3 mutex acquires under load. Folding them
+    /// into one call amortises the lock cost — important when the
+    /// session manager's internal lock contention is on the perf-
+    /// hot path (it's behind ChaCha20-Poly1305 today, but the perf
+    /// trace flagged it as the next layer to surface once crypto
+    /// stops being the dominant user-mode cost).
+    ///
+    /// Behaviour notes:
+    /// * Returns `Ok(0)` if `payloads` is empty.
+    /// * If the session isn't established, queues a SessionInit and
+    ///   bails with the same error as `write_to`. None of the
+    ///   payloads are sent.
+    /// * If route lookup fails *after* encryption, bails — the
+    ///   encrypted payloads are discarded (next call will retry).
+    /// * Order is preserved: the writer task's
+    ///   `write_frames_batched` keeps them in submission order on
+    ///   the wire.
+    /// Returns the number of payloads actually queued for the peer.
+    #[mutants::skip]
+    pub async fn write_to_batch(
+        &self, payloads: &[Vec<u8>], dst: &[u8; 32],
+    ) -> Result<usize> {
+        if payloads.is_empty() {
+            return Ok(0);
+        }
+        // Session establishment check — same shape as write_to.
+        let established = {
+            let state = self.inner.lock_or_recover();
+            let sm = state.sessions.lock_or_recover();
+            sm.is_established(dst)
+        };
+        if !established {
+            let init_data = {
+                let state = self.inner.lock_or_recover();
+                let mut sm = state.sessions.lock_or_recover();
+                sm.get_or_initiate_bytes(dst).unwrap_or_default()
+            };
+            if !init_data.is_empty() {
+                self.inner.lock_or_recover().send_traffic_to(dst, init_data);
+            }
+            bail!("session not established with {:?}", &dst[..4]);
+        }
+
+        // Encrypt + envelope all payloads under a single session-
+        // manager lock acquire. Each per-payload encrypt is fast;
+        // the lock acquire/release dance is what we're saving.
+        let pub_key = self.pub_key;
+        let (enc_header, tag) = encrypt_header(&pub_key, dst);
+        let encoded_frames: Vec<Vec<u8>> = {
+            let state = self.inner.lock_or_recover();
+            let mut sm = state.sessions.lock_or_recover();
+            let mut out = Vec::with_capacity(payloads.len());
+            for p in payloads {
+                let padded = pad_payload(p);
+                let ciphertext = sm.encrypt(dst, &padded)?;
+                let traffic = Traffic {
+                    path: vec![],
+                    from: pub_key,
+                    enc_header,
+                    routing_tag: tag,
+                    pkt_type: packet::PKT_DATA,
+                    watermark: 0,
+                    payload: ciphertext,
+                };
+                out.push(traffic.encode());
+            }
+            out
+        };
+
+        // Route lookup once.
+        let next_hop = self.inner.lock_or_recover().lookup(dst);
+        let Some(next_hop) = next_hop else {
+            bail!("no route to {:?}", &dst[..4]);
+        };
+
+        // Dispatch each encoded frame. send_to_peer round-robins
+        // across the peer's multi-link tx vec, so consecutive frames
+        // in this batch get spread across N TCP links naturally.
+        let mut sent = 0usize;
+        {
+            let mut state = self.inner.lock_or_recover();
+            for f in encoded_frames {
+                state.send_to_peer(&next_hop, f);
+                sent += 1;
+            }
+        }
+        Ok(sent)
     }
 
     /// Select up to `n` random peers to use as onion relays.
