@@ -62,6 +62,34 @@ echo "=== scraper running for 120s; mid-run we kill+restore ~10% of nodes ==="
 docker compose -f "$HERE/docker-compose.yml" logs -f scraper > "$HERE/out/scraper.log" 2>&1 &
 SCRAPER_TAIL=$!
 
+# Per-second hardware-load sampling. `docker stats --no-stream` is a
+# point-in-time snapshot of CPU% / mem / netio across every container
+# in the cluster; one CSV row per (timestamp, container). Used by
+# `plot.py` to render cpu.svg + mem.svg alongside the per-metric plots.
+(
+    HW_CSV="$HERE/out/hwstats.csv"
+    echo "ts,name,cpu_pct,mem_mb,net_rx_mb,net_tx_mb" > "$HW_CSV"
+    for _ in $(seq 1 130); do
+        ts=$(date +%s)
+        docker stats --no-stream --format \
+            '{{.Name}},{{.CPUPerc}},{{.MemUsage}},{{.NetIO}}' 2>/dev/null \
+            | while IFS=, read -r name cpu mem net; do
+                cpu_n=${cpu/\%/}
+                # MemUsage looks like "12.34MiB / 7.5GiB"; just grab the LHS.
+                mem_n=$(printf %s "$mem" | awk -F'/' '{print $1}' \
+                    | sed -E 's/[[:space:]]+//g; s/MiB//; s/GiB/*1024/; s/KiB/\/1024/' )
+                # NetIO "12.3kB / 4.5kB" — convert each side to MB.
+                rx=$(printf %s "$net" | awk -F'/' '{print $1}' \
+                    | sed -E 's/[[:space:]]+//g; s/MB//; s/kB/\/1000/; s/B$/\/1000000/' )
+                tx=$(printf %s "$net" | awk -F'/' '{print $2}' \
+                    | sed -E 's/[[:space:]]+//g; s/MB//; s/kB/\/1000/; s/B$/\/1000000/' )
+                echo "$ts,$name,$cpu_n,$mem_n,$rx,$tx" >> "$HW_CSV"
+            done
+        sleep 1
+    done
+) &
+HW_SAMPLER_PID=$!
+
 (
     NODE_COUNT=$(grep -cE '^  norn-[0-9]+:' "$HERE/docker-compose.yml" || echo 0)
     KILL_COUNT=$(( (NODE_COUNT + 9) / 10 ))
@@ -75,7 +103,11 @@ SCRAPER_TAIL=$!
         name=$(printf "norn-test-%02d" "$i")
         svc=$(printf "norn-%02d" "$i")
         KILLED="$KILLED $svc"
-        docker kill -s SIGTERM "$name" >/dev/null 2>&1 || true
+        # SIGKILL — nornd doesn't install a SIGTERM handler, so the
+        # default-ignore on PID 1 inside a container would leave the
+        # process running. SIGKILL bypasses that and exercises the
+        # actual partition-recovery code path on the survivors.
+        docker kill -s SIGKILL "$name" >/dev/null 2>&1 || true
     done
     sleep 10
     echo "  [chaos] restoring at t=70s:$KILLED"
@@ -87,6 +119,7 @@ CHAOS_PID=$!
 
 wait "$SCRAPER_TAIL" || true
 wait "$CHAOS_PID" 2>/dev/null || true
+kill "$HW_SAMPLER_PID" 2>/dev/null || true
 
 echo "=== snapshot tree state (per-node /metrics → tree_snapshot.json) ==="
 "$PYVENV" "$HERE/snapshot_trees.py" \
