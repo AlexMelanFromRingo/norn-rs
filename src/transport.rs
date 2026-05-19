@@ -111,6 +111,19 @@ fn spawn_tcp_info_poller(
 /// Keepalive settings: first probe after 10s idle, retries every 3s, 3 retries.
 /// This detects silent peer failures (e.g. network partition, crashed process)
 /// within ~19 seconds without waiting for TCP's default 2-hour timeout.
+///
+/// Note on socket buffers: we **deliberately do NOT** call
+/// `set_send_buffer_size` / `set_recv_buffer_size`. On Linux, an
+/// explicit `setsockopt(SO_RCVBUF)` disables receive-window
+/// auto-tuning for the socket and then clamps the chosen value to
+/// `net.core.{r,w}mem_max` (default 208 KB on many distros). The net
+/// effect is the *worst* of both worlds: the buffer never grows past
+/// 208 KB, the receive window plateaus, and long-fat-pipe single-stream
+/// throughput stalls at ~30 Mbit/s. Letting the kernel auto-tune
+/// against `tcp_rmem.max` / `tcp_wmem.max` (defaults 6 MB / 4 MB on
+/// Linux) gives properly scaling BDP behaviour without operator
+/// intervention. Confirmed on a real UA↔NL WAN benchmark
+/// (2026-05-18); see report under `bifrost-wan-test-2026-05-18`.
 fn configure_socket(stream: &TcpStream) {
     let _ = stream.set_nodelay(true);
     let sock = socket2::SockRef::from(stream);
