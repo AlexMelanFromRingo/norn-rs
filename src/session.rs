@@ -206,7 +206,7 @@ fn derive_packet_key(
     key
 }
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, RwLock};
 use std::time::Instant;
 use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret};
 
@@ -1040,7 +1040,19 @@ impl SessionManager {
     }
 }
 
-pub type SharedSessionManager = Arc<Mutex<SessionManager>>;
+/// Process-wide handle to the session manager.
+///
+/// `RwLock` (not `Mutex`) so the hot-path encrypt/decrypt — which
+/// only need to read the per-peer `SessionHandle` map — share a
+/// read guard instead of serialising through one writer. The
+/// per-peer `Mutex<SessionInfo>` reached via [`SessionHandle`]
+/// handles exclusion for the actual ChaCha20-Poly1305 work, so
+/// the outer lock is *only* held for the hashmap lookup.
+///
+/// Write guards are taken for session-table mutations:
+/// `handle_init`, `handle_ack`, `initiate`, `get_or_initiate_bytes`,
+/// `remove`. Those are rare relative to the per-packet path.
+pub type SharedSessionManager = Arc<RwLock<SessionManager>>;
 
 #[cfg(test)]
 mod tests {

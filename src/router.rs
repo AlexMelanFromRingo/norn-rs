@@ -127,6 +127,46 @@ impl<T> LockOrRecover<T> for std::sync::Mutex<T> {
         })
     }
 }
+
+/// Same poison-recovery story for `RwLock`, used by
+/// [`SharedSessionManager`]: hot-path encrypt/decrypt take a
+/// `read_or_recover()` so N peers run AEAD concurrently; setup
+/// (handle_init/handle_ack/initiate/remove) takes
+/// `write_or_recover()`.
+trait RwLockOrRecover<T> {
+    fn read_or_recover(&self) -> std::sync::RwLockReadGuard<'_, T>;
+    fn write_or_recover(&self) -> std::sync::RwLockWriteGuard<'_, T>;
+}
+
+impl<T> RwLockOrRecover<T> for std::sync::RwLock<T> {
+    #[track_caller]
+    fn read_or_recover(&self) -> std::sync::RwLockReadGuard<'_, T> {
+        self.read().unwrap_or_else(|p| {
+            let loc = std::panic::Location::caller();
+            MUTEX_POISON_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            tracing::error!(
+                file = loc.file(), line = loc.line(),
+                "rwlock poisoned (read) at {}:{} — RECOVERING but state may be inconsistent",
+                loc.file(), loc.line(),
+            );
+            p.into_inner()
+        })
+    }
+
+    #[track_caller]
+    fn write_or_recover(&self) -> std::sync::RwLockWriteGuard<'_, T> {
+        self.write().unwrap_or_else(|p| {
+            let loc = std::panic::Location::caller();
+            MUTEX_POISON_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            tracing::error!(
+                file = loc.file(), line = loc.line(),
+                "rwlock poisoned (write) at {}:{} — RECOVERING but state may be inconsistent",
+                loc.file(), loc.line(),
+            );
+            p.into_inner()
+        })
+    }
+}
 use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret};
 
 use crate::cuckoo::CuckooFilter;
@@ -691,7 +731,7 @@ fn metric_less(a: &[u8; 32], b: &[u8; 32]) -> bool {
 impl RouterState {
     fn new(signing_key: SigningKey, traffic_tx: mpsc::Sender<InboundPacket>) -> Self {
         let pub_key = signing_key.verifying_key().to_bytes();
-        let sessions = Arc::new(Mutex::new(SessionManager::new(signing_key.clone())));
+        let sessions = Arc::new(std::sync::RwLock::new(SessionManager::new(signing_key.clone())));
         let onion_keys = crate::onion::OnionKeyChain::with_identity_fallback(&signing_key);
 
         let trees = std::array::from_fn(|_| TreeState {
@@ -888,7 +928,7 @@ impl RouterState {
         // tunnel kept failing 4/4 after exit restart even though the
         // TCP reconnected. Caching the session prevented the natural
         // retry path that already worked for cold-start cases.
-        self.sessions.lock_or_recover().remove(pub_key);
+        self.sessions.write_or_recover().remove(pub_key);
     }
 
     fn update_landmarks(&mut self) {
@@ -1263,7 +1303,7 @@ impl RouterState {
     /// passed. Cheap when nothing's due; we just check the timer.
     #[mutants::skip]
     fn rotate_pq_keys_if_due(&self) {
-        let mut sm = self.sessions.lock_or_recover();
+        let mut sm = self.sessions.write_or_recover();
         if sm.maybe_rotate_pq_keys() {
             debug!("ML-KEM long-term keypair rotated");
         }
@@ -1692,7 +1732,7 @@ impl RouterState {
     // to observe the rotation — that setup is complex and tested separately in session.rs.
     #[mutants::skip]
     fn rotate_session_keys(&self) {
-        let sm = self.sessions.lock_or_recover();
+        let sm = self.sessions.read_or_recover();
         // Snapshot the per-peer handles first so we don't hold the
         // outer SessionManager lock while doing per-peer rotation.
         let handles: Vec<_> = sm.sessions.values().cloned().collect();
@@ -1823,7 +1863,7 @@ impl RouterState {
     /// Remove sessions that have been idle beyond SESSION_IDLE_EXPIRY.
     fn cleanup_stale_sessions(&self) {
         let now = Instant::now();
-        let mut sm = self.sessions.lock_or_recover();
+        let mut sm = self.sessions.write_or_recover();
         sm.sessions.retain(|_, handle| {
             // Per-peer lock: nobody else is allowed to be inside
             // this session's crypto while we read `last_used`, so
@@ -2111,7 +2151,7 @@ impl RouterState {
                         }
                     };
                     if raw.first().copied() == Some(SESSION_INIT_MAGIC) {
-                        let ack_opt = self.sessions.lock_or_recover().handle_init(&raw).ok();
+                        let ack_opt = self.sessions.write_or_recover().handle_init(&raw).ok();
                         if let Some(ack_bytes) = ack_opt
                             && raw.len() >= 33 {
                                 let mut sender = [0u8; 32];
@@ -2119,7 +2159,7 @@ impl RouterState {
                                 self.send_traffic_to(&sender, ack_bytes);
                             }
                     } else if raw.first().copied() == Some(SESSION_ACK_MAGIC) {
-                        let _ = self.sessions.lock_or_recover().handle_ack(&raw);
+                        let _ = self.sessions.write_or_recover().handle_ack(&raw);
                     }
                 }
                 packet::PKT_DATA => {
@@ -2141,7 +2181,7 @@ impl RouterState {
                     // the AEAD (Roadmap #2).
                     let handle = self
                         .sessions
-                        .lock_or_recover()
+                        .read_or_recover()
                         .get_session(&source);
                     let padded_pt = match handle {
                         Some(h) => match h.lock().unwrap().decrypt(&traffic.payload) {
@@ -2763,7 +2803,7 @@ impl PacketConn {
         // Initiate session exchange before entering the read loop.
         let init_bytes = {
             let s = state.lock_or_recover();
-            s.sessions.lock_or_recover().get_or_initiate_bytes(&remote_pub_key)
+            s.sessions.write_or_recover().get_or_initiate_bytes(&remote_pub_key)
         };
         if let Some(init_data) = init_bytes {
             state.lock_or_recover().send_traffic_to(&remote_pub_key, init_data);
@@ -2803,13 +2843,13 @@ impl PacketConn {
         {
             let established = {
                 let state = self.inner.lock_or_recover();
-                let sm = state.sessions.lock_or_recover();
+                let sm = state.sessions.read_or_recover();
                 sm.is_established(dst)
             };
             if !established {
                 let init_data = {
                     let state = self.inner.lock_or_recover();
-                    let mut sm = state.sessions.lock_or_recover();
+                    let mut sm = state.sessions.write_or_recover();
                     sm.get_or_initiate_bytes(dst).unwrap_or_default()
                 };
                 if !init_data.is_empty() {
@@ -2822,13 +2862,13 @@ impl PacketConn {
         // Pad plaintext before encryption so ciphertext sizes are multiples of PAD_BLOCK.
         // This hides message length from observers.
         let padded = pad_payload(payload);
-        // Per-peer session lock: acquire the SessionManager mutex
-        // only long enough to clone the SessionHandle, then drop
-        // it so concurrent encrypts to OTHER peers don't queue
-        // behind us (Roadmap #2).
+        // Per-peer session lock: acquire the SessionManager read
+        // lock only long enough to clone the SessionHandle, then
+        // drop it so concurrent encrypts to OTHER peers don't
+        // queue behind us (Roadmap #2).
         let handle = {
             let state = self.inner.lock_or_recover();
-            let sm = state.sessions.lock_or_recover();
+            let sm = state.sessions.read_or_recover();
             sm.get_session(dst)
         };
         let ciphertext = match handle {
@@ -2896,13 +2936,13 @@ impl PacketConn {
         // Session establishment check — same shape as write_to.
         let established = {
             let state = self.inner.lock_or_recover();
-            let sm = state.sessions.lock_or_recover();
+            let sm = state.sessions.read_or_recover();
             sm.is_established(dst)
         };
         if !established {
             let init_data = {
                 let state = self.inner.lock_or_recover();
-                let mut sm = state.sessions.lock_or_recover();
+                let mut sm = state.sessions.write_or_recover();
                 sm.get_or_initiate_bytes(dst).unwrap_or_default()
             };
             if !init_data.is_empty() {
@@ -2912,14 +2952,14 @@ impl PacketConn {
         }
 
         // Per-peer session lock: clone the SessionHandle once,
-        // drop the SessionManager mutex, then encrypt all payloads
-        // under one acquire of the per-peer mutex. Other peers'
-        // encrypt/decrypt paths stay unblocked (Roadmap #2).
+        // drop the SessionManager read lock, then encrypt all
+        // payloads under one acquire of the per-peer mutex. Other
+        // peers' encrypt/decrypt paths stay unblocked (Roadmap #2).
         let pub_key = self.pub_key;
         let (enc_header, tag) = encrypt_header(&pub_key, dst);
         let handle = {
             let state = self.inner.lock_or_recover();
-            let sm = state.sessions.lock_or_recover();
+            let sm = state.sessions.read_or_recover();
             sm.get_session(dst)
         };
         let Some(handle) = handle else {
@@ -3077,12 +3117,12 @@ impl PacketConn {
         {
             let established = {
                 let state = self.inner.lock_or_recover();
-                state.sessions.lock_or_recover().is_established(dst)
+                state.sessions.read_or_recover().is_established(dst)
             };
             if !established {
                 let init_data = {
                     let state = self.inner.lock_or_recover();
-                    let mut sm = state.sessions.lock_or_recover();
+                    let mut sm = state.sessions.write_or_recover();
                     sm.get_or_initiate_bytes(dst).unwrap_or_default()
                 };
                 if !init_data.is_empty() {
@@ -3093,9 +3133,13 @@ impl PacketConn {
         }
 
         let padded = pad_payload(payload);
+        // `encrypt` is `&self` on SessionManager (it goes through the
+        // per-peer Mutex<SessionInfo> internally), so a read guard is
+        // sufficient — multiple concurrent encrypts to different
+        // peers share this lock.
         let ciphertext = {
             let state = self.inner.lock_or_recover();
-            state.sessions.lock_or_recover().encrypt(dst, &padded)?
+            state.sessions.read_or_recover().encrypt(dst, &padded)?
         };
 
         let pub_key = self.pub_key;
@@ -5048,22 +5092,22 @@ mod tests {
         let remote_key = [0x77u8; 32];
 
         // initiate() creates a SessionInfo entry in rs.sessions
-        rs.sessions.lock_or_recover().initiate(&remote_key);
-        assert!(rs.sessions.lock_or_recover().sessions.contains_key(&remote_key),
+        rs.sessions.write_or_recover().initiate(&remote_key);
+        assert!(rs.sessions.read_or_recover().sessions.contains_key(&remote_key),
             "session must exist before cleanup");
 
         // Back-date last_used beyond SESSION_IDLE_EXPIRY (300s)
         let stale_time = Instant::now()
             .checked_sub(SESSION_IDLE_EXPIRY + Duration::from_secs(10))
             .expect("instant subtraction must succeed on any system that has been up 310s+");
-        rs.sessions.lock_or_recover()
+        rs.sessions.read_or_recover()
             .sessions.get(&remote_key).unwrap()
             .lock().unwrap()
             .last_used = stale_time;
 
         rs.cleanup_stale_sessions();
 
-        assert!(!rs.sessions.lock_or_recover().sessions.contains_key(&remote_key),
+        assert!(!rs.sessions.read_or_recover().sessions.contains_key(&remote_key),
             "stale session must be removed by cleanup_stale_sessions; \
              `replace with ()` mutation leaves it present");
     }
@@ -5073,12 +5117,12 @@ mod tests {
         let rs = make_router();
         let remote_key = [0x78u8; 32];
 
-        rs.sessions.lock_or_recover().initiate(&remote_key);
+        rs.sessions.write_or_recover().initiate(&remote_key);
         // last_used is Instant::now() by default — fresh session, must be kept
 
         rs.cleanup_stale_sessions();
 
-        assert!(rs.sessions.lock_or_recover().sessions.contains_key(&remote_key),
+        assert!(rs.sessions.read_or_recover().sessions.contains_key(&remote_key),
             "fresh session must survive cleanup_stale_sessions; \
              `< → >` mutation would remove it instead");
     }
