@@ -963,9 +963,29 @@ impl RouterState {
     fn send_to_peer(&mut self, peer_key: &PeerId, data: Vec<u8>) {
         if let Some(peer) = self.peers.get_mut(peer_key) {
             let len = data.len() as u64;
-            if peer.tx.try_send(data).is_ok() {
-                peer.tx_bytes += len;
-                peer.last_tx_time = Instant::now();
+            match peer.tx.try_send(data) {
+                Ok(()) => {
+                    peer.tx_bytes += len;
+                    peer.last_tx_time = Instant::now();
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                    // Surface the drop so operators can spot saturation —
+                    // bulk Data writes go through the awaiting path in
+                    // `write_to`, so anything that gets here is control
+                    // / telemetry and the drop is unexpected.
+                    warn!(
+                        "send_to_peer: dropping frame for peer {:?} (channel full)",
+                        &peer_key[..4]
+                    );
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                    // Peer's writer task exited — usually means the TCP
+                    // connection is gone and `connected` will repaper.
+                    debug!(
+                        "send_to_peer: peer {:?} channel closed (writer task gone)",
+                        &peer_key[..4]
+                    );
+                }
             }
         }
     }
@@ -2587,7 +2607,17 @@ impl PacketConn {
         writer: impl AsyncWrite + Unpin + Send + 'static,
         priority: u8,
     ) {
-        let (tx, mut rx) = mpsc::channel::<Vec<u8>>(256);
+        // Per-peer write channel. 256 was too small under sustained
+        // load: a SOCKS5 download with N pipelined Data frames would
+        // saturate the channel, `try_send` would silently drop frames,
+        // our ARQ would retransmit, and TCP's CUBIC would interpret
+        // the apparent burstiness as packet loss and halve cwnd —
+        // collapsing single-stream throughput to ~37 Mbit/s on
+        // long-fat WAN even after the bifrost-side reliability window
+        // had been bumped to 4 MB. Sizing at 8192 lets ~512 MB of
+        // pipelined Traffic frames queue before backpressure kicks in
+        // (typical encrypted Traffic ≤ 64 KB).
+        let (tx, mut rx) = mpsc::channel::<Vec<u8>>(8192);
 
         // Register peer (guarded against duplicates inside add_peer)
         self.inner.lock_or_recover().add_peer(remote_pub_key, tx, priority);
