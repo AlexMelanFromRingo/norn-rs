@@ -48,6 +48,9 @@ quinn = { version = "0.11", default-features = false, features = ["runtime-tokio
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 rustls-pki-types = { version = "1", features = ["std"] }
 rcgen = { version = "0.14", default-features = false, features = ["pem", "ring"] }
+# Roadmap #8: human-friendly key sharing — BIP39 word mnemonics + QR codes.
+bip39 = "2"
+qrcode = { version = "0.14", default-features = false }
 
 # Linux-only: SO_TCP_INFO ground-truth RTT/loss reader in src/tcp_info.rs.
 # Bypasses application-layer probe contamination from TCP HoL blocking.

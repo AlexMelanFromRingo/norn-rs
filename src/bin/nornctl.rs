@@ -51,6 +51,19 @@ enum Cmd {
         /// 64-char hex Ed25519 public key.
         pub_key_hex: String,
     },
+    /// Show this node's identity as a shareable QR code + word mnemonic.
+    ///
+    /// Hand the 24-word phrase to someone over the phone, or let them
+    /// scan the QR — both decode back to the exact 64-hex public key.
+    Share,
+    /// Decode a 24-word key mnemonic back into a hex public key + address.
+    ///
+    /// Example: nornctl resolve abandon abandon ... art
+    Resolve {
+        /// The 24 words of the mnemonic, space-separated.
+        #[arg(required = true, num_args = 1..)]
+        mnemonic: Vec<String>,
+    },
     /// Emit shell-completion script to stdout.
     ///
     /// Examples:
@@ -158,20 +171,61 @@ async fn main() -> Result<()> {
         }
         Cmd::Showaddr { pub_key_hex } => {
             // Local computation — no socket call needed.
-            let bytes = hex::decode(&pub_key_hex).context("pub_key_hex must be hex")?;
-            if bytes.len() != 32 {
-                bail!("pub_key_hex must decode to 32 bytes, got {}", bytes.len());
-            }
-            let mut arr = [0u8; 32];
-            arr.copy_from_slice(&bytes);
+            let arr = parse_hex_key(&pub_key_hex)?;
             let addr = norn_rs::address::address_from_key(&arr);
-            use std::net::Ipv6Addr;
-            let v6 = Ipv6Addr::from(addr);
-            println!("{}", v6);
+            println!("{}", std::net::Ipv6Addr::from(addr));
+        }
+        Cmd::Share => {
+            // getSelf gives us our own pub_key; the rest is local rendering.
+            let v = call(&cli.socket, "getSelf", None).await?;
+            let s: SelfInfo = serde_json::from_value(v).context("parsing getSelf reply")?;
+            let key = parse_hex_key(&s.pub_key)?;
+            let mnemonic = norn_rs::keyshare::to_mnemonic(&key);
+            if cli.json {
+                let out = serde_json::json!({
+                    "pub_key": s.pub_key,
+                    "address": s.address,
+                    "mnemonic": mnemonic,
+                });
+                println!("{}", serde_json::to_string_pretty(&out)?);
+            } else {
+                println!("pub_key:  {}", s.pub_key);
+                println!("address:  {}", s.address);
+                println!();
+                println!("mnemonic (24 words — read aloud or paste; `nornctl resolve` decodes it):");
+                println!("  {mnemonic}");
+                println!();
+                println!("QR (scan with a phone camera):");
+                println!("{}", norn_rs::keyshare::qr_terminal(&s.pub_key)?);
+            }
+        }
+        Cmd::Resolve { mnemonic } => {
+            // Local computation — no socket call needed.
+            let key = norn_rs::keyshare::from_mnemonic(&mnemonic.join(" "))?;
+            let hex_key = hex::encode(key);
+            let v6 = std::net::Ipv6Addr::from(norn_rs::address::address_from_key(&key));
+            if cli.json {
+                let out = serde_json::json!({ "pub_key": hex_key, "address": v6.to_string() });
+                println!("{}", serde_json::to_string_pretty(&out)?);
+            } else {
+                println!("pub_key:  {hex_key}");
+                println!("address:  {v6}");
+            }
         }
     }
 
     Ok(())
+}
+
+/// Decode a 64-char hex string into a 32-byte key array.
+fn parse_hex_key(hex_str: &str) -> Result<[u8; 32]> {
+    let bytes = hex::decode(hex_str.trim()).context("public key must be hex")?;
+    if bytes.len() != 32 {
+        bail!("public key must decode to 32 bytes, got {}", bytes.len());
+    }
+    let mut arr = [0u8; 32];
+    arr.copy_from_slice(&bytes);
+    Ok(arr)
 }
 
 /// Send one JSON request, read one JSON reply, return as serde Value.
@@ -243,6 +297,38 @@ mod tests {
             Cmd::Showaddr { pub_key_hex } => assert_eq!(pub_key_hex.len(), 64),
             _ => panic!("expected Showaddr"),
         }
+    }
+
+    #[test]
+    fn cli_parses_share() {
+        let cli = Cli::try_parse_from(["nornctl", "share"]).unwrap();
+        assert!(matches!(cli.cmd, Cmd::Share));
+    }
+
+    #[test]
+    fn cli_parses_resolve_collects_all_words() {
+        let words = "abandon abandon abandon abandon abandon abandon abandon abandon \
+                     abandon abandon abandon abandon abandon abandon abandon abandon \
+                     abandon abandon abandon abandon abandon abandon abandon art";
+        let mut argv = vec!["nornctl", "resolve"];
+        argv.extend(words.split_whitespace());
+        let cli = Cli::try_parse_from(argv).unwrap();
+        match cli.cmd {
+            Cmd::Resolve { mnemonic } => {
+                assert_eq!(mnemonic.len(), 24, "all 24 words must be collected");
+                // Round-trips through the keyshare decoder to the zero key.
+                assert_eq!(
+                    norn_rs::keyshare::from_mnemonic(&mnemonic.join(" ")).unwrap(),
+                    [0u8; 32]
+                );
+            }
+            _ => panic!("expected Resolve"),
+        }
+    }
+
+    #[test]
+    fn cli_resolve_requires_at_least_one_word() {
+        assert!(Cli::try_parse_from(["nornctl", "resolve"]).is_err());
     }
 
     #[test]

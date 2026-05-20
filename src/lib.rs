@@ -5,6 +5,7 @@ pub mod address;
 pub mod config;
 pub mod cuckoo;
 pub mod hyperbolic;
+pub mod keyshare;
 pub mod onion;
 pub mod packet;
 pub mod router;
