@@ -356,3 +356,4 @@ against the just-replaced public key still decap successfully.
 | `v0.5.0` | + QUIC transport, reputation system, UDP hole-punching |
 | `v0.6.0` | + security & ops hardening (three audit passes) |
 | `v0.8.0` | + multi-link peer bonding & `sendmmsg`-style write coalescing (the 0.7.0 transport work), per-peer session sharding, opt-in multi-core crypto worker pool |
+| `v0.9.0` | + opt-in transport obfuscation, BIP39/QR key sharing, adaptive control-plane cadence, cached per-packet X25519 DH (~20× faster encrypt) |
