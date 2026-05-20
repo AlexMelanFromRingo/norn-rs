@@ -2637,6 +2637,134 @@ fn dispatch(state: &Arc<Mutex<RouterState>>, from: PeerId, frame: Vec<u8>) {
 // PacketConn — public API
 // ──────────────────────────────────────────────
 
+/// Encrypt one `payload` for `dst`, wrap it in a `Traffic` envelope, and
+/// hand it to the routing layer for dispatch.
+///
+/// This is the expensive half of [`PacketConn::write_to`] — pad +
+/// ChaCha20-Poly1305 + envelope encode + route lookup — factored out so
+/// the inline path and the Roadmap #2 crypto worker pool share one
+/// implementation. Synchronous on purpose: the only routing step
+/// (`lookup` + `send_to_peer`) is non-blocking — it just pushes onto a
+/// per-peer mpsc — so a worker task can call this directly without an
+/// `.await`.
+///
+/// Assumes the session with `dst` is already established; callers do the
+/// establishment check (and queue a `SessionInit`) before reaching here.
+fn encrypt_and_dispatch(
+    inner: &Arc<Mutex<RouterState>>,
+    pub_key: &[u8; 32],
+    payload: &[u8],
+    dst: &[u8; 32],
+) -> Result<()> {
+    // Pad before encryption so ciphertext sizes are multiples of
+    // PAD_BLOCK — hides message length from observers.
+    let padded = pad_payload(payload);
+    // Clone the per-peer SessionHandle under a short read lock, then
+    // encrypt under that peer's own mutex so encrypts to OTHER peers
+    // never queue behind us.
+    let handle = {
+        let state = inner.lock_or_recover();
+        let sm = state.sessions.read_or_recover();
+        sm.get_session(dst)
+    };
+    let ciphertext = match handle {
+        Some(h) => h.lock().unwrap().encrypt(&padded)?,
+        None => bail!("session not established with {:?}", &dst[..4]),
+    };
+
+    let (enc_header, tag) = encrypt_header(pub_key, dst);
+    let traffic = Traffic {
+        path: vec![],
+        from: *pub_key,
+        enc_header,
+        routing_tag: tag,
+        pkt_type: packet::PKT_DATA,
+        watermark: 0,
+        payload: ciphertext,
+    };
+    let encoded = traffic.encode();
+    // next_hop into a variable so the MutexGuard drops at the `;`
+    // before send_to_peer relocks.
+    let next_hop = inner.lock_or_recover().lookup(dst);
+    match next_hop {
+        Some(next_hop) => {
+            inner.lock_or_recover().send_to_peer(&next_hop, encoded);
+            Ok(())
+        }
+        None => bail!("no route to {:?}", &dst[..4]),
+    }
+}
+
+/// One unit of deferred crypto work: encrypt `payload` for `dst` and
+/// route it. Built by [`PacketConn::write_to`] when the worker pool is
+/// enabled, drained by a [`crypto_worker`].
+struct CryptoJob {
+    payload: Vec<u8>,
+    dst: [u8; 32],
+}
+
+/// Roadmap #2: a fixed pool of crypto worker tasks that lift the
+/// pad + ChaCha20-Poly1305 encrypt + envelope + dispatch off the
+/// caller's task. On a multi-thread tokio runtime the workers land on
+/// separate OS threads, so the AEAD runs on several cores in parallel.
+///
+/// Each worker owns one mpsc queue; `write_to` hashes the destination
+/// key to a worker, so every packet for a given peer lands on the *same*
+/// worker. Two consequences fall out of that for free: per-peer wire
+/// order is preserved (one FIFO queue), and a peer's session mutex is
+/// never contended across workers.
+///
+/// Opt-in via `NodeConfig.crypto_workers`. On a single-core box, or a
+/// WAN-bottlenecked link where ChaCha20 is a fraction of a percent of
+/// one core, leave it disabled — the queueing hop is pure overhead
+/// there. It earns its keep on fast (≥ ~500 Mbit/s) links where crypto
+/// is a real share of a core.
+struct CryptoPool {
+    senders: Vec<mpsc::Sender<CryptoJob>>,
+}
+
+impl CryptoPool {
+    /// Try to enqueue `payload` for `dst` on its worker. Returns `false`
+    /// if the chosen worker's queue is full or closed — the caller then
+    /// encrypts inline rather than dropping the packet, so the pool is a
+    /// pure offload optimisation and never costs delivery.
+    fn try_submit(&self, payload: &[u8], dst: &[u8; 32]) -> bool {
+        if self.senders.is_empty() {
+            return false;
+        }
+        // First 8 bytes of the (uniformly random) ed25519 key make a
+        // fine hash; modulo maps it to a stable worker index.
+        let idx = (u64::from_le_bytes(dst[..8].try_into().unwrap())
+            % self.senders.len() as u64) as usize;
+        self.senders[idx]
+            .try_send(CryptoJob { payload: payload.to_vec(), dst: *dst })
+            .is_ok()
+    }
+}
+
+/// Body of one crypto worker: drain `CryptoJob`s, encrypt+dispatch each,
+/// exit when the queue closes or the node shuts down.
+async fn crypto_worker(
+    mut rx: mpsc::Receiver<CryptoJob>,
+    inner: Arc<Mutex<RouterState>>,
+    pub_key: [u8; 32],
+    mut shutdown: watch::Receiver<bool>,
+) {
+    loop {
+        tokio::select! {
+            job = rx.recv() => {
+                let Some(job) = job else { break };
+                if let Err(e) =
+                    encrypt_and_dispatch(&inner, &pub_key, &job.payload, &job.dst)
+                {
+                    debug!("crypto worker: dropping packet for {:?}: {e}", &job.dst[..4]);
+                }
+            }
+            _ = shutdown.changed() => break,
+        }
+    }
+}
+
 pub struct PacketConn {
     inner: Arc<Mutex<RouterState>>,
     traffic_rx: tokio::sync::Mutex<mpsc::Receiver<InboundPacket>>,
@@ -2651,6 +2779,11 @@ pub struct PacketConn {
     /// AtomicU32 so it can be raised at runtime without locking.
     min_peer_difficulty_bits: Arc<std::sync::atomic::AtomicU32>,
     shutdown_tx: watch::Sender<bool>,
+    /// Roadmap #2: optional multi-core crypto worker pool. `None` until
+    /// `enable_crypto_pool` installs one; once set, `write_to` offloads
+    /// the encrypt+dispatch half onto it. `OnceLock` so the hot path
+    /// reads it lock-free.
+    crypto_pool: std::sync::OnceLock<CryptoPool>,
 }
 
 impl PacketConn {
@@ -2736,7 +2869,41 @@ impl PacketConn {
             signing_key: signing_key_for_pc,
             min_peer_difficulty_bits: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             shutdown_tx,
+            crypto_pool: std::sync::OnceLock::new(),
         }
+    }
+
+    /// Roadmap #2: spin up a pool of `workers` crypto worker tasks.
+    /// Once installed, [`write_to`](Self::write_to) offloads the
+    /// pad + encrypt + envelope + dispatch half of each send onto a
+    /// worker (chosen by hashing the destination key), so the AEAD runs
+    /// off the caller's task and across cores.
+    ///
+    /// Idempotent and one-shot: the first call with `workers > 0`
+    /// installs the pool; `workers == 0` and any later call are no-ops.
+    /// Call once at node startup, before traffic flows. A good value is
+    /// the physical core count; see `NodeConfig.crypto_workers`.
+    pub fn enable_crypto_pool(&self, workers: usize) {
+        if workers == 0 || self.crypto_pool.get().is_some() {
+            return;
+        }
+        let mut senders = Vec::with_capacity(workers);
+        for _ in 0..workers {
+            // Queue depth mirrors the per-peer write channel (8192):
+            // deep enough to ride out a burst, bounded so a flooder
+            // can't grow it without limit. Overflow falls back to
+            // inline encryption — see CryptoPool::try_submit.
+            let (tx, rx) = mpsc::channel::<CryptoJob>(8192);
+            senders.push(tx);
+            tokio::spawn(crypto_worker(
+                rx,
+                self.inner.clone(),
+                self.pub_key,
+                self.shutdown_tx.subscribe(),
+            ));
+        }
+        let _ = self.crypto_pool.set(CryptoPool { senders });
+        tracing::info!("crypto worker pool enabled: {workers} worker(s)");
     }
 
     /// Attach a new peer connection.
@@ -2859,44 +3026,19 @@ impl PacketConn {
             }
         }
 
-        // Pad plaintext before encryption so ciphertext sizes are multiples of PAD_BLOCK.
-        // This hides message length from observers.
-        let padded = pad_payload(payload);
-        // Per-peer session lock: acquire the SessionManager read
-        // lock only long enough to clone the SessionHandle, then
-        // drop it so concurrent encrypts to OTHER peers don't
-        // queue behind us (Roadmap #2).
-        let handle = {
-            let state = self.inner.lock_or_recover();
-            let sm = state.sessions.read_or_recover();
-            sm.get_session(dst)
-        };
-        let ciphertext = match handle {
-            Some(h) => h.lock().unwrap().encrypt(&padded)?,
-            None => bail!("session not established with {:?}", &dst[..4]),
-        };
-
-        let pub_key = self.pub_key;
-        let (enc_header, tag) = encrypt_header(&pub_key, dst);
-        let traffic = Traffic {
-            path: vec![],
-            from: pub_key,
-            enc_header,
-            routing_tag: tag,
-            pkt_type: packet::PKT_DATA,
-            watermark: 0,
-            payload: ciphertext,
-        };
-        let encoded = traffic.encode();
-        // Important: extract next_hop into a variable so the MutexGuard is
-        // dropped at the `;` before we try to lock again in send_to_peer.
-        let next_hop = self.inner.lock_or_recover().lookup(dst);
-        if let Some(next_hop) = next_hop {
-            self.inner.lock_or_recover().send_to_peer(&next_hop, encoded);
-        } else {
-            bail!("no route to {:?}", &dst[..4]);
+        // Roadmap #2: with a crypto worker pool installed, hand the
+        // expensive half (pad + ChaCha20-Poly1305 + envelope + route +
+        // dispatch) to a worker so it runs on another core while this
+        // task returns. `dst` is hashed to a fixed worker, so packets
+        // for one peer keep submission order and never contend on that
+        // peer's session mutex. A saturated pool falls through to
+        // inline encryption below — never a drop.
+        if let Some(pool) = self.crypto_pool.get()
+            && pool.try_submit(payload, dst)
+        {
+            return Ok(());
         }
-        Ok(())
+        encrypt_and_dispatch(&self.inner, &self.pub_key, payload, dst)
     }
 
     /// Batched analogue of `write_to`: encrypt + envelope + dispatch N

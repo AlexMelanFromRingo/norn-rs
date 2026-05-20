@@ -67,6 +67,18 @@ pub struct NodeConfig {
     /// both can be on or off independently.
     #[serde(default = "default_true")]
     pub mdns_enabled: bool,
+
+    /// Roadmap #2: number of dedicated crypto worker tasks. With `N > 0`,
+    /// `PacketConn::write_to` offloads pad + ChaCha20-Poly1305 encrypt +
+    /// envelope + dispatch onto a pool of N tasks, which a multi-thread
+    /// runtime spreads across cores; each destination is pinned to one
+    /// worker so per-peer wire order holds. Default 0 = encrypt inline on
+    /// the caller's task. Only worth enabling on a fast (≥ ~500 Mbit/s),
+    /// non-WAN-bottlenecked link where ChaCha20 is a real share of a
+    /// core — on a slow WAN the extra queueing hop is pure overhead. A
+    /// good value is the physical core count.
+    #[serde(default)]
+    pub crypto_workers: u8,
 }
 
 fn default_listen() -> Vec<String> { vec!["tcp://0.0.0.0:9001".to_string()] }
@@ -93,6 +105,7 @@ impl Default for NodeConfig {
             metrics_addr: default_metrics_addr(),
             min_peer_difficulty_bits: 0,
             mdns_enabled: true,
+            crypto_workers: 0,
         }
     }
 }

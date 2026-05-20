@@ -789,3 +789,53 @@ async fn onion_routing_via_relay() {
     let mut recv_s = recv_c.clone(); recv_s.sort();
     assert_eq!(sent_s, recv_s, "onion message set mismatch");
 }
+
+/// Roadmap #2: with a crypto worker pool enabled, write_to offloads
+/// encrypt+dispatch onto worker tasks. Every packet for one dst is
+/// hashed to a single worker, so the FIFO ordering contract must still
+/// hold end-to-end. Send a long run of numbered messages and assert
+/// they arrive in submission order.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn crypto_worker_pool_preserves_order() {
+    let _ = tracing_subscriber::fmt().with_env_filter("warn").try_init();
+
+    let (conn_a, conn_b) = make_connected_pair().await;
+    let pub_b = conn_b.pub_key;
+
+    // Install the pool before any traffic flows.
+    conn_a.enable_crypto_pool(3);
+
+    assert!(
+        wait_for_session(&conn_a, &pub_b).await,
+        "A→B session failed to establish within 10s"
+    );
+
+    // Drain warmup pings produced by wait_for_session.
+    let drain = Duration::from_millis(200);
+    loop {
+        match tokio::time::timeout(drain, conn_b.read_from()).await {
+            Ok(Ok(_)) => continue,
+            _ => break,
+        }
+    }
+
+    const N: usize = 200;
+    let sent: Vec<Vec<u8>> = (0..N)
+        .map(|i| format!("pooled_{:06}", i).into_bytes())
+        .collect();
+    for msg in &sent {
+        conn_a.write_to(msg, &pub_b).await.expect("pooled write_to failed");
+    }
+
+    let received = tokio::time::timeout(Duration::from_secs(20), async {
+        let mut out = Vec::with_capacity(N);
+        for _ in 0..N {
+            out.push(conn_b.read_from().await.expect("B read_from failed").payload);
+        }
+        out
+    })
+    .await
+    .expect("timed out waiting for pooled messages at B");
+
+    assert_eq!(received, sent, "crypto pool must preserve per-peer order");
+}

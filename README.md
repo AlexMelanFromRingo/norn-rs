@@ -353,3 +353,6 @@ against the just-replaced public key still decap successfully.
 | `v0.2.0-production-ready` | TCP transport, TUN, discovery, admin, source privacy |
 | `v0.2.1-dest-privacy` | + enc_header, routing_tag, padding, jitter, cover traffic |
 | `v0.2.2-onion-routing` | + onion routing, all critical security fixes |
+| `v0.5.0` | + QUIC transport, reputation system, UDP hole-punching |
+| `v0.6.0` | + security & ops hardening (three audit passes) |
+| `v0.8.0` | + multi-link peer bonding & `sendmmsg`-style write coalescing (the 0.7.0 transport work), per-peer session sharding, opt-in multi-core crypto worker pool |
