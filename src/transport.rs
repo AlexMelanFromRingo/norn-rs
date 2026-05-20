@@ -12,11 +12,14 @@ use rand::RngCore;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use std::io;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::timeout;
 use tracing::{debug, info, warn};
 
+use crate::obfs::{ObfsReader, ObfsWriter};
 use crate::router::PacketConn;
 
 /// Handshake protocol version. Bump on incompatible wire changes.
@@ -206,10 +209,31 @@ pub(crate) fn verify_handshake_sig(
         .context("handshake: signature verification failed")
 }
 
+/// Establish the transport byte stream for one TCP connection.
+///
+/// When `obfs_key` is set (roadmap #7) the obfuscation nonce exchange
+/// runs first, on the raw socket, then both halves are wrapped in the
+/// keystream obfuscator — so the NRN1 handshake that follows is itself
+/// obfuscated. With no key the halves are returned plain. Either way
+/// the result is one concrete reader/writer type the caller threads
+/// through `handshake_over_stream` and `handle_conn`.
 #[mutants::skip]
-async fn handshake(stream: &mut TcpStream, signing_key: &SigningKey) -> Result<[u8; 32]> {
-    let (mut reader, mut writer) = stream.split();
-    handshake_over_stream(&mut reader, &mut writer, signing_key).await
+async fn establish(
+    stream: TcpStream,
+    obfs_key: Option<[u8; 32]>,
+) -> io::Result<(ObfsReader<OwnedReadHalf>, ObfsWriter<OwnedWriteHalf>)> {
+    match obfs_key {
+        Some(key) => {
+            let mut stream = stream;
+            let hs = crate::obfs::obfs_handshake(&mut stream, &key).await?;
+            let (r, w) = stream.into_split();
+            Ok(hs.wrap(r, w))
+        }
+        None => {
+            let (r, w) = stream.into_split();
+            Ok((ObfsReader::plain(r), ObfsWriter::plain(w)))
+        }
+    }
 }
 
 /// Generic NRN1 authenticated handshake over any AsyncRead+AsyncWrite pair.
@@ -306,7 +330,7 @@ pub async fn listen(
         Arc::new(Mutex::new(std::collections::HashMap::new()));
 
     loop {
-        let (mut stream, peer_addr) = match listener.accept().await {
+        let (stream, peer_addr) = match listener.accept().await {
             Ok(r) => r,
             Err(e) => { warn!("accept error: {}", e); continue; }
         };
@@ -349,18 +373,35 @@ pub async fn listen(
             // success (we move into the long-lived loop) or failure.
             let _ip_guard = ip_guard;
             configure_socket(&stream);
-            let hs_result = timeout(
-                HANDSHAKE_TIMEOUT,
-                handshake(&mut stream, conn.signing_key()),
-            ).await;
+            // Capture the OS fd before `establish` consumes the stream —
+            // the Linux kernel-stats poller needs it; it stays valid for
+            // the life of the split halves.
+            #[cfg(target_os = "linux")]
+            let fd = {
+                use std::os::fd::AsRawFd;
+                stream.as_raw_fd()
+            };
+            #[cfg(not(target_os = "linux"))]
+            let fd: i32 = 0;
+
+            // Roadmap #7: obfuscation nonce exchange (when a PSK is set)
+            // + split + the NRN1 authenticated handshake, all under one
+            // timeout. The obfuscation wraps the NRN1 handshake itself.
+            let obfs_key = conn.obfuscation_key();
+            let hs_result = timeout(HANDSHAKE_TIMEOUT, async {
+                let (mut reader, mut writer) = establish(stream, obfs_key).await?;
+                let remote_pub =
+                    handshake_over_stream(&mut reader, &mut writer, conn.signing_key()).await?;
+                Ok::<_, anyhow::Error>((remote_pub, reader, writer))
+            }).await;
 
             // Release the handshake permit before the long-lived read loop.
             drop(permit);
 
-            let remote_pub = match hs_result {
+            let (remote_pub, reader, writer) = match hs_result {
                 Err(_) => { warn!("handshake timed out from {}", peer_addr); return; }
                 Ok(Err(e)) => { warn!("handshake failed from {}: {:#}", peer_addr, e); return; }
-                Ok(Ok(p)) => p,
+                Ok(Ok(v)) => v,
             };
 
             // Sybil-resistance: refuse peers whose pub_key has insufficient
@@ -398,17 +439,6 @@ pub async fn listen(
                 *count += 1;
             }
             info!("accepted peer {:?} from {}", &remote_pub[..4], peer_addr);
-            // Capture the OS fd BEFORE split — used by the Linux kernel-stats
-            // poller below. On Windows this resolves to a no-op handle.
-            #[cfg(target_os = "linux")]
-            let fd = {
-                use std::os::fd::AsRawFd;
-                stream.as_raw_fd()
-            };
-            #[cfg(not(target_os = "linux"))]
-            let fd: i32 = 0;
-
-            let (reader, writer) = stream.into_split();
             let poller = spawn_tcp_info_poller(fd, remote_pub, conn.clone());
             conn.handle_conn(remote_pub, reader, writer, 0).await;
             poller.abort();
@@ -441,18 +471,36 @@ pub async fn dial(uri: &str, conn: Arc<PacketConn>, connected: ConnectedPeers) {
     let mut delay = Duration::from_secs(1);
     loop {
         match TcpStream::connect(&addr).await {
-            Ok(mut stream) => {
+            Ok(stream) => {
                 configure_socket(&stream);
-                let hs = timeout(
-                    HANDSHAKE_TIMEOUT,
-                    handshake(&mut stream, conn.signing_key()),
-                ).await;
-                let remote_pub_res: Result<[u8; 32]> = match hs {
+                // Capture the OS fd before `establish` consumes the stream.
+                #[cfg(target_os = "linux")]
+                let fd = {
+                    use std::os::fd::AsRawFd;
+                    stream.as_raw_fd()
+                };
+                #[cfg(not(target_os = "linux"))]
+                let fd: i32 = 0;
+
+                // Roadmap #7: obfuscation nonce exchange (when a PSK is
+                // set) + split + the NRN1 handshake, all under one timeout.
+                let obfs_key = conn.obfuscation_key();
+                let hs = timeout(HANDSHAKE_TIMEOUT, async {
+                    let (mut reader, mut writer) = establish(stream, obfs_key).await?;
+                    let remote_pub =
+                        handshake_over_stream(&mut reader, &mut writer, conn.signing_key()).await?;
+                    Ok::<_, anyhow::Error>((remote_pub, reader, writer))
+                }).await;
+                let hs_res: Result<(
+                    [u8; 32],
+                    ObfsReader<OwnedReadHalf>,
+                    ObfsWriter<OwnedWriteHalf>,
+                )> = match hs {
                     Err(_) => Err(anyhow::anyhow!("handshake timed out")),
                     Ok(r) => r,
                 };
-                match remote_pub_res {
-                    Ok(remote_pub) => {
+                match hs_res {
+                    Ok((remote_pub, reader, writer)) => {
                         // Symmetric Sybil-resistance check on outbound side:
                         // if the remote's pub_key falls below our minimum
                         // difficulty we drop and back off — peer cannot meet
@@ -514,15 +562,6 @@ pub async fn dial(uri: &str, conn: Arc<PacketConn>, connected: ConnectedPeers) {
                         }
                         info!("connected to peer {:?} at {}", &remote_pub[..4], addr);
                         // Kernel TCP-info poller (Linux); no-op elsewhere.
-                        #[cfg(target_os = "linux")]
-                        let fd = {
-                            use std::os::fd::AsRawFd;
-                            stream.as_raw_fd()
-                        };
-                        #[cfg(not(target_os = "linux"))]
-                        let fd: i32 = 0;
-
-                        let (reader, writer) = stream.into_split();
                         let poller = spawn_tcp_info_poller(fd, remote_pub, conn.clone());
                         conn.handle_conn(remote_pub, reader, writer, 0).await;
                         poller.abort();

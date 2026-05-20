@@ -31,6 +31,9 @@ impl Node {
         // Roadmap #2: optional multi-core crypto worker pool. No-op at 0.
         conn.enable_crypto_pool(config.crypto_workers as usize);
 
+        // Roadmap #7: optional transport obfuscation. No-op if PSK empty.
+        conn.set_obfuscation_psk(&config.obfuscation_psk);
+
         let key_store = new_key_store();
         // Register our own key so TUN knows our address
         key_store.lock().unwrap().register(conn.pub_key);

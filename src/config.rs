@@ -79,6 +79,17 @@ pub struct NodeConfig {
     /// good value is the physical core count.
     #[serde(default)]
     pub crypto_workers: u8,
+
+    /// Roadmap #7: transport-obfuscation pre-shared key. When non-empty,
+    /// every TCP link is wrapped in a keystream obfuscator so the whole
+    /// connection — NRN1 handshake included — looks like uniform random
+    /// bytes to a deep-packet-inspection box, defeating signature-based
+    /// blocking. Every node that should interoperate must share the
+    /// exact same string. Empty (the default) = no obfuscation. Costs a
+    /// little CPU and adds a 16-byte cleartext nonce per connection; it
+    /// does not hide packet sizes or timing.
+    #[serde(default)]
+    pub obfuscation_psk: String,
 }
 
 fn default_listen() -> Vec<String> { vec!["tcp://0.0.0.0:9001".to_string()] }
@@ -106,6 +117,7 @@ impl Default for NodeConfig {
             min_peer_difficulty_bits: 0,
             mdns_enabled: true,
             crypto_workers: 0,
+            obfuscation_psk: String::new(),
         }
     }
 }

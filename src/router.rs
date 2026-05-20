@@ -9,7 +9,7 @@ use rand::rngs::OsRng;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{mpsc, watch};
 use tracing::{debug, warn};
 
@@ -2885,6 +2885,11 @@ pub struct PacketConn {
     /// the encrypt+dispatch half onto it. `OnceLock` so the hot path
     /// reads it lock-free.
     crypto_pool: std::sync::OnceLock<CryptoPool>,
+    /// Roadmap #7: optional transport-obfuscation key, derived from the
+    /// configured PSK. `None` (unset) = obfuscation off. The transport
+    /// layer reads it via `obfuscation_key()` to decide whether to wrap
+    /// each TCP link in the keystream obfuscator.
+    obfs_key: std::sync::OnceLock<[u8; 32]>,
 }
 
 impl PacketConn {
@@ -2902,6 +2907,22 @@ impl PacketConn {
     /// `key_difficulty_bits` are refused at the transport layer.
     pub fn set_min_peer_difficulty_bits(&self, bits: u32) {
         self.min_peer_difficulty_bits.store(bits, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Roadmap #7: install the transport-obfuscation PSK. An empty
+    /// string leaves obfuscation off (the default). Idempotent and
+    /// one-shot — call once at node startup, before transports spawn.
+    pub fn set_obfuscation_psk(&self, psk: &str) {
+        if let Some(key) = crate::obfs::derive_psk_key(psk) {
+            let _ = self.obfs_key.set(key);
+            tracing::info!("transport obfuscation enabled (roadmap #7)");
+        }
+    }
+
+    /// Roadmap #7: the derived obfuscation key, or `None` when
+    /// obfuscation is off. Read by the TCP transport per connection.
+    pub fn obfuscation_key(&self) -> Option<[u8; 32]> {
+        self.obfs_key.get().copied()
     }
 }
 
@@ -2971,6 +2992,7 @@ impl PacketConn {
             min_peer_difficulty_bits: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             shutdown_tx,
             crypto_pool: std::sync::OnceLock::new(),
+            obfs_key: std::sync::OnceLock::new(),
         }
     }
 
@@ -3063,6 +3085,12 @@ impl PacketConn {
                     }
                 }
                 if crate::packet::write_frames_batched(&mut writer, &batch).await.is_err() {
+                    break;
+                }
+                // Flush so a buffered writer (the roadmap #7 obfuscation
+                // layer) never strands a batch's tail when the peer goes
+                // idle. A no-op for the bare TCP write half.
+                if writer.flush().await.is_err() {
                     break;
                 }
             }
