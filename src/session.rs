@@ -252,13 +252,6 @@ pub fn ed25519_pub_to_x25519(ed_pub_bytes: &[u8; 32]) -> Result<X25519PublicKey>
 // Per-session state
 // ──────────────────────────────────────────────
 
-/// Per-session state.
-///
-/// Encryption protocol:
-/// - Each side has a local x25519 keypair (rotated after each send).
-/// - Shared key = DH(local_priv, remote_pub).
-/// - Each encrypted packet carries sender's current x25519 pub key.
-/// - Receiver updates remote_pub from packet, recomputes shared key.
 /// Roadmap #4: a memoised X25519 shared secret, tagged with the public
 /// keys it was derived from so [`SessionInfo::dh_shared`] can detect a
 /// key rotation on either side and recompute. Plain bytes, `Copy` — no
@@ -270,6 +263,13 @@ struct CachedDh {
     shared: [u8; 32],
 }
 
+/// Per-session state.
+///
+/// Encryption protocol:
+/// - Each side has a local x25519 keypair (rotated after each send).
+/// - Shared key = DH(local_priv, remote_pub).
+/// - Each encrypted packet carries sender's current x25519 pub key.
+/// - Receiver updates remote_pub from packet, recomputes shared key.
 pub struct SessionInfo {
     /// Remote's ed25519 public key
     pub remote_ed_pub: [u8; 32],
@@ -360,10 +360,11 @@ impl SessionInfo {
     fn dh_shared(&mut self, remote: &X25519PublicKey) -> [u8; 32] {
         let local_fp = *self.local_x25519_pub.as_bytes();
         let remote_fp = *remote.as_bytes();
-        if let Some(c) = self.cached_dh {
-            if c.local_fp == local_fp && c.remote_fp == remote_fp {
-                return c.shared;
-            }
+        if let Some(c) = self.cached_dh
+            && c.local_fp == local_fp
+            && c.remote_fp == remote_fp
+        {
+            return c.shared;
         }
         let shared = Self::compute_key(&self.local_x25519_priv, remote);
         self.cached_dh = Some(CachedDh { local_fp, remote_fp, shared });
