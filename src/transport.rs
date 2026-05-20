@@ -524,17 +524,37 @@ pub async fn dial(uri: &str, conn: Arc<PacketConn>, connected: ConnectedPeers) {
                         // a TCP whose far-end the OTHER side dropped on its
                         // own dedup → both connections die. The classic fix:
                         // smaller-pub-key role = "dialer", larger = "accepter".
-                        // If we are the larger pub, suppress our dial and let
-                        // their dial (smaller pub → our accept) become the
-                        // sole surviving TCP.
+                        // The larger-pub side yields its dial to the peer's.
+                        //
+                        // BUT that only works if the peer actually dials us.
+                        // A listen-only node (e.g. a bifrost-vpnd exit, whose
+                        // `peers` list is empty) never dials back, so a client
+                        // whose pub_key sorts higher than the exit's would
+                        // defer forever. So: only yield if the peer has in
+                        // fact reached us — wait briefly for their inbound
+                        // dial, and if none appears, keep the link we already
+                        // established.
                         let our_pub = conn.pub_key;
                         if our_pub > remote_pub {
+                            tokio::time::sleep(Duration::from_secs(3)).await;
+                            let peer_reached_us = {
+                                let map = connected.lock().unwrap();
+                                map.get(&remote_pub).copied().unwrap_or(0) > 0
+                            };
+                            if peer_reached_us {
+                                debug!(
+                                    "dial yielded: peer {:?} reached us via its own dial \
+                                     (we are the larger pub)",
+                                    &remote_pub[..4]
+                                );
+                                tokio::time::sleep(Duration::from_secs(30)).await;
+                                continue;
+                            }
                             debug!(
-                                "dial deferred: our_pub > remote_pub for {:?} (canonical role = accepter)",
+                                "dial kept: no inbound from {:?} — peer is listen-only, \
+                                 keeping our dialed link",
                                 &remote_pub[..4]
                             );
-                            tokio::time::sleep(Duration::from_secs(30)).await;
-                            continue;
                         }
 
                         // Per-peer link cap: refuse dial only when we
