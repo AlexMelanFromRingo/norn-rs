@@ -259,6 +259,17 @@ pub fn ed25519_pub_to_x25519(ed_pub_bytes: &[u8; 32]) -> Result<X25519PublicKey>
 /// - Shared key = DH(local_priv, remote_pub).
 /// - Each encrypted packet carries sender's current x25519 pub key.
 /// - Receiver updates remote_pub from packet, recomputes shared key.
+/// Roadmap #4: a memoised X25519 shared secret, tagged with the public
+/// keys it was derived from so [`SessionInfo::dh_shared`] can detect a
+/// key rotation on either side and recompute. Plain bytes, `Copy` — no
+/// more sensitive than `pq_shared`, which is also stored unwrapped.
+#[derive(Clone, Copy)]
+struct CachedDh {
+    local_fp: [u8; 32],
+    remote_fp: [u8; 32],
+    shared: [u8; 32],
+}
+
 pub struct SessionInfo {
     /// Remote's ed25519 public key
     pub remote_ed_pub: [u8; 32],
@@ -295,6 +306,11 @@ pub struct SessionInfo {
     /// Cleared as soon as a packet successfully decrypts with `pq_shared`
     /// (i.e. once we know which one was the right one).
     pq_shared_fallback: Option<[u8; ML_KEM_SHARED_BYTES]>,
+
+    /// Roadmap #4: memoised `DH(local_x25519_priv, remote_x25519_pub)`.
+    /// `None` until the first encrypt/decrypt; refreshed automatically
+    /// by `dh_shared` whenever either key rotates.
+    cached_dh: Option<CachedDh>,
 }
 
 impl SessionInfo {
@@ -316,6 +332,7 @@ impl SessionInfo {
             last_used: Instant::now(),
             pq_shared: None,
             pq_shared_fallback: None,
+            cached_dh: None,
         }
     }
 
@@ -327,6 +344,30 @@ impl SessionInfo {
     fn compute_key(local_priv: &StaticSecret, remote_pub: &X25519PublicKey) -> [u8; 32] {
         let shared = local_priv.diffie_hellman(remote_pub);
         *shared.as_bytes()
+    }
+
+    /// Roadmap #4: X25519 shared secret for `DH(local_x25519_priv, remote)`,
+    /// memoised.
+    ///
+    /// `encrypt`/`decrypt` would otherwise run a full X25519 scalar
+    /// multiplication — ~55µs, the dominant cost in the encrypt
+    /// benchmark — on *every* packet, even though `local_x25519_priv`
+    /// and the peer's pub key only change on key rotation. The cache is
+    /// self-validating: it records the public-key fingerprints the
+    /// secret was derived from and recomputes whenever either side
+    /// rotates, so there is no invalidation to forget at the key-
+    /// mutation sites.
+    fn dh_shared(&mut self, remote: &X25519PublicKey) -> [u8; 32] {
+        let local_fp = *self.local_x25519_pub.as_bytes();
+        let remote_fp = *remote.as_bytes();
+        if let Some(c) = self.cached_dh {
+            if c.local_fp == local_fp && c.remote_fp == remote_fp {
+                return c.shared;
+            }
+        }
+        let shared = Self::compute_key(&self.local_x25519_priv, remote);
+        self.cached_dh = Some(CachedDh { local_fp, remote_fp, shared });
+        shared
     }
 
     /// Encrypt a payload.
@@ -343,7 +384,10 @@ impl SessionInfo {
     /// remote will see the new pub in subsequent packets and update its state.
     pub fn encrypt(&mut self, plaintext: &[u8]) -> Result<Vec<u8>> {
         let sender_x_pub = *self.local_x25519_pub.as_bytes();
-        let x25519_shared = Self::compute_key(&self.local_x25519_priv, &self.remote_x25519_pub);
+        // Roadmap #4: memoised DH (see `dh_shared`) — was a full ~55µs
+        // X25519 scalar-mult on every single packet.
+        let remote = self.remote_x25519_pub;
+        let x25519_shared = self.dh_shared(&remote);
         // Hybrid: HKDF combines per-packet X25519 with per-session PQ secret.
         let key_bytes = derive_packet_key(&x25519_shared, self.pq_shared.as_ref());
         let key = Key::from_slice(&key_bytes);
@@ -397,7 +441,9 @@ impl SessionInfo {
 
         // Key = DH(our_stable_local_priv, sender_pub_from_packet)
         // equals DH(sender_priv, our_local_pub) by commutativity.
-        let x25519_shared = Self::compute_key(&self.local_x25519_priv, &sender_x_pub);
+        // Roadmap #4: memoised — a steady (non-rotating) sender hits the
+        // cache every packet; a sender rotation refreshes it once.
+        let x25519_shared = self.dh_shared(&sender_x_pub);
 
         let mut nonce_bytes = [0u8; 12];
         nonce_bytes[..8].copy_from_slice(&seq.to_le_bytes());
