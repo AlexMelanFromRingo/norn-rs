@@ -142,6 +142,22 @@ pub fn render(conn: &PacketConn, started: Instant) -> String {
     out.push_str("# TYPE norn_mutex_poison_total counter\n");
     out.push_str(&format!("norn_mutex_poison_total {}\n", crate::router::mutex_poison_count()));
 
+    // ── Roadmap #9: adaptive control-plane cadence ────────────────────────
+    // broadcasts = ANNOUNCE+CoordAnnounce floods actually sent; suppressed =
+    // maintenance ticks the adaptive cadence skipped because the topology
+    // was unchanged. A high suppressed:broadcasts ratio is the chatter the
+    // adaptive cadence saved versus the old send-every-tick behaviour.
+    let (ctrl_sent, ctrl_suppressed) = crate::router::control_broadcast_counts();
+    out.push_str("# HELP norn_control_broadcasts_total \
+                  Periodic control broadcasts (ANNOUNCE + CoordAnnounce) actually sent.\n");
+    out.push_str("# TYPE norn_control_broadcasts_total counter\n");
+    out.push_str(&format!("norn_control_broadcasts_total {ctrl_sent}\n"));
+    out.push_str("# HELP norn_control_suppressed_total \
+                  Maintenance ticks where the control broadcast was skipped \
+                  by the adaptive cadence (roadmap #9).\n");
+    out.push_str("# TYPE norn_control_suppressed_total counter\n");
+    out.push_str(&format!("norn_control_suppressed_total {ctrl_suppressed}\n"));
+
     // ── Per-tree spanning-tree state ──────────────────────────────────────
     // Three labelled gauges per K=3 trees — enough for a cluster-wide
     // scraper to reconstruct each tree:

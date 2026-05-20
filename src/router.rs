@@ -100,6 +100,23 @@ pub fn mutex_poison_count() -> u64 {
     MUTEX_POISON_COUNT.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Roadmap #9: count of periodic control broadcasts actually sent, and
+/// of maintenance ticks where the broadcast was suppressed because the
+/// topology was unchanged. The ratio quantifies the chatter reduction;
+/// both are surfaced in `/metrics` as `norn_control_broadcasts_total`
+/// and `norn_control_suppressed_total`.
+pub static CONTROL_BROADCASTS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub static CONTROL_SUPPRESSED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Snapshot of the control-broadcast counters `(sent, suppressed)` for
+/// the Prometheus exposition.
+pub fn control_broadcast_counts() -> (u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (CONTROL_BROADCASTS.load(Relaxed), CONTROL_SUPPRESSED.load(Relaxed))
+}
+
 /// Extension trait that recovers from poisoned mutexes instead of panicking.
 /// If a thread panicked while holding a lock, we log an error, bump the
 /// poison counter, and continue — better than a cascade crash from an
@@ -193,6 +210,13 @@ pub const TREE_SEEDS: [[u8; 8]; 3] = [
 
 /// Announce expires after 30 seconds
 const ANNOUNCE_EXPIRY: Duration = Duration::from_secs(30);
+/// Roadmap #9: adaptive control-plane cadence bounds. While the
+/// topology digest is unchanged the ANNOUNCE / CoordAnnounce interval
+/// backs off linearly from MIN to MAX ticks; any change snaps it back
+/// to MIN. MAX stays well under `ANNOUNCE_EXPIRY` (30 s) so a
+/// neighbour's cached announce is always refreshed before it expires.
+const CONTROL_MIN_INTERVAL: u32 = 1;
+const CONTROL_MAX_INTERVAL: u32 = 8;
 /// Keep-alive interval: send ping every 5 maintenance ticks (5 seconds)
 const KEEPALIVE_TICKS: u32 = 5;
 /// Peer timeout
@@ -319,6 +343,26 @@ struct TreeState {
     root: [u8; 32],
     root_seq: u64,
     parent_cost: u64,
+}
+
+/// Roadmap #9: snapshot of everything the periodic control broadcasts
+/// (`send_announces` ×K + `broadcast_coord`) encode. Two equal
+/// snapshots mean a re-broadcast would carry the same topology, so the
+/// adaptive cadence can safely skip it.
+///
+/// Deliberately excludes `parent_cost`: it is a soft routing metric
+/// that jitters with RTT noise, and letting it refresh lazily within
+/// `CONTROL_MAX_INTERVAL` instead of forcing a broadcast every tick is
+/// exactly the freshness-for-chatter trade roadmap #9 makes. The digest
+/// keeps only *topological identity* — root, root_seq, parent, depth —
+/// plus the onion ephemeral pub the CoordAnnounce carries and the peer
+/// count, so a peer join/leave snaps the cadence back to fast.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct ControlDigest {
+    trees: [(PeerId, u64, Option<PeerId>); K],
+    own_depth: u32,
+    onion_eph_pub: [u8; 32],
+    peer_count: usize,
 }
 
 /// Public snapshot of one tree's current state — returned by
@@ -494,6 +538,12 @@ struct RouterState {
     /// WE receive it from peer P, we should learn "P cannot reach this
     /// tag" → cache (P, tag). Next lookup_by_tag skips P.
     path_negative_cache: HashMap<([u8; 32], [u8; 16]), Instant>,
+    /// Roadmap #9 adaptive control-plane cadence: the last broadcast
+    /// topology digest, the tick it went out on, and the current
+    /// inter-broadcast interval in ticks.
+    last_control_digest: Option<ControlDigest>,
+    last_control_tick: u32,
+    control_interval: u32,
 }
 
 /// One observation in `reputation`.
@@ -769,6 +819,9 @@ impl RouterState {
             own_reputation_seq: 0,
             hole_punch_cb: None,
             path_negative_cache: HashMap::new(),
+            last_control_digest: None,
+            last_control_tick: 0,
+            control_interval: CONTROL_MIN_INTERVAL,
         }
     }
 
@@ -1056,6 +1109,53 @@ impl RouterState {
         }
     }
 
+    /// Roadmap #9: snapshot the topology the periodic control
+    /// broadcasts would carry — see [`ControlDigest`].
+    fn control_digest(&self) -> ControlDigest {
+        ControlDigest {
+            trees: std::array::from_fn(|i| {
+                let t = &self.trees[i];
+                (t.root, t.root_seq, t.parent)
+            }),
+            own_depth: self.own_depth,
+            onion_eph_pub: *self.onion_keys.pub_key().as_bytes(),
+            peer_count: self.peers.len(),
+        }
+    }
+
+    /// Roadmap #9: adaptive control-plane cadence.
+    ///
+    /// `send_announces` (×K) and `broadcast_coord` otherwise re-flood
+    /// the *same* bytes to every peer every tick once a neighbourhood
+    /// is stable — fixed-rate chatter that scales with the node count.
+    /// Instead: digest the topology; while the digest is unchanged let
+    /// the interval back off linearly to `CONTROL_MAX_INTERVAL`; on any
+    /// change snap back to `CONTROL_MIN_INTERVAL` and broadcast at once.
+    /// Keepalives (independent, every `KEEPALIVE_TICKS`) still keep the
+    /// links themselves from being declared dead.
+    fn maybe_broadcast_control(&mut self) {
+        let digest = self.control_digest();
+        let changed = self.last_control_digest != Some(digest);
+        self.control_interval = if changed {
+            CONTROL_MIN_INTERVAL
+        } else {
+            (self.control_interval + 1).min(CONTROL_MAX_INTERVAL)
+        };
+        let due = changed
+            || self.tick.wrapping_sub(self.last_control_tick) >= self.control_interval;
+        if !due {
+            CONTROL_SUPPRESSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return;
+        }
+        for i in 0..K {
+            self.send_announces(i);
+        }
+        self.broadcast_coord();
+        self.last_control_digest = Some(digest);
+        self.last_control_tick = self.tick;
+        CONTROL_BROADCASTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
     fn send_to_peer(&mut self, peer_key: &PeerId, data: Vec<u8>) {
         if let Some(peer) = self.peers.get_mut(peer_key) {
             if peer.txs.is_empty() {
@@ -1246,11 +1346,12 @@ impl RouterState {
         self.expire_peers();
         for i in 0..K {
             self.fix_tree(i);
-            self.send_announces(i);
             self.cuckoo_do_maintenance(i);
         }
         self.update_own_coord();
-        self.broadcast_coord();
+        // Roadmap #9: adaptive cadence — replaces the unconditional
+        // per-tick `send_announces` ×K + `broadcast_coord`.
+        self.maybe_broadcast_control();
         if self.tick.is_multiple_of(KEEPALIVE_TICKS) {
             self.send_keepalives();
         }
@@ -3889,6 +3990,64 @@ mod tests {
         rs.remove_peer(&peer_a);
         assert_eq!(rs.trees[0].parent, Some(peer_b), "unrelated parent must not be cleared");
         assert_eq!(rs.trees[0].parent_cost, 500, "parent_cost must not change");
+    }
+
+    // ── roadmap #9: adaptive control-plane cadence ────────────────────────────
+
+    #[test]
+    fn control_cadence_backs_off_when_stable() {
+        let mut rs = make_router();
+        // Frozen topology — run well past the back-off ramp.
+        for _ in 0..40 {
+            rs.tick += 1;
+            rs.maybe_broadcast_control();
+        }
+        assert_eq!(
+            rs.control_interval, CONTROL_MAX_INTERVAL,
+            "a stable topology must back the cadence off to the cap"
+        );
+
+        // In steady state, consecutive broadcasts are exactly
+        // CONTROL_MAX_INTERVAL ticks apart — record two and check the gap.
+        let mut broadcast_ticks = Vec::new();
+        let mut prev = rs.last_control_tick;
+        while broadcast_ticks.len() < 2 {
+            rs.tick += 1;
+            rs.maybe_broadcast_control();
+            if rs.last_control_tick != prev {
+                broadcast_ticks.push(rs.last_control_tick);
+                prev = rs.last_control_tick;
+            }
+        }
+        assert_eq!(
+            broadcast_ticks[1] - broadcast_ticks[0],
+            CONTROL_MAX_INTERVAL,
+            "steady-state broadcasts must be CONTROL_MAX_INTERVAL ticks apart"
+        );
+    }
+
+    #[test]
+    fn control_cadence_snaps_back_on_topology_change() {
+        let mut rs = make_router();
+        for _ in 0..40 {
+            rs.tick += 1;
+            rs.maybe_broadcast_control();
+        }
+        assert_eq!(rs.control_interval, CONTROL_MAX_INTERVAL, "precondition: backed off");
+
+        // A new peer changes the digest (peer_count) — the cadence must
+        // snap back to fast and broadcast on the very next tick.
+        add_dummy_peer(&mut rs, [7u8; 32]);
+        rs.tick += 1;
+        rs.maybe_broadcast_control();
+        assert_eq!(
+            rs.control_interval, CONTROL_MIN_INTERVAL,
+            "a topology change must snap the cadence back to fast"
+        );
+        assert_eq!(
+            rs.last_control_tick, rs.tick,
+            "a topology change must broadcast immediately"
+        );
     }
 
     // ── fix_tree ──────────────────────────────────────────────────────────────
