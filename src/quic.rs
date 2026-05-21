@@ -313,64 +313,20 @@ pub async fn dial(uri: &str, conn: Arc<PacketConn>, connected: ConnectedPeers) {
     }
 }
 
-/// Common per-connection plumbing for both accept and dial: run the NRN1
-/// handshake over the QUIC bidi stream, then call `handle_conn`.
+/// Per-connection plumbing for both accept and dial: hand the QUIC bidi
+/// stream to the shared `transport::serve_authenticated_link`, which runs
+/// the NRN1 handshake, the Sybil-difficulty gate, the per-peer link cap
+/// and the connection loop — identically for the TCP, QUIC and (out of
+/// crate) `wss://` transports.
 #[mutants::skip]
 async fn handle_one(
     conn: Arc<PacketConn>,
     connected: ConnectedPeers,
     peer_label: String,
-    mut reader: Box<dyn tokio::io::AsyncRead + Unpin + Send>,
-    mut writer: Box<dyn tokio::io::AsyncWrite + Unpin + Send>,
+    reader: Box<dyn tokio::io::AsyncRead + Unpin + Send>,
+    writer: Box<dyn tokio::io::AsyncWrite + Unpin + Send>,
 ) {
-    // Reuse the *exact* NRN1 handshake messages defined in transport.rs by
-    // simulating the same async exchange. We delegate to a thin shim because
-    // transport::handshake is private and tied to TcpStream.
-
-    let hs_result = timeout(
-        QUIC_HANDSHAKE_TIMEOUT,
-        crate::transport::handshake_over_stream(&mut reader, &mut writer, conn.signing_key()),
-    ).await;
-    let remote_pub = match hs_result {
-        Err(_) => { warn!("QUIC handshake timed out from {}", peer_label); return; }
-        Ok(Err(e)) => { warn!("QUIC handshake from {}: {:#}", peer_label, e); return; }
-        Ok(Ok(p)) => p,
-    };
-
-    let min_bits = conn.min_peer_difficulty_bits();
-    if min_bits > 0 {
-        let got = crate::address::key_difficulty_bits(&remote_pub);
-        if got < min_bits {
-            warn!("QUIC: rejecting {} ({:?}): difficulty {} < {}",
-                peer_label, &remote_pub[..4], got, min_bits);
-            return;
-        }
-    }
-
-    {
-        use crate::router::MAX_PARALLEL_LINKS_PER_PEER;
-        let mut map = connected.lock().unwrap();
-        let count = map.entry(remote_pub).or_insert(0);
-        if (*count as usize) >= MAX_PARALLEL_LINKS_PER_PEER {
-            debug!(
-                "QUIC inbound from {:?} at cap ({} links), dropping",
-                &remote_pub[..4], *count
-            );
-            return;
-        }
-        *count += 1;
-    }
-    info!("QUIC peer {:?} from {}", &remote_pub[..4], peer_label);
-    conn.handle_conn(remote_pub, reader, writer, 0).await;
-    {
-        let mut map = connected.lock().unwrap();
-        if let Some(count) = map.get_mut(&remote_pub) {
-            *count = count.saturating_sub(1);
-            if *count == 0 {
-                map.remove(&remote_pub);
-            }
-        }
-    }
+    crate::transport::serve_authenticated_link(conn, connected, peer_label, reader, writer).await
 }
 
 // ── AsyncRead / AsyncWrite adapters around quinn's typed streams ──────────
