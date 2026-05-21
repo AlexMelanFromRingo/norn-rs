@@ -306,6 +306,80 @@ where
     Ok(their_pub)
 }
 
+/// Run the NRN1 authenticated handshake over an already-established
+/// byte-stream pair, then serve the connection until it ends.
+///
+/// This is norn-rs's seam for transports implemented *outside* this
+/// crate. A pluggable transport (e.g. an obfuscating `wss://` transport
+/// living in a separate crate) brings up any `AsyncRead + AsyncWrite`
+/// pipe by whatever means, then hands the two halves here; norn-rs owns
+/// the rest — identity handshake, Sybil-difficulty gate, the per-peer
+/// link cap, and the read/write loop. The built-in TCP (`listen` /
+/// `dial`) and QUIC (`quic::handle_one`) paths do the same work inline;
+/// this is the equivalent entry point exposed for external callers.
+#[mutants::skip]
+pub async fn serve_authenticated_link(
+    conn: Arc<PacketConn>,
+    connected: ConnectedPeers,
+    peer_label: String,
+    mut reader: Box<dyn tokio::io::AsyncRead + Unpin + Send>,
+    mut writer: Box<dyn tokio::io::AsyncWrite + Unpin + Send>,
+) {
+    let hs = timeout(
+        HANDSHAKE_TIMEOUT,
+        handshake_over_stream(&mut reader, &mut writer, conn.signing_key()),
+    )
+    .await;
+    let remote_pub = match hs {
+        Err(_) => {
+            warn!("handshake timed out from {}", peer_label);
+            return;
+        }
+        Ok(Err(e)) => {
+            warn!("handshake from {}: {:#}", peer_label, e);
+            return;
+        }
+        Ok(Ok(p)) => p,
+    };
+
+    let min_bits = conn.min_peer_difficulty_bits();
+    if min_bits > 0 {
+        let got = crate::address::key_difficulty_bits(&remote_pub);
+        if got < min_bits {
+            warn!(
+                "rejecting {} ({:?}): difficulty {} < required {}",
+                peer_label, &remote_pub[..4], got, min_bits
+            );
+            return;
+        }
+    }
+
+    {
+        use crate::router::MAX_PARALLEL_LINKS_PER_PEER;
+        let mut map = connected.lock().unwrap();
+        let count = map.entry(remote_pub).or_insert(0);
+        if (*count as usize) >= MAX_PARALLEL_LINKS_PER_PEER {
+            debug!(
+                "inbound from {:?} at cap ({} links), dropping",
+                &remote_pub[..4], *count
+            );
+            return;
+        }
+        *count += 1;
+    }
+    info!("accepted peer {:?} via {}", &remote_pub[..4], peer_label);
+    conn.handle_conn(remote_pub, reader, writer, 0).await;
+    {
+        let mut map = connected.lock().unwrap();
+        if let Some(count) = map.get_mut(&remote_pub) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                map.remove(&remote_pub);
+            }
+        }
+    }
+}
+
 /// Start a TCP listener. Accepts peers, performs handshake, calls handle_conn.
 #[mutants::skip]
 pub async fn listen(
