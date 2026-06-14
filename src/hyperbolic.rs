@@ -1,76 +1,96 @@
-//! Hyperbolic coordinate routing in the Poincaré disk.
+//! Hyperbolic coordinate routing on the hyperboloid (Lorentz) model.
 //!
-//! Each node has a coordinate (r, θ) in [0,1) × [0, 2π).
-//! Greedy forwarding: forward to the neighbour with minimum hyperbolic
-//! distance to the destination coordinate.
+//! Each node has a coordinate `(rho, theta)`: `rho` is the radial **hyperbolic
+//! distance** from the origin (linear in tree depth), `theta ∈ [0, 2π)` is a
+//! key-derived angle. Greedy forwarding picks the neighbour with minimum
+//! hyperbolic distance to the destination coordinate.
 //!
-//! Reference: Kleinberg 2007; Sarkar 2011.
+//! ## Why the hyperboloid model (coordinate format v4)
+//!
+//! The earlier Poincaré-disk form stored `r = tanh(depth·0.5)`, which **saturates
+//! to 1.0 in f64 at depth ≳ 38** (and hit a `1−1e-10` clamp at depth ~24): deep
+//! nodes became indistinguishable, and the distance denominator `1 − ū·v`
+//! suffered catastrophic cancellation near the boundary. Carrying `rho` (which
+//! grows linearly and never saturates) and computing distance on the hyperboloid
+//! removes both problems. See `docs/superpowers/specs/2026-06-14-hyperbolic-coords-v4-design.md`.
+//!
+//! Reference: Kleinberg 2007; Sarkar 2011; Nickel & Kiela 2018 (hyperboloid model).
 
 use std::f64::consts::PI;
 use blake2::{Blake2b512, Digest};
 
-/// A point in the Poincaré disk. r ∈ [0, 1), θ ∈ [0, 2π).
+/// Radial step per tree-depth level, in hyperbolic units. The Poincaré radius is
+/// `r = tanh(rho/2)`; with this step the legacy embedding's `r = tanh(depth·0.5)`
+/// corresponds exactly to `rho = depth`.
+const RADIAL_STEP: f64 = 1.0;
+
+/// Upper clamp on the radial coordinate. `cosh(RHO_MAX)²` must stay within f64
+/// range so the distance computation never overflows to NaN: `cosh(354)² ≈ 6e306
+/// < f64::MAX`, so 350 is a safe bound — and ~15× deeper than the legacy ceiling
+/// (~24). Beyond this depth distances saturate gracefully (monotone, finite).
+const RHO_MAX: f64 = 350.0;
+
+/// A point on the hyperbolic plane in radial form. `rho ≥ 0`, `theta ∈ [0, 2π)`.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct HypCoord {
-    pub r: f64,
+    /// Radial hyperbolic distance from the origin. Linear in tree depth; never
+    /// saturates (unlike the legacy Poincaré `r`).
+    pub rho: f64,
+    /// Angle in [0, 2π).
     pub theta: f64,
 }
 
 impl HypCoord {
     pub fn origin() -> Self {
-        Self { r: 0.0, theta: 0.0 }
+        Self { rho: 0.0, theta: 0.0 }
     }
 
-    /// Convert to Cartesian for distance calculation.
-    pub fn to_cartesian(self) -> (f64, f64) {
-        (self.r * self.theta.cos(), self.r * self.theta.sin())
-    }
-
-    /// Hyperbolic distance between two Poincaré disk points.
-    /// d(u,v) = 2·arctanh(|u−v| / |1 − ū·v|)  (Möbius formula)
+    /// Hyperbolic distance between two points, via the hyperbolic law of cosines
+    /// **rewritten to avoid catastrophic cancellation**:
     ///
-    /// Note the MINUS in the denominator: ū·v = (ax·bx + ay·by) + i(ax·by − ay·bx),
-    /// so 1 − ū·v has real part 1 − (ax·bx + ay·by). A `+` here is a classic
-    /// transcription error — it stays invisible whenever one point is the origin
-    /// (ū·v = 0) but grossly distorts every other pair (antipodal points read as
-    /// ~10× too far), silently degrading greedy routing. Cross-checked against the
-    /// independent arcosh form in `distance_matches_independent_arcosh_reference`.
+    /// ```text
+    ///   cosh d = cosh ρu cosh ρv − sinh ρu sinh ρv cos Δθ
+    ///          = cosh(ρu − ρv) + 2·sinh ρu·sinh ρv·sin²(Δθ/2)
+    /// ```
+    ///
+    /// The second form has no `huge − huge` subtraction: `cosh(ρu−ρv)` is exact
+    /// when `ρu ≈ ρv` (the case the old Poincaré formula mangled), and the rest is
+    /// a sum of non-negatives. `RHO_MAX` keeps the `sinh·sinh` product finite;
+    /// `max(1.0, …)` absorbs sub-ulp rounding so `acosh` stays real (identical
+    /// points give exactly 0).
     pub fn distance(self, other: Self) -> f64 {
-        let (ax, ay) = self.to_cartesian();
-        let (bx, by) = other.to_cartesian();
-        let dx = ax - bx;
-        let dy = ay - by;
-        let num = (dx * dx + dy * dy).sqrt();
-        let denom_re = 1.0 - ax * bx - ay * by;
-        let denom_im = ax * by - ay * bx;
-        let denom = (denom_re * denom_re + denom_im * denom_im).sqrt();
-        let ratio = num / denom;
-        let ratio = ratio.min(1.0 - 1e-10); // clamp for numerical safety
-        2.0 * ratio.atanh()
+        let a = self.rho.clamp(0.0, RHO_MAX);
+        let b = other.rho.clamp(0.0, RHO_MAX);
+        let dtheta = self.theta - other.theta;
+        let sin_half = (0.5 * dtheta).sin();
+        let cosh_d = (a - b).cosh() + 2.0 * a.sinh() * b.sinh() * sin_half * sin_half;
+        cosh_d.max(1.0).acosh()
     }
 
-    /// Encode as 16 bytes: r as f64 LE + theta as f64 LE.
+    /// Encode as 16 bytes: rho as f64 LE + theta as f64 LE.
     pub fn encode(self) -> [u8; 16] {
         let mut out = [0u8; 16];
-        out[..8].copy_from_slice(&self.r.to_le_bytes());
+        out[..8].copy_from_slice(&self.rho.to_le_bytes());
         out[8..].copy_from_slice(&self.theta.to_le_bytes());
         out
     }
 
     pub fn decode(data: &[u8; 16]) -> Self {
-        let r = f64::from_le_bytes(data[..8].try_into().unwrap());
+        let rho = f64::from_le_bytes(data[..8].try_into().unwrap());
         let theta = f64::from_le_bytes(data[8..].try_into().unwrap());
         // Sanitise non-finite values — NaN/Inf would otherwise propagate through
         // `distance()` and silently poison greedy routing (NaN comparisons are
         // always false, so a NaN-coord node is effectively never closer/farther).
-        let r = if r.is_finite() { r.clamp(0.0, 1.0 - 1e-10) } else { 0.0 };
+        // Clamp rho to [0, RHO_MAX]: negatives are invalid, and the upper bound
+        // keeps the distance math overflow-free.
+        let rho = if rho.is_finite() { rho.clamp(0.0, RHO_MAX) } else { 0.0 };
         let theta = if theta.is_finite() {
             // Use rem_euclid for a canonical [0, 2π) result regardless of sign.
             theta.rem_euclid(2.0 * PI)
         } else {
             0.0
         };
-        Self { r, theta }
+        Self { rho, theta }
     }
 
     /// Derive a deterministic θ from an ed25519 public key.
@@ -81,16 +101,12 @@ impl HypCoord {
     }
 
     /// Compute coordinate for a node given its tree depth and pub key.
-    /// Uses Sarkar-style embedding: r from depth, θ from key hash.
+    /// Sarkar-style embedding: `rho` from depth (linear, clamped to `RHO_MAX`),
+    /// `theta` from the key hash. Root (depth 0) sits at the origin.
     pub fn from_tree_depth(depth: u32, pub_key: &[u8; 32]) -> Self {
-        const DELTA: f64 = 0.5;
-        let r = if depth == 0 {
-            0.0
-        } else {
-            (depth as f64 * DELTA).tanh()
-        };
+        let rho = (depth as f64 * RADIAL_STEP).min(RHO_MAX);
         let theta = Self::angle_from_key(pub_key);
-        Self { r, theta }
+        Self { rho, theta }
     }
 }
 
@@ -99,132 +115,150 @@ mod tests {
     use super::*;
 
     #[test]
+    fn origin_is_zero() {
+        let o = HypCoord::origin();
+        assert_eq!(o.rho, 0.0);
+        assert_eq!(o.theta, 0.0);
+    }
+
+    #[test]
     fn origin_distance_zero() {
         let o = HypCoord::origin();
-        assert!((o.distance(o)).abs() < 1e-10);
+        assert!(o.distance(o).abs() < 1e-12);
     }
 
     #[test]
     fn encode_decode_roundtrip() {
-        let c = HypCoord { r: 0.5, theta: 1.23 };
-        let enc = c.encode();
-        let dec = HypCoord::decode(&enc);
-        assert!((dec.r - c.r).abs() < 1e-12);
-        assert!((dec.theta - c.theta).abs() < 1e-12);
+        let c = HypCoord { rho: 3.5, theta: 1.23 };
+        let d = HypCoord::decode(&c.encode());
+        assert!((d.rho - c.rho).abs() < 1e-12);
+        assert!((d.theta - c.theta).abs() < 1e-12);
     }
 
+    // ── distance: core metric properties ──────────────────────────────────────
+
     #[test]
-    fn from_tree_depth_root_at_origin() {
-        let key = [0u8; 32];
-        let c = HypCoord::from_tree_depth(0, &key);
-        assert_eq!(c.r, 0.0);
+    fn distance_self_is_zero() {
+        let a = HypCoord { rho: 7.0, theta: 1.0 };
+        assert!(a.distance(a).abs() < 1e-9, "distance to self must be 0");
     }
 
     #[test]
     fn distance_symmetric() {
-        let a = HypCoord { r: 0.3, theta: 0.5 };
-        let b = HypCoord { r: 0.7, theta: 2.1 };
-        let d_ab = a.distance(b);
-        let d_ba = b.distance(a);
-        assert!((d_ab - d_ba).abs() < 1e-10, "distance not symmetric: {} vs {}", d_ab, d_ba);
-    }
-
-    // ── distance correctness ──────────────────────────────────────────────────
-
-    #[test]
-    fn distance_self_is_zero() {
-        let a = HypCoord { r: 0.5, theta: 1.0 };
-        assert!(a.distance(a).abs() < 1e-10, "distance to self must be 0");
+        let a = HypCoord { rho: 3.0, theta: 0.5 };
+        let b = HypCoord { rho: 7.0, theta: 2.1 };
+        assert!((a.distance(b) - b.distance(a)).abs() < 1e-9, "distance not symmetric");
     }
 
     #[test]
-    fn distance_always_positive_for_distinct_points() {
-        let a = HypCoord { r: 0.2, theta: 0.5 };
-        let b = HypCoord { r: 0.8, theta: 3.0 };
-        assert!(a.distance(b) > 0.0, "distance between distinct points must be positive");
+    fn distance_positive_for_distinct_points() {
+        let a = HypCoord { rho: 2.0, theta: 0.5 };
+        let b = HypCoord { rho: 8.0, theta: 3.0 };
+        assert!(a.distance(b) > 0.0);
     }
 
     #[test]
     fn distance_triangle_inequality() {
-        let a = HypCoord { r: 0.1, theta: 0.0 };
-        let b = HypCoord { r: 0.5, theta: 1.5 };
-        let c = HypCoord { r: 0.3, theta: 3.0 };
-        let d_ab = a.distance(b);
-        let d_bc = b.distance(c);
-        let d_ac = a.distance(c);
-        assert!(d_ac <= d_ab + d_bc + 1e-10,
-            "triangle inequality violated: {} <= {} + {}", d_ac, d_ab, d_bc);
+        let a = HypCoord { rho: 1.0, theta: 0.0 };
+        let b = HypCoord { rho: 5.0, theta: 1.5 };
+        let c = HypCoord { rho: 3.0, theta: 3.0 };
+        assert!(a.distance(c) <= a.distance(b) + b.distance(c) + 1e-9,
+            "triangle inequality violated");
     }
 
     #[test]
-    fn distance_increases_with_r() {
-        // Moving further from origin increases distance
-        let origin = HypCoord::origin();
-        let near = HypCoord { r: 0.3, theta: 0.0 };
-        let far  = HypCoord { r: 0.8, theta: 0.0 };
-        assert!(origin.distance(far) > origin.distance(near),
-            "larger r must give larger distance from origin");
-    }
-
-    // ── to_cartesian ──────────────────────────────────────────────────────────
-
-    #[test]
-    fn to_cartesian_at_origin() {
+    fn distance_increases_with_rho() {
         let o = HypCoord::origin();
-        let (x, y) = o.to_cartesian();
-        assert!(x.abs() < 1e-10 && y.abs() < 1e-10);
+        let near = HypCoord { rho: 3.0, theta: 0.0 };
+        let far = HypCoord { rho: 8.0, theta: 0.0 };
+        assert!(o.distance(far) > o.distance(near));
+    }
+
+    // ── distance: exact references ────────────────────────────────────────────
+
+    /// Distance from the origin to a point equals its radial coordinate — exact
+    /// at ANY rho (this is the property that fails under the legacy saturation).
+    #[test]
+    fn distance_from_origin_equals_rho() {
+        for rho in [0.5, 2.0, 10.0, 40.0, 300.0] {
+            let p = HypCoord { rho, theta: 1.234 };
+            let d = HypCoord::origin().distance(p);
+            assert!((d - rho).abs() < 1e-6, "origin→rho={rho}: got {d}");
+        }
+    }
+
+    /// Cross-check the stable formula against the *naive* hyperbolic law of
+    /// cosines (which is accurate at moderate rho, where there is no cancellation).
+    #[test]
+    fn distance_matches_naive_law_of_cosines() {
+        let a = HypCoord { rho: 2.5, theta: 0.7 };
+        let b = HypCoord { rho: 1.8, theta: 2.4 };
+        let naive = (a.rho.cosh() * b.rho.cosh()
+            - a.rho.sinh() * b.rho.sinh() * (a.theta - b.theta).cos())
+            .max(1.0)
+            .acosh();
+        assert!((a.distance(b) - naive).abs() < 1e-9,
+            "stable vs naive law of cosines: {} vs {}", a.distance(b), naive);
+    }
+
+    // ── the v3 regression: deep nodes must stay distinguishable ───────────────
+
+    #[test]
+    fn deep_nodes_are_distinguishable() {
+        let key = [9u8; 32];
+        let c40 = HypCoord::from_tree_depth(40, &key);
+        let c45 = HypCoord::from_tree_depth(45, &key);
+        // Radial coordinate tracks depth exactly (v3: both saturated to ~1.0).
+        assert!((c40.rho - 40.0).abs() < 1e-9 && (c45.rho - 45.0).abs() < 1e-9);
+        // Distance from origin is distinct (v3: both ≈ 23.7, indistinguishable).
+        let o = HypCoord::origin();
+        let (d40, d45) = (o.distance(c40), o.distance(c45));
+        assert!((d40 - 40.0).abs() < 1e-6 && (d45 - 45.0).abs() < 1e-6, "got {d40} {d45}");
+        assert!(d45 - d40 > 4.9, "deep nodes must be distinguishable: {d40} vs {d45}");
+    }
+
+    // ── numerical robustness near/over the boundary ───────────────────────────
+
+    #[test]
+    fn large_rho_distance_finite() {
+        // Two far-from-centre nodes close in angle — the catastrophic-cancellation
+        // case for the naive/Poincaré forms. Must be finite and positive.
+        let a = HypCoord { rho: 300.0, theta: 0.0 };
+        let b = HypCoord { rho: 320.0, theta: 1.0e-6 };
+        let d = a.distance(b);
+        assert!(d.is_finite() && d > 0.0, "large-rho distance must be finite: {d}");
     }
 
     #[test]
-    fn to_cartesian_at_unit_x() {
-        let c = HypCoord { r: 1.0, theta: 0.0 };
-        let (x, y) = c.to_cartesian();
-        assert!((x - 1.0).abs() < 1e-10, "x should be 1.0, got {}", x);
-        assert!(y.abs() < 1e-10, "y should be 0.0, got {}", y);
-    }
-
-    #[test]
-    fn to_cartesian_at_unit_y() {
-        let c = HypCoord { r: 1.0, theta: PI / 2.0 };
-        let (x, y) = c.to_cartesian();
-        assert!(x.abs() < 1e-10, "x should be 0, got {}", x);
-        assert!((y - 1.0).abs() < 1e-10, "y should be 1.0, got {}", y);
-    }
-
-    // ── angle_from_key ────────────────────────────────────────────────────────
-
-    #[test]
-    fn angle_from_key_in_range() {
-        let key = [0u8; 32];
-        let angle = HypCoord::angle_from_key(&key);
-        assert!((0.0..2.0 * PI).contains(&angle),
-            "angle must be in [0, 2π), got {}", angle);
-    }
-
-    #[test]
-    fn angle_from_key_deterministic() {
-        let key = [42u8; 32];
-        assert_eq!(HypCoord::angle_from_key(&key), HypCoord::angle_from_key(&key));
-    }
-
-    #[test]
-    fn angle_from_key_different_keys() {
-        let a1 = HypCoord::angle_from_key(&[1u8; 32]);
-        let a2 = HypCoord::angle_from_key(&[2u8; 32]);
-        assert_ne!(a1, a2, "different keys must give different angles");
+    fn rho_overflow_is_clamped_not_nan() {
+        let a = HypCoord { rho: 1e9, theta: 0.0 };
+        let b = HypCoord { rho: 1e12, theta: 2.0 };
+        assert!(a.distance(b).is_finite(), "huge rho must clamp, not overflow");
+        assert!(HypCoord::origin().distance(a).is_finite());
     }
 
     // ── from_tree_depth ───────────────────────────────────────────────────────
 
     #[test]
-    fn from_tree_depth_r_increases_with_depth() {
+    fn from_tree_depth_root_at_origin() {
+        assert_eq!(HypCoord::from_tree_depth(0, &[0u8; 32]).rho, 0.0);
+    }
+
+    #[test]
+    fn from_tree_depth_rho_equals_depth() {
+        let key = [0u8; 32];
+        assert!((HypCoord::from_tree_depth(1, &key).rho - 1.0).abs() < 1e-12);
+        assert!((HypCoord::from_tree_depth(7, &key).rho - 7.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn from_tree_depth_rho_increases_with_depth() {
         let key = [5u8; 32];
         let c0 = HypCoord::from_tree_depth(0, &key);
         let c1 = HypCoord::from_tree_depth(1, &key);
         let c5 = HypCoord::from_tree_depth(5, &key);
-        assert_eq!(c0.r, 0.0, "depth 0 must be at origin");
-        assert!(c1.r > 0.0, "depth 1 must have r > 0");
-        assert!(c5.r > c1.r, "larger depth must give larger r");
+        assert_eq!(c0.rho, 0.0);
+        assert!(c1.rho > 0.0 && c5.rho > c1.rho);
     }
 
     #[test]
@@ -232,256 +266,77 @@ mod tests {
         let key = [7u8; 32];
         let c1 = HypCoord::from_tree_depth(1, &key);
         let c3 = HypCoord::from_tree_depth(3, &key);
-        // Same key → same angle regardless of depth
         assert!((c1.theta - c3.theta).abs() < 1e-15);
     }
 
-    // ── decode clamping ───────────────────────────────────────────────────────
+    #[test]
+    fn from_tree_depth_clamps_extreme_depth() {
+        let c = HypCoord::from_tree_depth(u32::MAX, &[1u8; 32]);
+        assert!(c.rho <= RHO_MAX && c.rho.is_finite(), "extreme depth must clamp: {}", c.rho);
+    }
+
+    // ── decode: sanitation & clamping ─────────────────────────────────────────
 
     #[test]
-    fn decode_clamps_r_to_valid_range() {
+    fn decode_clamps_rho_to_max() {
         let mut data = [0u8; 16];
-        // r = 2.0 (out of range) stored as f64 LE
-        data[..8].copy_from_slice(&2.0f64.to_le_bytes());
+        data[..8].copy_from_slice(&1e9f64.to_le_bytes());
         data[8..].copy_from_slice(&1.0f64.to_le_bytes());
         let c = HypCoord::decode(&data);
-        assert!(c.r < 1.0, "r must be clamped below 1.0, got {}", c.r);
-    }
-
-    // ── numeric pinning: distance formula ────────────────────────────────────
-
-    #[test]
-    fn distance_origin_to_point_on_real_axis() {
-        // origin (0,0) to (r=0.5, theta=0) = (0.5, 0) Cartesian.
-        // num = 0.5, denom_re = 1 + 0*0.5 + 0*0 = 1, denom_im = 0
-        // ratio = 0.5 / 1.0 = 0.5 → distance = 2*atanh(0.5)
-        let origin = HypCoord::origin();
-        let p = HypCoord { r: 0.5, theta: 0.0 };
-        let d = origin.distance(p);
-        let expected = 2.0 * 0.5f64.atanh();
-        assert!((d - expected).abs() < 1e-10,
-            "distance formula mismatch: got {}, expected {}", d, expected);
+        assert!(c.rho <= RHO_MAX && c.rho >= 0.0, "rho must clamp into [0, RHO_MAX], got {}", c.rho);
     }
 
     #[test]
-    fn distance_formula_uses_minus_for_dx_dy() {
-        // Two distinct points: a=(0.3,0), b=(0.5,0) both on real axis.
-        // dx = 0.3-0.5 = -0.2, dy=0
-        // num = 0.2
-        // denom_re = 1 - 0.3*0.5 - 0 = 0.85
-        // denom_im = 0.3*0 - 0*0.5 = 0
-        // ratio = 0.2/0.85 ≈ 0.23529
-        // distance = 2*atanh(0.23529...)
-        let a = HypCoord { r: 0.3, theta: 0.0 };
-        let b = HypCoord { r: 0.5, theta: 0.0 };
-        let ax = 0.3f64; let bx = 0.5f64;
-        let num = (ax - bx).abs();
-        let denom = 1.0 - ax * bx;
-        let expected = 2.0 * (num / denom).atanh();
-        let d = a.distance(b);
-        assert!((d - expected).abs() < 1e-9,
-            "distance along real axis: got {}, expected {}", d, expected);
+    fn decode_negative_rho_clamped_nonneg() {
+        let mut data = [0u8; 16];
+        data[..8].copy_from_slice(&(-5.0f64).to_le_bytes());
+        data[8..].copy_from_slice(&1.0f64.to_le_bytes());
+        assert!(HypCoord::decode(&data).rho >= 0.0, "negative rho must clamp to 0");
     }
 
     #[test]
-    fn distance_formula_denominator_includes_ay_by_term() {
-        // a=(0.5, π/2) → (0, 0.5) and b=(0.3, 0) → (0.3, 0)
-        // dx=0-0.3=-0.3, dy=0.5-0=0.5
-        // num = sqrt(0.09+0.25) = sqrt(0.34) ≈ 0.58310
-        // denom_re = 1 + 0*0.3 + 0.5*0 = 1.0      ← ay*by term = 0.5*0 = 0
-        // denom_im = 0*0 - 0.5*0.3 = -0.15
-        // denom = sqrt(1 + 0.0225) = sqrt(1.0225) ≈ 1.01119
-        // ratio = 0.58310 / 1.01119 ≈ 0.57670
-        // distance = 2*atanh(0.57670) ≈ 1.28...
-        // If + was − in denom_re (1+ax*bx−ay*by): same (ay*by=0)
-        // If denom_im was ax*by + ay*bx: 0*0 + 0.5*0.3 = +0.15 (same magnitude → same dist)
-        // So use points where ay and by are BOTH nonzero.
-        let a = HypCoord { r: 0.4, theta: PI / 4.0 }; // (0.4/√2, 0.4/√2)
-        let b = HypCoord { r: 0.4, theta: 3.0 * PI / 4.0 }; // (-0.4/√2, 0.4/√2)
-        let (ax, ay) = a.to_cartesian();
-        let (bx, by) = b.to_cartesian();
-        let dx = ax - bx; let dy = ay - by;
-        let num = (dx * dx + dy * dy).sqrt();
-        let denom_re = 1.0 - ax * bx - ay * by; // the correct formula (1 − ū·v)
-        let denom_im = ax * by - ay * bx;
-        let denom = (denom_re * denom_re + denom_im * denom_im).sqrt();
-        let expected = 2.0 * (num / denom).atanh();
-        let d = a.distance(b);
-        assert!((d - expected).abs() < 1e-9,
-            "distance with nonzero ay/by: got {}, expected {}", d, expected);
-    }
-
-    // ── numeric pinning: to_cartesian formula ─────────────────────────────────
-
-    #[test]
-    fn to_cartesian_uses_cos_for_x_sin_for_y() {
-        // theta=π/3: x must be r*cos(π/3), y must be r*sin(π/3)
-        let r = 0.4f64;
-        let theta = PI / 3.0;
-        let c = HypCoord { r, theta };
-        let (x, y) = c.to_cartesian();
-        assert!((x - r * theta.cos()).abs() < 1e-12,
-            "x must be r*cos(theta): got {} vs {}", x, r * theta.cos());
-        assert!((y - r * theta.sin()).abs() < 1e-12,
-            "y must be r*sin(theta): got {} vs {}", y, r * theta.sin());
-    }
-
-    // ── numeric pinning: from_tree_depth DELTA=0.5 ───────────────────────────
-
-    #[test]
-    fn from_tree_depth_r_uses_delta_half() {
-        let key = [0u8; 32];
-        // depth=1: r = tanh(1 * 0.5) = tanh(0.5) ≈ 0.46212
-        let c1 = HypCoord::from_tree_depth(1, &key);
-        let expected_r1 = (1.0f64 * 0.5).tanh();
-        assert!((c1.r - expected_r1).abs() < 1e-12,
-            "depth=1: expected r=tanh(0.5)≈0.462, got {}", c1.r);
-        // depth=2: r = tanh(2 * 0.5) = tanh(1.0) ≈ 0.76159
-        let c2 = HypCoord::from_tree_depth(2, &key);
-        let expected_r2 = (2.0f64 * 0.5).tanh();
-        assert!((c2.r - expected_r2).abs() < 1e-12,
-            "depth=2: expected r=tanh(1.0)≈0.762, got {}", c2.r);
-    }
-
-    // ── numeric pinning: angle_from_key formula ───────────────────────────────
-
-    #[test]
-    fn angle_from_key_proportional_to_hash() {
-        // Key with all-zero hash bytes → val=0 → angle=0
-        // Use a key known to produce a specific hash direction.
-        // We test that angle = (val / u64::MAX) * 2π is in bounds and varies.
-        let angle_a = HypCoord::angle_from_key(&[0x00u8; 32]);
-        let angle_b = HypCoord::angle_from_key(&[0xFFu8; 32]);
-        // Both must be in [0, 2π)
-        assert!((0.0..2.0 * PI).contains(&angle_a));
-        assert!((0.0..2.0 * PI).contains(&angle_b));
-        // They must differ (different keys → different hashes)
-        assert_ne!(angle_a, angle_b, "all-0 and all-FF keys must produce different angles");
-        // Maximum possible angle must be strictly < 2π (val/u64::MAX * 2π < 2π)
-        let max_angle = (u64::MAX as f64 / u64::MAX as f64) * 2.0 * PI;
-        assert!(max_angle <= 2.0 * PI, "max angle must not exceed 2π");
-    }
-
-    // ── distance: pin exact value with nonzero dy (kills + → - and * → +) ───
-    //
-    // All previous distance tests use collinear points (dy=0), so mutations
-    // that corrupt dy terms aren't detected. This test uses a=origin, b on
-    // the imaginary axis (theta=π/2) so both dx and dy are nonzero at distance
-    // computation.
-    #[test]
-    fn distance_nonzero_dy_pinned_value() {
-        // origin → (r=0.4, θ=π/2): Cartesian b=(0, 0.4).
-        // dx = 0 - 0 = 0, dy = 0 - 0.4 = -0.4
-        // num = sqrt(0 + 0.16) = 0.4
-        // denom_re = 1 + 0*0 + 0*0.4 = 1.0
-        // denom_im = 0*0.4 - 0*0 = 0
-        // denom = 1.0, ratio = 0.4
-        // distance = 2*atanh(0.4)
-        let origin = HypCoord::origin();
-        let p = HypCoord { r: 0.4, theta: PI / 2.0 };
-        let d = origin.distance(p);
-        let expected = 2.0 * 0.4f64.atanh();
-        assert!((d - expected).abs() < 1e-10,
-            "distance origin → (0.4, π/2): got {d}, expected {expected}");
+    fn decode_sanitizes_non_finite() {
+        let mut data = [0u8; 16];
+        data[..8].copy_from_slice(&f64::NAN.to_le_bytes());
+        data[8..].copy_from_slice(&f64::INFINITY.to_le_bytes());
+        let c = HypCoord::decode(&data);
+        assert!(c.rho.is_finite() && c.theta.is_finite(), "non-finite must be sanitised");
     }
 
     #[test]
-    fn distance_two_nonzero_dy_points_pinned() {
-        // a=(0.3, π/4) → (0.3/√2, 0.3/√2), b=(0.5, π/2) → (0, 0.5)
-        // dx = 0.3/√2 - 0 ≈ 0.21213
-        // dy = 0.3/√2 - 0.5 ≈ -0.28787
-        // num = sqrt(dx²+dy²) ≈ sqrt(0.04500+0.08287) ≈ sqrt(0.12787) ≈ 0.35759
-        // With mutation + → -: num = sqrt(dx²-dy²) = sqrt(0.04500-0.08287) → negative → NaN
-        // With mutation * → + (dy*dy → dy+dy=2*dy): num changes
-        // So this test catches both mutations.
-        let a = HypCoord { r: 0.3, theta: PI / 4.0 };
-        let b = HypCoord { r: 0.5, theta: PI / 2.0 };
-        let (ax, ay) = a.to_cartesian();
-        let (bx, by) = b.to_cartesian();
-        let dx = ax - bx;
-        let dy = ay - by;
-        // Compute expected with explicit % formula
-        let num = (dx * dx + dy * dy).sqrt();
-        let denom_re = 1.0 - ax * bx - ay * by;
-        let denom_im = ax * by - ay * bx;
-        let denom = (denom_re * denom_re + denom_im * denom_im).sqrt();
-        let expected = 2.0 * (num / denom).atanh();
-        let d = a.distance(b);
-        assert!((d - expected).abs() < 1e-10 && d > 0.0,
-            "distance a→b: got {d}, expected {expected}");
-    }
-
-    // ── decode: theta > 2+π distinguishes 2*PI from 2+PI modulus (line 58) ──
-    //
-    // Mutation replaces `2.0 * PI` with `2.0 + PI` ≈ 5.14.
-    // For theta=5.5: original → 5.5 % 6.28 = 5.5; mutation → 5.5 % 5.14 ≈ 0.36.
-    #[test]
-    fn decode_theta_above_two_plus_pi_wraps_correctly() {
-        let theta = 5.5f64; // 5.5 > 2+π ≈ 5.14 but < 2π ≈ 6.28
+    fn decode_theta_wraps_into_range() {
+        // 5.5 is < 2π so survives; verifies rem_euclid uses 2π (not e.g. 2+π).
         let mut bytes = [0u8; 16];
-        bytes[..8].copy_from_slice(&0.5f64.to_le_bytes()); // r=0.5
-        bytes[8..].copy_from_slice(&theta.to_le_bytes());
-        let dec = HypCoord::decode(&bytes);
-        // Original: theta % (2π) ≈ 5.5 (unchanged since 5.5 < 2π)
-        // Mutation: theta % (2+π) ≈ 0.36 (wrong)
-        assert!((dec.theta - 5.5).abs() < 1e-12,
-            "theta=5.5 must survive decode unchanged (< 2π); got {}", dec.theta);
+        bytes[..8].copy_from_slice(&2.0f64.to_le_bytes());
+        bytes[8..].copy_from_slice(&5.5f64.to_le_bytes());
+        assert!((HypCoord::decode(&bytes).theta - 5.5).abs() < 1e-12);
     }
 
-    // ── angle_from_key: pin exact value to kill * → + and * → / mutations ───
-    //
-    // Mutations change `(val/u64::MAX) * 2.0 * PI` to:
-    //   col 40: * → /  → `(val/u64::MAX) / 2.0 * PI`  (halved then scaled)
-    //   col 46: * → +  → `(val/u64::MAX) * 2.0 + PI`  (shifted by π)
-    //   col 46: * → /  → `(val/u64::MAX) * 2.0 / PI`  (different scaling)
-    // A pinned expected value (computed using the correct formula) catches these.
+    // ── angle_from_key (unchanged from v3) ────────────────────────────────────
+
+    #[test]
+    fn angle_from_key_in_range() {
+        assert!((0.0..2.0 * PI).contains(&HypCoord::angle_from_key(&[0u8; 32])));
+    }
+
+    #[test]
+    fn angle_from_key_deterministic() {
+        assert_eq!(HypCoord::angle_from_key(&[42u8; 32]), HypCoord::angle_from_key(&[42u8; 32]));
+    }
+
+    #[test]
+    fn angle_from_key_different_keys() {
+        assert_ne!(HypCoord::angle_from_key(&[1u8; 32]), HypCoord::angle_from_key(&[2u8; 32]));
+    }
+
     #[test]
     fn angle_from_key_pinned_exact_value() {
-        use blake2::{Blake2b512, Digest};
         let key = [0x42u8; 32];
         let hash = Blake2b512::digest(key);
         let val = u64::from_le_bytes(hash[..8].try_into().unwrap());
-        // Expected: (val / u64::MAX) * 2.0 * PI
         let expected = (val as f64 / u64::MAX as f64) * 2.0 * PI;
         let got = HypCoord::angle_from_key(&key);
         assert!((got - expected).abs() < 1e-12,
-            "angle_from_key must use (val/u64::MAX)*2π formula: got {got}, expected {expected}");
-        // Sanity: must be strictly positive for a non-zero hash (key=0x42 gives nonzero val)
-        assert!(got > 0.0, "angle for key=[0x42;32] must be > 0");
-    }
-
-    /// Independent cross-check of `distance` against the arcosh form of the
-    /// Poincaré-disk metric:  d = arcosh(1 + 2|u−v|² / ((1−|u|²)(1−|v|²))).
-    /// This formula is mathematically independent of the Möbius/arctanh
-    /// implementation, so — unlike the self-referential pinning tests — it
-    /// catches sign/term errors in the denominator. Regression guard for the
-    /// `1 + ū·v` → `1 − ū·v` fix.
-    #[test]
-    fn distance_matches_independent_arcosh_reference() {
-        fn arcosh_ref(u: HypCoord, v: HypCoord) -> f64 {
-            let (ax, ay) = u.to_cartesian();
-            let (bx, by) = v.to_cartesian();
-            let d2 = (ax - bx).powi(2) + (ay - by).powi(2);
-            let nu = (1.0 - (ax * ax + ay * ay)) * (1.0 - (bx * bx + by * by));
-            (1.0 + 2.0 * d2 / nu).acosh()
-        }
-        // Deliberately non-origin, non-collinear pairs — exactly the cases the
-        // old `1 + ū·v` denominator got wrong (antipodal read as ~23 instead of
-        // ~2.2; same-ray points read as closer than they truly are).
-        let cases = [
-            (HypCoord { r: 0.5, theta: 0.0 }, HypCoord { r: 0.5, theta: PI }),
-            (HypCoord { r: 0.6, theta: 0.3 }, HypCoord { r: 0.6, theta: 2.8 }),
-            (HypCoord { r: 0.3, theta: 0.0 }, HypCoord { r: 0.8, theta: 0.0 }),
-            (HypCoord { r: 0.7, theta: 1.0 }, HypCoord { r: 0.7, theta: 4.0 }),
-            (HypCoord { r: 0.2, theta: 0.5 }, HypCoord { r: 0.8, theta: 3.0 }),
-        ];
-        for (a, b) in cases {
-            let got = a.distance(b);
-            let want = arcosh_ref(a, b);
-            assert!(
-                (got - want).abs() < 1e-9,
-                "distance {got} != arcosh reference {want} for {a:?} → {b:?}"
-            );
-        }
+            "angle_from_key must use (val/u64::MAX)*2π: got {got}, expected {expected}");
     }
 }
