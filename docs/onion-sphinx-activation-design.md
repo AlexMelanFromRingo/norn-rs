@@ -1,7 +1,13 @@
 # Design: capability negotiation — safely activate the Sphinx onion by default
 
-Status: **design**. Branch `feature/onion-sphinx`. Follows
-`onion-sphinx-design.md` (the format) — this is the rollout/activation half.
+Status: **implemented behind the opt-in `sphinx` Cargo feature**. Branch
+`feature/onion-sphinx`. Follows `onion-sphinx-design.md` (the format) — this is the
+rollout/activation half.
+
+> **Build gate.** Everything here is compiled only with `--features sphinx`; a
+> default build does not flood `CapabilityAnnounce` and does not select Sphinx.
+> "Activate by default" / "default Auto" below means *the default behaviour once
+> the `sphinx` feature is enabled* — not the default of a stock build.
 
 ## 1. Problem
 
