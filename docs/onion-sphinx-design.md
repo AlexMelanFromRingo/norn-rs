@@ -95,23 +95,34 @@ pi(s)  = BLAKE2b256("norn-sphinx:pi:v1"  || s)   # ChaCha20 key for payload stre
 
 ## 6. Payload
 
-A constant `PAYLOAD_LEN`-byte blob, onion-encrypted with a per-hop stream cipher.
+A constant `PAYLOAD_LEN`-byte blob, onion-encrypted per hop with the **LIONESS**
+wide-block cipher (Anderson–Biham).
 
 - Innermost plaintext = `[orig_len:2 LE][Traffic packet bytes][zero pad → PAYLOAD_LEN]`.
   `orig_len` is encrypted (revealed only at the exit), so it leaks nothing en route.
-- Sender, for `i = ν-1 .. 0`: `payload = ChaCha20_xor(pi(s_i), payload)`.
-- Relay `i`: `payload = ChaCha20_xor(pi(s_i), payload)` (one peel). Same op both
-  ways since XOR is involutive.
+- Sender, for `i = ν-1 .. 0`: `payload = LIONESS_encrypt(s_i, payload)`.
+- Relay `i`: `payload = LIONESS_decrypt(s_i, payload)` (one peel).
 
-**Integrity tradeoff (documented):** the payload carries no per-hop MAC, so a relay
-can flip payload bits (a tagging attack). norn's payload is the session-layer
-`Traffic` packet, already AEAD-authenticated end-to-end (ChaCha20-Poly1305), so any
-tampering is **detected and dropped at the destination**. The residual signal a
-tagging attack yields (a dropped flow) is weaker than the depth leak we remove, and
-is the same class of signal timing analysis already provides. Canonical Sphinx uses
-LIONESS to make payload tampering non-localisable; adding LIONESS later is a
-self-contained upgrade (see §9). The *routing header* IS per-hop MAC'd (§5), so a
-relay cannot redirect or truncate the route undetected.
+**LIONESS** is a length-preserving, provably-secure wide-block cipher built from a
+stream cipher and a keyed hash via a 4-round unbalanced Feistel over
+`(L = first 32 B, R = rest)`. Per hop we derive four 32-byte sub-keys
+`lion1..4 = BLAKE2b(label_i ‖ s)` and run, with `S = ChaCha20` (keystream over R)
+and `H = BLAKE2b-MAC` (→ 32 B):
+
+```
+encrypt:  R ^= S(L^lion1);  L ^= H(lion2, R);  R ^= S(L^lion3);  L ^= H(lion4, R)
+decrypt:  L ^= H(lion4, R);  R ^= S(L^lion3);  L ^= H(lion2, R);  R ^= S(L^lion1)
+```
+
+**Why LIONESS (vs a plain stream cipher).** The payload has no per-hop MAC (it is
+the session-AEAD-protected `Traffic` packet, authenticated end-to-end). With a
+stream cipher, a relay flipping ciphertext bit *i* flips plaintext bit *i* at the
+destination — a *localised* tag an adversary can recognise. LIONESS's wide-block
+diffusion means flipping **any** bit avalanches the **whole** block, so a tag
+carries no positional information: the destination's AEAD just drops the packet,
+the same as for any corruption. This gives tagging-attack **non-localisability**
+without adding any wire overhead (length-preserving). The *routing header* remains
+per-hop MAC'd (§5), so route redirection/truncation is still detected immediately.
 
 ## 7. Algorithms
 
@@ -184,18 +195,20 @@ always emits a 1280-byte cell.
 
 ## 9. Security notes & deferred items
 
-- **Fixes the leak:** every cell is `[type|epk32|gamma16|beta325|payload906]` with
-  no length field and no per-hop-varying-size content. Position/where in the path is
+- **Fixes the leak:** every cell is `[type|tag16|epk32|gamma16|beta325|payload890]`
+  with no length field and no per-hop-varying-size content (the leading tag is
+  per-segment routing metadata, rewritten each hop). Position/where in the path is
   not observable.
 - **Unlinkability:** `epk`, `gamma`, `beta`, and the payload are all freshly
   pseudo-random per hop; nothing is equal across hops (independent epks ⇒ no
   algebraic link, stronger than blinded Sphinx).
 - **Header integrity:** per-hop BLAKE2b MAC over `beta`.
+- **✅ LIONESS payload:** the payload is a per-hop LIONESS wide-block cipher (§6),
+  so payload tampering is non-localisable (one flipped bit avalanches the whole
+  block) on top of the end-to-end session AEAD. Implemented.
 - **Deferred — blinding (canonical Sphinx):** replace per-hop epks with one
   re-blinded ristretto255 element to reclaim ~`(MAX_HOPS-1)*32` header bytes. Needs
   an onion-key-type migration; tracked as a follow-up.
-- **Deferred — LIONESS payload:** full tagging-attack resistance; not required given
-  end-to-end session AEAD.
 - Extend `spec/norn.pv` with the new header once implemented.
 
 ## 10. Test plan

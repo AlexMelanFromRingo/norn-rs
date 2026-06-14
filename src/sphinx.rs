@@ -99,7 +99,15 @@ fn kdf(label: &[u8], s: &[u8; 32]) -> [u8; 32] {
 
 fn rho_key(s: &[u8; 32]) -> [u8; 32] { kdf(b"norn-sphinx:rho:v1", s) }
 fn mu_key(s: &[u8; 32]) -> [u8; 32] { kdf(b"norn-sphinx:mu:v1", s) }
-fn pi_key(s: &[u8; 32]) -> [u8; 32] { kdf(b"norn-sphinx:pi:v1", s) }
+/// The four LIONESS sub-keys for the payload wide-block cipher (see `lioness_*`).
+fn lioness_keys(s: &[u8; 32]) -> [[u8; 32]; 4] {
+    [
+        kdf(b"norn-sphinx:lion1:v1", s),
+        kdf(b"norn-sphinx:lion2:v1", s),
+        kdf(b"norn-sphinx:lion3:v1", s),
+        kdf(b"norn-sphinx:lion4:v1", s),
+    ]
+}
 
 /// ChaCha20 keystream (key derived per hop, nonce = 0; safe because the key is
 /// unique per hop) XORed in place.
@@ -120,6 +128,56 @@ fn mac16(key: &[u8; 32], msg: &[u8]) -> [u8; 16] {
         .expect("32-byte key is a valid BLAKE2b MAC key length");
     m.update(msg);
     m.finalize().into_bytes().into()
+}
+
+/// Keyed BLAKE2b MAC, 32-byte output (LIONESS round hash H).
+fn mac32(key: &[u8; 32], msg: &[u8]) -> [u8; 32] {
+    let mut m = <Blake2bMac<U32> as Mac>::new_from_slice(key)
+        .expect("32-byte key is a valid BLAKE2b MAC key length");
+    m.update(msg);
+    m.finalize().into_bytes().into()
+}
+
+/// Length of the LIONESS "left" half (= ChaCha20 key size).
+const LIONESS_L: usize = 32;
+
+fn xor_into(dst: &mut [u8], src: &[u8]) {
+    for (d, s) in dst.iter_mut().zip(src) {
+        *d ^= s;
+    }
+}
+
+fn xor32(a: &[u8], b: &[u8; 32]) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    for i in 0..32 {
+        out[i] = a[i] ^ b[i];
+    }
+    out
+}
+
+/// LIONESS (Anderson–Biham) wide-block cipher over `buf` (len > LIONESS_L),
+/// keyed from the per-hop secret. 4-round unbalanced Feistel on
+/// (L = buf[..32], R = buf[32..]) with S = ChaCha20 over R and H = BLAKE2b-MAC.
+/// Length-preserving and reversible (`lioness_decrypt` ∘ `lioness_encrypt` = id);
+/// flipping any byte avalanches the whole block (tagging-attack non-localisability).
+fn lioness_encrypt(s: &[u8; 32], buf: &mut [u8]) {
+    debug_assert!(buf.len() > LIONESS_L);
+    let k = lioness_keys(s);
+    let (l, r) = buf.split_at_mut(LIONESS_L);
+    xor_into(r, &chacha_keystream(&xor32(l, &k[0]), r.len())); // R ^= S(L^k1)
+    xor_into(l, &mac32(&k[1], r)); //                             L ^= H(k2, R)
+    xor_into(r, &chacha_keystream(&xor32(l, &k[2]), r.len())); // R ^= S(L^k3)
+    xor_into(l, &mac32(&k[3], r)); //                             L ^= H(k4, R)
+}
+
+fn lioness_decrypt(s: &[u8; 32], buf: &mut [u8]) {
+    debug_assert!(buf.len() > LIONESS_L);
+    let k = lioness_keys(s);
+    let (l, r) = buf.split_at_mut(LIONESS_L);
+    xor_into(l, &mac32(&k[3], r)); //                             undo L ^= H(k4, R)
+    xor_into(r, &chacha_keystream(&xor32(l, &k[2]), r.len())); // undo R ^= S(L^k3)
+    xor_into(l, &mac32(&k[1], r)); //                             undo L ^= H(k2, R)
+    xor_into(r, &chacha_keystream(&xor32(l, &k[0]), r.len())); // undo R ^= S(L^k1)
 }
 
 fn x25519_shared(local: &StaticSecret, remote_pub: &[u8; 32]) -> [u8; 32] {
@@ -196,7 +254,7 @@ pub fn build_sphinx(hops: &[SphinxHop], traffic: &[u8]) -> Result<Vec<u8>> {
     payload[2..2 + traffic.len()].copy_from_slice(traffic);
     OsRng.fill_bytes(&mut payload[2 + traffic.len()..]);
     for s in secrets.iter().take(nu).rev() {
-        chacha_apply(&pi_key(s), &mut payload);
+        lioness_encrypt(s, &mut payload);
     }
 
     let mut cell = Vec::with_capacity(CELL_SIZE);
@@ -254,7 +312,7 @@ pub fn process_sphinx(cell: &[u8], onion_privs: &[&StaticSecret]) -> Result<Sphi
 
     // Peel one payload layer.
     let mut pl = payload.to_vec();
-    chacha_apply(&pi_key(&s), &mut pl);
+    lioness_decrypt(&s, &mut pl);
 
     match flags {
         FLAG_EXIT => {
@@ -410,8 +468,37 @@ mod tests {
     #[test]
     fn key_schedule_is_domain_separated() {
         let s = [7u8; 32];
-        assert_ne!(rho_key(&s), mu_key(&s));
-        assert_ne!(mu_key(&s), pi_key(&s));
-        assert_ne!(rho_key(&s), pi_key(&s));
+        let lion = lioness_keys(&s);
+        // rho, mu, and all four lioness sub-keys are pairwise distinct.
+        let mut keys = vec![rho_key(&s), mu_key(&s)];
+        keys.extend_from_slice(&lion);
+        for i in 0..keys.len() {
+            for j in (i + 1)..keys.len() {
+                assert_ne!(keys[i], keys[j], "sub-keys {i} and {j} must differ");
+            }
+        }
+    }
+
+    #[test]
+    fn lioness_round_trips_and_avalanches() {
+        let s = [9u8; 32];
+        let orig: Vec<u8> = (0..PAYLOAD_LEN as u32).map(|i| i as u8).collect();
+        let mut buf = orig.clone();
+        lioness_encrypt(&s, &mut buf);
+        assert_ne!(buf, orig, "ciphertext must differ from plaintext");
+        let ct = buf.clone();
+        lioness_decrypt(&s, &mut buf);
+        assert_eq!(buf, orig, "decrypt∘encrypt must be the identity");
+        // Avalanche: flip ONE ciphertext bit; the decryption must differ from the
+        // original in MANY bytes (a stream cipher would differ in exactly one) —
+        // this is the tagging-attack non-localisability property.
+        let mut tampered = ct;
+        tampered[PAYLOAD_LEN / 2] ^= 0x01;
+        lioness_decrypt(&s, &mut tampered);
+        let differing = tampered.iter().zip(&orig).filter(|(a, b)| a != b).count();
+        assert!(
+            differing > PAYLOAD_LEN / 2,
+            "one flipped ciphertext bit must avalanche across the block; only {differing} bytes differ"
+        );
     }
 }
