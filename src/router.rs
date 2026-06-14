@@ -2520,10 +2520,14 @@ impl RouterState {
         h.update(pkt.epk);
         let prefix_len = pkt.aead_payload.len().min(16);
         h.update(&pkt.aead_payload[..prefix_len]);
-        let digest: [u8; 32] = h.finalize().into();
-        // O(1) membership test (was an O(n) linear scan over up to
-        // ONION_REPLAY_CACHE_SIZE entries on every onion packet). `insert`
-        // returns false iff the digest was already present → replay.
+        self.onion_digest_seen(h.finalize().into())
+    }
+
+    /// Record an onion replay digest; returns true if it was already seen.
+    /// Shared by the legacy onion and the Sphinx-style cell. O(1) membership via
+    /// the HashSet mirror; FIFO-evicted by `onion_seen` (bounded by
+    /// ONION_REPLAY_CACHE_SIZE). `insert` returns false iff already present.
+    fn onion_digest_seen(&mut self, digest: [u8; 32]) -> bool {
         if !self.onion_seen_set.insert(digest) {
             return true;
         }
@@ -2533,6 +2537,40 @@ impl RouterState {
         }
         self.onion_seen.push_back(digest);
         false
+    }
+
+    /// Handle an inbound Sphinx-style onion cell addressed to us (the dispatch
+    /// already matched the cleartext routing tag). Mirrors [`Self::handle_onion`]:
+    /// replay-check, MAC-authenticate + peel one layer, then forward the
+    /// constant-size cell toward the next tag or deliver the inner Traffic packet.
+    pub fn handle_sphinx(&mut self, from: PeerId, cell: Vec<u8>) {
+        if let Some(peer) = self.peers.get_mut(&from) {
+            peer.last_rx_time = Instant::now();
+        }
+        if let Some(digest) = crate::sphinx::replay_digest(&cell)
+            && self.onion_digest_seen(digest) {
+            debug!("sphinx: replay detected, dropping");
+            return;
+        }
+        match crate::sphinx::process_sphinx(&cell, &self.onion_keys.sphinx_privs()) {
+            Ok(crate::sphinx::SphinxPeeled::Forward { next_tag, cell }) => {
+                if let Some(next) = self.lookup_by_tag_excluding(&next_tag, Some(from)) {
+                    self.send_to_peer(&next, cell);
+                } else {
+                    debug!("sphinx: no route for next tag {:?}", &next_tag[..4]);
+                    self.send_path_negative(from, next_tag, PATH_NEG_INITIAL_TTL);
+                }
+            }
+            Ok(crate::sphinx::SphinxPeeled::Deliver(traffic_bytes)) => {
+                if traffic_bytes.first() == Some(&TRAFFIC) {
+                    match Traffic::decode(&traffic_bytes[1..]) {
+                        Ok(traffic) => self.handle_traffic(from, traffic),
+                        Err(e) => debug!("sphinx: inner Traffic decode failed: {}", e),
+                    }
+                }
+            }
+            Err(e) => debug!("sphinx process failed from {:?}: {}", &from[..4], e),
+        }
     }
 
     /// Route lookup using only the 16-byte routing_tag (for forwarding Traffic
@@ -2736,6 +2774,39 @@ fn dispatch(state: &Arc<Mutex<RouterState>>, from: PeerId, frame: Vec<u8>) {
                         }
                     });
                 }
+            }
+        }
+        crate::sphinx::TYPE_ONION_SPHINX => {
+            if frame.len() != crate::sphinx::CELL_SIZE {
+                debug!("sphinx: bad cell size {} from {:?}", frame.len(), &from[..4]);
+                return;
+            }
+            // Cleartext per-segment routing tag — route to it exactly like a
+            // legacy onion's outer tag. Copy it out before `frame` is moved.
+            let cell_tag: [u8; 16] = frame[1..17].try_into().unwrap();
+            let my_pub = state.lock_or_recover().pub_key;
+            if routing_tag_eq(&cell_tag, &routing_tag(&my_pub)) {
+                // We are this onion hop — peel and re-address.
+                let state2 = state.clone();
+                tokio::spawn(async move {
+                    state2.lock_or_recover().handle_sphinx(from, frame);
+                });
+            } else {
+                // Forwarding node: relay the unchanged cell toward cell_tag, jittered.
+                let permit = forward_sem().clone().try_acquire_owned();
+                let state_fwd = state.clone();
+                tokio::spawn(async move {
+                    let _permit = permit.ok();
+                    let jitter_ms = rand::random::<u64>() % 50;
+                    tokio::time::sleep(Duration::from_millis(jitter_ms)).await;
+                    let next = state_fwd.lock_or_recover()
+                        .lookup_by_tag_excluding(&cell_tag, Some(from));
+                    match next {
+                        Some(next) => state_fwd.lock_or_recover().send_to_peer(&next, frame),
+                        None => state_fwd.lock_or_recover()
+                            .send_path_negative(from, cell_tag, PATH_NEG_INITIAL_TTL),
+                    }
+                });
             }
         }
         _ => {
@@ -3904,6 +3975,52 @@ mod tests {
         let sk = SigningKey::generate(&mut OsRng);
         let (tx, _rx) = mpsc::channel(32);
         RouterState::new(sk, tx)
+    }
+
+    fn sphinx_hop_for(rs: &RouterState) -> crate::sphinx::SphinxHop {
+        crate::sphinx::SphinxHop {
+            routing_tag: routing_tag(&rs.pub_key),
+            onion_pub: *rs.onion_keys.pub_key().as_bytes(),
+        }
+    }
+
+    // A cell built to a router's *advertised* onion pub must be processed by that
+    // router's `sphinx_privs()` — i.e. the key a peer learns (CoordAnnounce /
+    // OnionKeyAnnounce → pub_key()) matches the keys we decrypt with.
+    #[test]
+    fn sphinx_cell_built_for_us_is_delivered() {
+        let rs = make_router();
+        let traffic = b"arbitrary inner bytes";
+        let cell = crate::sphinx::build_sphinx(&[sphinx_hop_for(&rs)], traffic).unwrap();
+        match crate::sphinx::process_sphinx(&cell, &rs.onion_keys.sphinx_privs()) {
+            Ok(crate::sphinx::SphinxPeeled::Deliver(t)) => assert_eq!(t, traffic),
+            other => panic!("expected Deliver, got {other:?}"),
+        }
+    }
+
+    // Full relay→exit chain across two routers using their advertised keys: r0
+    // forwards toward r1's tag (constant-size cell), r1 delivers the traffic.
+    #[test]
+    fn sphinx_two_hop_relay_then_deliver() {
+        let r0 = make_router();
+        let r1 = make_router();
+        let hops = vec![sphinx_hop_for(&r0), sphinx_hop_for(&r1)];
+        let traffic = b"two-hop payload bytes";
+        let cell = crate::sphinx::build_sphinx(&hops, traffic).unwrap();
+        assert_eq!(cell.len(), crate::sphinx::CELL_SIZE);
+
+        let next_cell = match crate::sphinx::process_sphinx(&cell, &r0.onion_keys.sphinx_privs()) {
+            Ok(crate::sphinx::SphinxPeeled::Forward { next_tag, cell }) => {
+                assert_eq!(next_tag, routing_tag(&r1.pub_key), "r0 must forward to r1's tag");
+                assert_eq!(cell.len(), crate::sphinx::CELL_SIZE, "forwarded cell stays constant size");
+                cell
+            }
+            other => panic!("r0 should Forward, got {other:?}"),
+        };
+        match crate::sphinx::process_sphinx(&next_cell, &r1.onion_keys.sphinx_privs()) {
+            Ok(crate::sphinx::SphinxPeeled::Deliver(t)) => assert_eq!(t, traffic),
+            other => panic!("r1 should Deliver, got {other:?}"),
+        }
     }
 
     fn add_dummy_peer(rs: &mut RouterState, key: PeerId) {
