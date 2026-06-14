@@ -9,6 +9,7 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
+x25519-dalek = "2"
 
 [dependencies.norn-rs]
 path = ".."
@@ -31,5 +32,11 @@ doc = false
 [[bin]]
 name = "fuzz_uvarint"
 path = "fuzz_targets/fuzz_uvarint.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_sphinx"
+path = "fuzz_targets/fuzz_sphinx.rs"
 test = false
 doc = false
