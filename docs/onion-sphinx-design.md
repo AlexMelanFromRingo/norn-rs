@@ -215,9 +215,23 @@ always emits a 1280-byte cell.
 
 ## 11. Implementation phases (each: TDD, commit, push)
 
-1. `src/sphinx.rs` skeleton + constants + key schedule (KATs).      ← start
-2. Filler + `build` (header only) + `process` (header only) round-trip.
-3. Payload onion; full `build`/`process`; all §10 tests.
-4. Wire `Cell` encode/decode + fuzz target.
-5. Router integration behind `onion_format = "sphinx"` + replay cache.
-6. ProVerif model note; REVIEW-FINDINGS update.
+1. ✅ `src/sphinx.rs` constants + key schedule (domain-separation test).
+2. ✅ Filler + `build`/`process` header round-trip (machine-verified ν=1..5).
+3. ✅ Payload onion; full `build`/`process`; all §10 tests (round-trip, constant
+   size, empty/max traffic, tamper beta/gamma, wrong key, garbage-no-panic).
+4. ✅ Wire cell with cleartext per-segment routing tag; `replay_digest`.
+5. ✅ Router **inbound**: `handle_sphinx` (replay → MAC-auth + peel → forward/
+   deliver), `dispatch` arm, `OnionKeyChain::sphinx_privs`, shared replay cache.
+   Integration tests: announce↔process key consistency; 2-router relay→exit chain.
+   ✅ Router **outbound**: `PacketConn::write_to_onion_sphinx` (additive, opt-in).
+6. ⏳ **Remaining for activation:**
+   - Capability negotiation: a bit in `CoordAnnounce`/`OnionKeyAnnounce` so a
+     sender only builds Sphinx when every hop supports `TYPE_ONION_SPHINX`
+     (sending to a legacy node today is silently dropped). Until then
+     `write_to_onion_sphinx` is opt-in and unused by default.
+   - Config flag (`onion_format = "sphinx"`) once negotiation exists, to auto-route
+     `write_to_onion` → Sphinx when the path supports it.
+   - Extend `spec/norn.pv` with the new header.
+   - Optional: a `fuzz_targets/fuzz_sphinx_process` cargo-fuzz target (the
+     `process_never_panics_on_garbage` unit test already covers panic-safety).
+   - Optional follow-ups from §9 (ristretto blinding, LIONESS payload).
