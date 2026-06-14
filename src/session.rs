@@ -15,7 +15,7 @@
 
 use anyhow::{bail, Context, Result};
 use chacha20poly1305::{AeadInPlace, ChaCha20Poly1305, Key, KeyInit, Nonce};
-use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use hkdf::Hkdf;
 use ml_kem::array::Array;
 use ml_kem::kem::{Decapsulate, Encapsulate, Kem};
@@ -683,7 +683,7 @@ impl SessionInit {
             &self.ed_pub, &self.x25519_pub, self.timestamp_ms, &self.recipient_ed_pub,
             &self.ml_kem_pub,
         );
-        vk.verify(&sign_data, &Signature::from_bytes(&self.signature))?;
+        vk.verify_strict(&sign_data, &Signature::from_bytes(&self.signature))?;
         Ok(())
     }
 }
@@ -777,7 +777,7 @@ impl SessionAck {
             &self.ed_pub, &self.x25519_pub, self.timestamp_ms, &self.recipient_ed_pub,
             &self.ml_kem_ct,
         );
-        vk.verify(&sign_data, &Signature::from_bytes(&self.signature))?;
+        vk.verify_strict(&sign_data, &Signature::from_bytes(&self.signature))?;
         Ok(())
     }
 }

@@ -4,7 +4,7 @@
 
 use anyhow::{bail, Result};
 use chacha20poly1305::{AeadInPlace, ChaCha20Poly1305, Key, KeyInit, Nonce};
-use ed25519_dalek::{SigningKey, Signer, VerifyingKey, Verifier};
+use ed25519_dalek::{SigningKey, Signer, VerifyingKey};
 use rand::rngs::OsRng;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -506,6 +506,11 @@ struct RouterState {
     /// LRU-style set of recent onion (epk, aead-prefix) hashes for replay
     /// detection. Bounded; oldest entries evicted when full.
     onion_seen: std::collections::VecDeque<[u8; 32]>,
+    /// O(1) membership mirror of `onion_seen`. The VecDeque keeps FIFO
+    /// eviction order; this set answers "seen before?" without an O(n)
+    /// linear scan on every onion packet (the relay hot path). Both hold
+    /// exactly the same elements.
+    onion_seen_set: std::collections::HashSet<[u8; 32]>,
     /// Network-wide table of current onion ephemeral pubs per identity.
     /// Populated from OnionKeyAnnounce floods. Latest seq per origin wins.
     /// (seq, eph_pub, recorded_at)
@@ -812,6 +817,7 @@ impl RouterState {
             cuckoo_generation: [0u64; K],
             onion_keys,
             onion_seen: std::collections::VecDeque::with_capacity(ONION_REPLAY_CACHE_SIZE),
+            onion_seen_set: std::collections::HashSet::with_capacity(ONION_REPLAY_CACHE_SIZE),
             remote_onion_keys: HashMap::new(),
             own_onion_key_seq: 0,
             pending_probes: HashMap::new(),
@@ -1455,7 +1461,7 @@ impl RouterState {
             Ok(v) => v,
             Err(_) => return,
         };
-        if vk.verify(&ann.sign_bytes(), &ed25519_dalek::Signature::from_bytes(&ann.sig)).is_err() {
+        if vk.verify_strict(&ann.sign_bytes(), &ed25519_dalek::Signature::from_bytes(&ann.sig)).is_err() {
             warn!("invalid OnionKeyAnnounce sig from origin {:?}", &ann.origin[..4]);
             return;
         }
@@ -1624,7 +1630,7 @@ impl RouterState {
             Ok(v) => v,
             Err(_) => return,
         };
-        if vk.verify(&r.sign_bytes(), &ed25519_dalek::Signature::from_bytes(&r.sig)).is_err() {
+        if vk.verify_strict(&r.sign_bytes(), &ed25519_dalek::Signature::from_bytes(&r.sig)).is_err() {
             warn!("invalid reputation report sig from observer {:?}", &r.observer[..4]);
             return;
         }
@@ -1677,7 +1683,7 @@ impl RouterState {
             Ok(v) => v,
             Err(_) => return,
         };
-        if vk.verify(&hp.sign_bytes(), &ed25519_dalek::Signature::from_bytes(&hp.sig)).is_err() {
+        if vk.verify_strict(&hp.sign_bytes(), &ed25519_dalek::Signature::from_bytes(&hp.sig)).is_err() {
             warn!("invalid HolePunch sig from {:?}", &hp.initiator[..4]);
             return;
         }
@@ -1884,7 +1890,7 @@ impl RouterState {
             Err(_) => return,
         };
         let sig = ed25519_dalek::Signature::from_bytes(&ann.sig);
-        if vk.verify(&ann.sign_bytes(), &sig).is_err() {
+        if vk.verify_strict(&ann.sign_bytes(), &sig).is_err() {
             warn!("invalid coord announce signature from {:?}", &from_key[..4]);
             return;
         }
@@ -2030,7 +2036,7 @@ impl RouterState {
         // The responder signed over req.pub_key, which is OUR pub key (we sent it in the SigReq).
         sign_data.extend_from_slice(&self.pub_key);
         let sig = ed25519_dalek::Signature::from_bytes(&res.signature);
-        if vk.verify(&sign_data, &sig).is_err() {
+        if vk.verify_strict(&sign_data, &sig).is_err() {
             warn!("sig_res: bad signature from {:?}", &from[..4]);
             return;
         }
@@ -2066,7 +2072,7 @@ impl RouterState {
         };
         let sign_bytes = ann.sign_bytes();
         let sig = ed25519_dalek::Signature::from_bytes(&ann.signature);
-        if vk.verify(&sign_bytes, &sig).is_err() {
+        if vk.verify_strict(&sign_bytes, &sig).is_err() {
             warn!("invalid announce signature from {:?}", &from[..4]);
             return;
         }
@@ -2515,11 +2521,15 @@ impl RouterState {
         let prefix_len = pkt.aead_payload.len().min(16);
         h.update(&pkt.aead_payload[..prefix_len]);
         let digest: [u8; 32] = h.finalize().into();
-        if self.onion_seen.iter().any(|d| d == &digest) {
+        // O(1) membership test (was an O(n) linear scan over up to
+        // ONION_REPLAY_CACHE_SIZE entries on every onion packet). `insert`
+        // returns false iff the digest was already present → replay.
+        if !self.onion_seen_set.insert(digest) {
             return true;
         }
-        if self.onion_seen.len() >= ONION_REPLAY_CACHE_SIZE {
-            self.onion_seen.pop_front();
+        if self.onion_seen.len() >= ONION_REPLAY_CACHE_SIZE
+            && let Some(evicted) = self.onion_seen.pop_front() {
+            self.onion_seen_set.remove(&evicted);
         }
         self.onion_seen.push_back(digest);
         false
@@ -5269,7 +5279,7 @@ mod tests {
         sign_data.extend_from_slice(&tmp);
         sign_data.extend_from_slice(&own_pub);
         let sig = ed25519_dalek::Signature::from_bytes(&sig_res.signature);
-        assert!(responder_vk.verify(&sign_data, &sig).is_ok(),
+        assert!(responder_vk.verify_strict(&sign_data, &sig).is_ok(),
             "SigRes signature must be valid");
     }
 
