@@ -34,8 +34,9 @@ impl Node {
         // Roadmap #7: optional transport obfuscation. No-op if PSK empty.
         conn.set_obfuscation_psk(&config.obfuscation_psk);
 
-        // Onion format we build when sending (default Auto: Sphinx where the
-        // whole path supports it, legacy otherwise).
+        // Onion format we build when sending (opt-in `sphinx` feature; default
+        // Auto: Sphinx where the whole path supports it, legacy otherwise).
+        #[cfg(feature = "sphinx")]
         conn.set_onion_format(config.onion_format);
 
         let key_store = new_key_store();

@@ -11,6 +11,7 @@ pub mod onion;
 pub mod packet;
 pub mod router;
 pub mod session;
+#[cfg(feature = "sphinx")]
 pub mod sphinx;
 pub mod transport;
 pub mod discovery;

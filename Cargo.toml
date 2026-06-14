@@ -16,6 +16,10 @@ path = "src/bin/nornctl.rs"
 [features]
 default = ["tun-support"]
 tun-support = ["dep:tun2"]
+# Opt-in fixed-size (Sphinx-style) onion routing + capability negotiation.
+# OFF by default: the default build keeps the original protocol behaviour
+# (no CapabilityAnnounce flooding, no Sphinx cell construction/selection).
+sphinx = []
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
