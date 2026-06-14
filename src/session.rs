@@ -569,6 +569,13 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+// SECURITY (domain separation — Tamarin-verified, do NOT remove): the leading
+// SESSION_INIT_MAGIC / SESSION_ACK_MAGIC byte is part of the *signed* bytes, not
+// just the wire demux tag. Because Init and Ack otherwise sign the same field
+// layout (<pub, dh, ts, recipient, kem>), a shared prefix would let an Init
+// signature be replayed as an Ack signature (a reflection attack). The distinct
+// magic bytes prevent it. spec/norn.spthy proves mutual authentication WITH these
+// tags and finds the reflection attack WITHOUT them — keep the magic in sign_data.
 fn build_init_sign_bytes(
     ed_pub: &[u8; 32],
     x25519_pub: &[u8; 32],

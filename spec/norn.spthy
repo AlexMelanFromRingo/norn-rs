@@ -1,0 +1,191 @@
+theory NornHandshake
+/*
+  norn-rs v3 session handshake — Tamarin symbolic model.
+
+  Companion to spec/norn.pv (ProVerif). ProVerif cannot soundly decide the
+  authentication / key-agreement correspondence of a DH-based AKE because of the
+  well-known incompleteness of its Horn-clause resolution under the DH
+  commutativity equation. Tamarin reasons about Diffie-Hellman natively (the
+  `diffie-hellman` builtin carries the abelian-group equational theory with a
+  dedicated normal-form / constraint solver), so the mutual-authentication
+  property that norn.pv had to leave commented is machine-checked HERE instead.
+
+  Modelled flow = the PQ-hybrid Init+Ack exchange:
+
+    I -> R   <pk_I, x25519_I, ml_kem_ek_I, ts, pk_R, sig_I>
+             sig_I = Sign(sk_I, <x25519_I, ml_kem_ek_I, ts, pk_R>)
+
+    R -> I   <pk_R, x25519_R, ml_kem_ct, ts, pk_I, sig_R>
+             sig_R = Sign(sk_R, <x25519_R, ml_kem_ct, ts, pk_I>)
+
+    pq_ss   = ML-KEM-768  (R encapsulates to ek_I; I decapsulates ct)
+    dh_ss   = X25519(x_I, x25519_R) = X25519(x_R, x25519_I)
+    key     = HKDF(pq_ss, dh_ss)          (modelled as h(<pq_ss, dh_ss>))
+
+  ML-KEM is modelled as the textbook KEM abstraction: the responder draws a fresh
+  shared secret and *encapsulates* it under the initiator's long-term KEM public
+  key (Tamarin's IND-CCA `asymmetric-encryption` builtin). Each party also holds a
+  long-term Ed25519 signing key. Both long-term keys can be revealed independently
+  so we can separate "Ed25519 broken" from "ML-KEM broken" and state the hybrid
+  claim precisely.
+
+  Proved (all-traces unless noted):
+    executable                (exists-trace)  a full honest run is reachable
+    I_injective_agreement                     Initiator authenticates Responder AND
+                                              agrees on the session key; injective
+                                              (no replay), modulo Ed25519 compromise
+    R_noninjective_agreement                  Responder authenticates the
+                                              Initiator's signed initiation, modulo
+                                              Ed25519 compromise  (the injective form
+                                              needs the runtime ts-window / dedup,
+                                              which is numeric and out of symbolic
+                                              scope — the analogue of norn.pv Q3)
+    key_secrecy_pq_hybrid                     session key stays secret EVEN IF the
+                                              ML-KEM long-term key is revealed — the
+                                              only escape is an Ed25519 long-term-key
+                                              compromise (forward secrecy from the
+                                              ephemeral X25519)
+*/
+begin
+
+builtins: diffie-hellman, signing, asymmetric-encryption, hashing
+// pk/1 is shared by `signing` (verify) and `asymmetric-encryption` (aenc);
+// a party's Ed25519 public key is pk(ltk), its ML-KEM enc-key is pk(dk).
+
+/* ───────────────────────── Setup & compromise ───────────────────────── */
+
+// One identity per party name: an Ed25519 key (ltk) + an ML-KEM key (dk).
+rule Setup_Party:
+    [ Fr(~ltk), Fr(~dk) ]
+  --[ Create($A), OnlyOnce($A) ]->
+    [ !Id($A, ~ltk, ~dk)
+    , !PkEd($A, pk(~ltk))
+    , Out(<pk(~ltk), pk(~dk)>) ]
+
+// Adversary may compromise the two long-term keys independently.
+rule Reveal_Ed:
+    [ !Id($A, ~ltk, ~dk) ] --[ RevealLtk($A) ]-> [ Out(~ltk) ]
+
+rule Reveal_Kem:
+    [ !Id($A, ~ltk, ~dk) ] --[ RevealKem($A) ]-> [ Out(~dk) ]
+
+/* ─────────────────────────────── Initiator ──────────────────────────── */
+
+rule I_send_Init:
+    let xpubI  = 'g'^~x
+        ekI    = pk(~dk)
+        // 'Init' tag = the SESSION_INIT_MAGIC (0x74) byte that prefixes the real
+        // signed bytes; 'Ack' uses SESSION_ACK_MAGIC (0x62). Distinct tags make
+        // an Init signature unusable as an Ack signature (no reflection).
+        signed = <'Init', xpubI, ekI, ~ts, pkR>
+        sigI   = sign(signed, ~ltk)
+        init   = <pk(~ltk), xpubI, ekI, ~ts, pkR, sigI>
+    in
+    [ !Id($I, ~ltk, ~dk)
+    , !PkEd($R, pkR)
+    , Fr(~x), Fr(~ts) ]
+  --[ I_Send($I, $R)
+    , I_Running($I, $R, <'I2R', xpubI, ekI, ~ts>) ]->
+    [ StateI($I, $R, ~ltk, ~dk, ~x, ~ts, pkR)
+    , Out(init) ]
+
+rule I_recv_Ack:
+    let dhSS      = xpubR^~x
+        pqSS      = adec(ctR, ~dk)
+        k         = h(<pqSS, dhSS>)
+        ackSigned = <'Ack', xpubR, ctR, ~ts, pk(~ltk)>
+    in
+    [ StateI($I, $R, ~ltk, ~dk, ~x, ~ts, pkR)
+    , In(<pkR, xpubR, ctR, ~ts, pk(~ltk), sigR>) ]
+  --[ Eq(verify(sigR, ackSigned, pkR), true)
+    , I_Commit($I, $R, <'R2I', k>)
+    , SessKey($I, $R, k)
+    , Honest($I), Honest($R) ]->
+    [ ]
+
+/* ─────────────────────────────── Responder ──────────────────────────── */
+
+rule R_recv_Init_send_Ack:
+    let xpubR      = 'g'^~y
+        dhSS       = xpubI^~y
+        ctR        = aenc(~kss, ekI)            // encapsulate fresh kss under ek_I
+        k          = h(<~kss, dhSS>)
+        initSigned = <'Init', xpubI, ekI, ts, pk(~ltk)>
+        ackSigned  = <'Ack', xpubR, ctR, ts, pkI>
+        sigR       = sign(ackSigned, ~ltk)
+        ack        = <pk(~ltk), xpubR, ctR, ts, pkI, sigR>
+    in
+    [ !Id($R, ~ltk, ~dk)
+    , !PkEd($I, pkI)
+    , In(<pkI, xpubI, ekI, ts, pk(~ltk), sigI>)
+    , Fr(~y), Fr(~kss) ]
+  --[ Eq(verify(sigI, initSigned, pkI), true)
+    , R_Recv($R, $I)
+    , R_Commit($R, $I, <'I2R', xpubI, ekI, ts>)
+    , R_Running($R, $I, <'R2I', k>)
+    , SessKey($R, $I, k)
+    , Honest($I), Honest($R) ]->
+    [ Out(ack) ]
+
+/* ─────────────────────────────── Restrictions ───────────────────────── */
+
+restriction Equality:
+  "All a b #i. Eq(a, b)@i ==> a = b"
+
+restriction OnlyOnceParty:
+  "All A #i #j. OnlyOnce(A)@i & OnlyOnce(A)@j ==> #i = #j"
+
+/* ─────────────────────────────── Lemmas ─────────────────────────────── */
+
+// Sanity: an honest run with no compromise actually completes with a shared key.
+lemma executable:
+  exists-trace
+  "Ex I R k #i #j.
+       R_Running(R, I, <'R2I', k>)@i
+     & I_Commit(I, R, <'R2I', k>)@j
+     & not (Ex A #r. RevealLtk(A)@r)
+     & not (Ex A #r. RevealKem(A)@r)"
+
+// Initiator authenticates the Responder AND agrees on the derived session key,
+// injectively (rules out replay) — unless an honest party's Ed25519 key leaked.
+lemma I_injective_agreement:
+  "All I R k #i.
+     I_Commit(I, R, <'R2I', k>)@i
+     ==> ( Ex #j. R_Running(R, I, <'R2I', k>)@j & #j < #i
+             & not (Ex I2 R2 #i2.
+                      I_Commit(I2, R2, <'R2I', k>)@i2 & not (#i2 = #i)) )
+         | (Ex B #r. RevealLtk(B)@r & Honest(B)@i)"
+
+// Responder authenticates that the Initiator really signed this initiation toward
+// it (non-injective: the runtime ±60s ts-window / session dedup defeats Init
+// replay numerically, which is out of symbolic scope) — unless Ed25519 leaked.
+lemma R_noninjective_agreement:
+  "All R I t #i.
+     R_Commit(R, I, t)@i
+     ==> ( Ex #j. I_Running(I, R, t)@j & #j < #i )
+         | (Ex B #r. RevealLtk(B)@r & Honest(B)@i)"
+
+// PQ-hybrid secrecy: the session key is secret even if the ML-KEM long-term key
+// is revealed — the ONLY escape is an Ed25519 long-term-key compromise. I.e. the
+// ephemeral X25519 alone keeps the key secret when ML-KEM is broken (and the
+// signed transcript stops an active MITM as long as the signing keys hold).
+lemma key_secrecy_pq_hybrid:
+  "All I R k #i.
+     SessKey(I, R, k)@i
+     ==> ( not (Ex #j. K(k)@j) )
+         | (Ex B #r. RevealLtk(B)@r & Honest(B)@i)"
+
+// Perfect forward secrecy. A session key is compromised ONLY IF an honest party's
+// Ed25519 key was revealed *before* that session (which permits a real-time MITM).
+// Revealing either long-term key AFTER the handshake, or the ML-KEM key at ANY
+// time, never exposes the key — the ephemeral X25519 secrets, gone after the run,
+// protect it. (ML-KEM is encapsulated against the initiator's *long-term* KEM key,
+// so the PQ secret alone is not forward-secret; the ephemeral DH is what carries
+// FS — and the converse PQ-hybrid lemma shows DH alone is not relied on either.)
+lemma key_secrecy_forward:
+  "All I R k #i.
+     SessKey(I, R, k)@i
+     ==> ( not (Ex #j. K(k)@j) )
+         | (Ex B #r. RevealLtk(B)@r & Honest(B)@i & #r < #i)"
+
+end

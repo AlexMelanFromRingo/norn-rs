@@ -1,7 +1,19 @@
 # Formal model
 
-This document describes the symbolic model of the `norn-rs` v3 session
-handshake in `spec/norn.pv`, and the security properties it claims.
+This document describes the symbolic models of the `norn-rs` v3 session handshake
+and their machine-checked security properties. Two complementary tools are used,
+because no single symbolic tool cleanly covers everything this protocol needs:
+
+* **ProVerif** (`spec/norn.pv`, `spec/capabilities.pv`) — session-key secrecy and
+  capability-gossip authenticity.
+* **Tamarin** (`spec/norn.spthy`) — mutual authentication, injective key
+  agreement, and perfect forward secrecy. These need native Diffie-Hellman
+  reasoning that ProVerif cannot soundly provide for a DH-based AKE (see Q2).
+
+Both operate in the Dolev-Yao model (the adversary controls the network; crypto
+primitives are black boxes). The Tamarin run additionally **confirmed that the
+Init/Ack signature domain separation is security-critical** — see "Tamarin model"
+below.
 
 ## Why ProVerif?
 
@@ -70,31 +82,34 @@ the protected channel. ProVerif explores whether any Dolev-Yao
 adversary can derive it. With a successful proof, no attack works in
 the symbolic model.
 
-### Q2 — Mutual authentication (documented limitation, not machine-proven here)
-
-```proverif
-query pkI, pkR, k;
-    event(I_finished(pkI, pkR, k)) ==> event(R_finished(pkR, pkI, k)).
-```
+### Q2 — Mutual authentication (machine-proven in Tamarin)
 
 The intended property: any session the Initiator commits to (peer pk_R, key k)
-must correspond to a Responder execution by pk_R that committed to k.
+must correspond to a Responder execution by pk_R that agrees on k, and the
+Responder must likewise agree on who initiated.
 
-**ProVerif reports this `false`** (with a candidate trace) — and so does the
-key-independent variant. This is the **well-known incompleteness of ProVerif
-under the Diffie-Hellman commutativity equation** `dh(a,pub(b)) = dh(b,pub(a))`:
-the equational theory over-approximates its Horn-clause resolution, yielding
-spurious traces for key-agreement correspondences. In every such trace both
-roles still verify each other's Ed25519 signatures (recipient-bound, per Q3) and
-derive the *same* key — i.e. it is a tool limitation, **not a demonstrated
-attack**. The query is therefore left commented in `spec/norn.pv`. Sound
-machine-checking of a DH-based AKE's authentication belongs in **CryptoVerif**
-(computational) or **Tamarin** (native DH); that is tracked as future work.
+ProVerif **cannot soundly decide this**. It reports the correspondence `false`
+with a candidate trace — but so does even the key-independent variant, and in
+every such trace both roles still verify each other's recipient-bound Ed25519
+signatures and derive the *same* key. This is the well-known **incompleteness of
+ProVerif under the Diffie-Hellman commutativity equation** `dh(a,pub(b)) =
+dh(b,pub(a))`: the equational theory makes its Horn-clause resolution
+over-approximate, producing spurious traces for key-agreement correspondences. So
+the query is left commented in `spec/norn.pv`.
 
-Defence-in-depth observation surfaced by the model: the Ack signature binds
-`(x25519_pub_R, ml_kem_ct, ts, recipient)` but **not** the initiator's
-`x25519_pub`/`ml_kem_ek`; signing the full transcript would let the responder's
-signature attest to the initiator's contributions too.
+**Tamarin reasons about DH natively, and there mutual authentication is proved**
+(`spec/norn.spthy`, "Tamarin model" section below). Both directions verify:
+`I_injective_agreement` (the initiator authenticates the responder *and* agrees on
+the session key, injectively — no replay) and `R_noninjective_agreement` (the
+responder authenticates the initiator's signed initiation).
+
+This also retires an earlier, ProVerif-era *speculation* that the Ack ought to
+additionally sign the initiator's `x25519_pub`/`ml_kem_ek`: the Tamarin proof
+shows it is **not** needed. Each party signs its **own** contributions plus the
+peer identity (and a per-message domain-separation tag); the initiator's
+contributions are already authenticated by the initiator's own signature in the
+Init. That structure is sufficient for full mutual authentication and key
+agreement.
 
 ### Q3 — Cross-target replay
 
@@ -103,7 +118,48 @@ who captures a valid `Init` cannot replay it against a different
 recipient because the captured signature only validates with the
 original recipient's public key in the signed bytes.
 
+## Tamarin model
+
+`spec/norn.spthy` re-models the same Init+Ack handshake in Tamarin. Tamarin is a
+multiset-rewriting prover whose `diffie-hellman` builtin carries the abelian-group
+equational theory with a dedicated solver — so it decides the key-agreement
+correspondences that defeat ProVerif (Q2). ML-KEM is modelled as the textbook KEM
+abstraction (the responder draws a fresh shared secret and *encapsulates* it under
+the initiator's long-term KEM public key, via the IND-CCA `asymmetric-encryption`
+builtin). Each party holds an Ed25519 signing key and an ML-KEM key, both
+**independently revealable** so "Ed25519 broken" and "ML-KEM broken" are separable.
+
+| Lemma | Kind | Meaning |
+|-------|------|---------|
+| `executable` | exists-trace | a full honest run is reachable (model non-vacuous) |
+| `I_injective_agreement` | all-traces | initiator authenticates responder **and** agrees on the session key, **injectively** (no replay) — unless an honest Ed25519 key leaked |
+| `R_noninjective_agreement` | all-traces | responder authenticates the initiator's signed initiation — unless an honest Ed25519 key leaked |
+| `key_secrecy_pq_hybrid` | all-traces | session key secret **even if the ML-KEM long-term key is revealed** (PQ hybrid: ephemeral X25519 still protects) |
+| `key_secrecy_forward` | all-traces | **perfect forward secrecy**: the key is exposed only if an honest Ed25519 key leaked *before* that session |
+
+All five **verify** (Tamarin 1.12.0 / maude 3.2; see "Running it").
+
+### Finding: Init/Ack signature domain separation is load-bearing
+
+Building this model surfaced a concrete result. The Init and Ack messages sign the
+*same* field layout, `<pub, dh, ts, recipient, kem>`. With a **first draft that
+omitted the leading magic byte** from the signed bytes, Tamarin found a **reflection
+attack**: an `Init` signature is structurally a valid `Ack` signature, so an
+adversary can reflect one for the other and break authentication. Adding the
+per-message domain-separation tag (`'Init'` / `'Ack'`, modelling
+`SESSION_INIT_MAGIC = 0x74` / `SESSION_ACK_MAGIC = 0x62`, which norn already prefixes
+to `sign_data` in `build_init_sign_bytes` / `build_ack_sign_bytes`) makes the
+attack disappear and all auth lemmas verify.
+
+So norn's real protocol is **safe** — the magic byte, which also serves as the wire
+demux tag, is doing double duty as a signature domain separator. Because that
+double role is easy to miss in a refactor, it is now pinned with a `SECURITY`
+comment in `src/session.rs` and asserted by this model (auth holds *with* the tags,
+reflection attack *without*).
+
 ## Running it
+
+### ProVerif
 
 ProVerif is distributed via opam (not in Ubuntu's apt as of 24.04):
 
@@ -124,30 +180,52 @@ RESULT event(acceptCap(pk(skO[]),caps)) ==> event(announceCap(pk(skO[]),caps)) i
 
 `true` means the query is proved in the symbolic model. Q1 (key secrecy) is
 proved and is *non-vacuous* — the Initiator actually encrypts `secret_marker`
-under the derived key. Q2 (authentication) is a documented ProVerif/DH
-limitation (above), left commented in `norn.pv`.
+under the derived key.
+
+### Tamarin
+
+Tamarin needs `maude` (≥ 3.2) on `PATH`; the prover itself is a prebuilt binary
+from the project's GitHub releases page:
+
+```bash
+apt-get install maude graphviz          # maude 3.2 ships in Ubuntu 24.04
+# install the tamarin-prover 1.12.0 linux64 binary on PATH, then:
+tamarin-prover --prove spec/norn.spthy  # all 5 lemmas, ~5s total
+```
+
+Actual output (verified with Tamarin 1.12.0, maude 3.2):
+
+```
+executable (exists-trace):             verified (16 steps)
+I_injective_agreement (all-traces):    verified (48 steps)
+R_noninjective_agreement (all-traces): verified (15 steps)
+key_secrecy_pq_hybrid (all-traces):    verified (76 steps)
+key_secrecy_forward (all-traces):      verified (76 steps)
+```
 
 ## Known model gaps
 
-These are properties that the live protocol claims but the .pv model
-does not currently formalise:
+Most of the original gaps are now closed by the Tamarin model. **Resolved:**
 
-1. **Forward secrecy under long-term-key compromise.** The handshake key
-   should remain secret even if `sk_I` or `dk_I` is later leaked. We
-   would model this by leaking the long-term keys *after* the protocol
-   run and re-querying secrecy. The PQ hybrid pq_shared is
-   contributory-FS only if the per-packet x25519 ratchet is modelled,
-   which we omit (see above).
-2. **Daily ML-KEM rotation.** The model uses a single, immortal dk_I;
-   the live protocol rotates it every ~24h with a 60s overlap. The
-   overlap window correctness is small enough to be inspected by hand
-   in `src/session.rs::PqKeys`.
-3. **Authentication / key agreement (Q2).** ProVerif cannot soundly decide
-   the I/R agreement correspondence under the DH commutativity equation
-   (see Q2 above); key *secrecy* (Q1) is proved, but mutual authentication
-   should be machine-checked in CryptoVerif or Tamarin.
+* **Forward secrecy** — proved in Tamarin (`key_secrecy_forward`): the session key
+  stays secret even if *both* long-term keys leak *after* the run (and the ML-KEM
+  key at any time). The ephemeral X25519 carries FS.
+* **Authentication / key agreement (Q2)** — proved in Tamarin (`I_injective_agreement`,
+  `R_noninjective_agreement`), which ProVerif could not soundly decide.
 
-These gaps are open invitations for future formal work.
+**Still out of (symbolic) scope:**
+
+1. **Daily ML-KEM rotation.** Both models use a single, immortal `dk_I`; the live
+   protocol rotates it every ~24h with a 60s overlap. The overlap-window
+   correctness is small enough to inspect by hand in `src/session.rs::PqKeys`.
+2. **Per-packet X25519 ratchet.** The models cover the handshake key; the live
+   protocol then ratchets it per packet — a strictly-additional-FS improvement on
+   top of the (already proved) handshake-level forward secrecy.
+3. **Numeric freshness / replay windows.** The ±60s handshake timestamp window and
+   the 64-slot session replay window are enforced numerically at runtime, out of
+   symbolic scope. This is exactly why `R_noninjective_agreement` is *non*-injective:
+   replaying one Init to one responder is defeated by the ts-window, not by the
+   message format.
 
 ## Onion layer (Sphinx) & capability negotiation
 

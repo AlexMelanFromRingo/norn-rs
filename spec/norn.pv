@@ -142,14 +142,16 @@ let Responder(sk_R: skey, dk_R: kem_dk, pk_R_self: pkey) =
    spurious traces for key-agreement correspondences. In every such trace both
    roles still verify each other's Ed25519 signatures (which bind the recipient,
    per Q3) and compute the *same* key, so this is a tool limitation, not a
-   demonstrated attack. Sound machine-checking of the authentication / key
-   agreement of a DH-based AKE belongs in CryptoVerif (computational) or Tamarin
-   (which handles DH natively); doing so is tracked as future work. See
-   docs/FORMAL.md.
+   demonstrated attack. This authentication / key-agreement property is therefore
+   machine-checked in TAMARIN instead (spec/norn.spthy), which handles DH natively:
+   both I_injective_agreement and R_noninjective_agreement verify. See docs/FORMAL.md.
 
-   Defence-in-depth note surfaced by the modelling: the Ack signature binds
-   (xpub_R, ct_R, ts, pk_I) but NOT the initiator's (xpub_I, ml_kem_ek); adding
-   them would make the responder's signature attest to the full transcript. *)
+   (An earlier note here speculated the Ack ought to additionally sign the
+   initiator's (xpub_I, ml_kem_ek). The Tamarin proof shows that is unnecessary:
+   each party signs its own contributions + the peer identity + a per-message
+   domain-separation tag (SESSION_INIT_MAGIC / SESSION_ACK_MAGIC), which together
+   suffice for full mutual authentication. Tamarin in fact finds a reflection
+   attack if that domain-separation tag is dropped — so it is load-bearing.) *)
 
 (* Q1 — key secrecy. The session key derived from a normal run is secret even
    against an attacker who has the public message stream. `secret_marker` is
