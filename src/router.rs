@@ -259,6 +259,15 @@ const ONION_KEY_VALIDITY_MS: u64 = 24 * 60 * 60 * 1_000;
 /// Cap on remembered foreign onion keys (LRU-ish via HashMap, evicts on insert
 /// when full — see record_remote_onion_key).
 const MAX_REMOTE_ONION_KEYS: usize = 16_384;
+/// Re-flood our CapabilityAnnounce every N ticks (≈ 60 s), and once at tick 1, so
+/// newly-joined peers learn our capabilities promptly. Caps are static, so the
+/// seq-dedup makes re-floods cheap.
+const CAPABILITY_BROADCAST_TICKS: u32 = 60;
+/// Maximum age (ms) of a CapabilityAnnounce we still trust / forward.
+const CAPABILITY_VALIDITY_MS: u64 = 24 * 60 * 60 * 1_000;
+/// Cap on remembered foreign capability records (evicts a non-peer entry on
+/// insert when full — mirrors record_remote_onion_key).
+const MAX_CAPABILITY_ENTRIES: usize = 16_384;
 /// Issue one path-validation probe every N maintenance ticks.
 const PROBE_INTERVAL_TICKS: u32 = 15;
 /// How long a `(peer, routing_tag)` negative-route hint stays in cache.
@@ -517,6 +526,15 @@ struct RouterState {
     remote_onion_keys: HashMap<[u8; 32], (u64, [u8; 32], Instant)>,
     /// Monotonic seq for our own OnionKeyAnnounce broadcasts.
     own_onion_key_seq: u64,
+    /// Network-wide table of advertised capabilities per identity, from
+    /// CapabilityAnnounce floods. (caps_bitfield, seq, recorded_at); latest seq
+    /// per origin wins. A sender consults this before choosing the Sphinx onion.
+    peer_capabilities: HashMap<[u8; 32], (u32, u64, Instant)>,
+    /// Monotonic seq for our own CapabilityAnnounce broadcasts.
+    own_caps_seq: u64,
+    /// Which onion format we BUILD when sending (config; default Auto). Inbound
+    /// always accepts both. See `path_supports_sphinx` for the Auto decision.
+    onion_format: crate::config::OnionFormat,
     /// Outgoing probe table: probe_id → (peer-we-sent-via, sent_at).
     /// On matching PathNotify → boost trust + remove. On timeout (handled
     /// in cleanup_stale_probes) → decay trust + remove.
@@ -820,6 +838,9 @@ impl RouterState {
             onion_seen_set: std::collections::HashSet::with_capacity(ONION_REPLAY_CACHE_SIZE),
             remote_onion_keys: HashMap::new(),
             own_onion_key_seq: 0,
+            peer_capabilities: HashMap::new(),
+            own_caps_seq: 0,
+            onion_format: crate::config::OnionFormat::Auto,
             pending_probes: HashMap::new(),
             reputation: HashMap::new(),
             own_reputation_seq: 0,
@@ -1370,6 +1391,11 @@ impl RouterState {
         if self.tick == 1 || self.tick.is_multiple_of(ONION_KEY_ANNOUNCE_TICKS) {
             self.broadcast_onion_key_announce();
         }
+        // Capability gossip — cold-start at tick 1, then periodically so newly
+        // joined peers learn we accept the Sphinx onion.
+        if self.tick == 1 || self.tick.is_multiple_of(CAPABILITY_BROADCAST_TICKS) {
+            self.broadcast_capabilities();
+        }
         // Active route validation: probe one cuckoo claim per cycle.
         if self.tick.is_multiple_of(PROBE_INTERVAL_TICKS) && self.tick > 0 {
             self.probe_cuckoo_claim();
@@ -1504,6 +1530,120 @@ impl RouterState {
                 self.send_to_peer(&pk, encoded.clone());
             }
         }
+    }
+
+    /// Periodic CapabilityAnnounce broadcast — mirrors broadcast_onion_key_announce:
+    /// strictly increasing seq, signed, self-recorded, flooded to all peers.
+    #[mutants::skip]
+    fn broadcast_capabilities(&mut self) {
+        self.own_caps_seq += 1;
+        let seq = self.own_caps_seq;
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        // We always accept Sphinx cells inbound (the code is compiled in),
+        // independent of our own *send* preference, so advertise unconditionally.
+        let caps = crate::packet::CAP_ONION_SPHINX;
+        let unsigned = crate::packet::CapabilityAnnounce {
+            origin: self.pub_key,
+            caps,
+            seq,
+            valid_from_ms: now_ms,
+            sig: [0u8; 64],
+        };
+        let sig = self.signing_key.sign(&unsigned.sign_bytes()).to_bytes();
+        let ann = crate::packet::CapabilityAnnounce { sig, ..unsigned };
+        self.peer_capabilities.insert(self.pub_key, (caps, seq, Instant::now()));
+        let encoded = ann.encode();
+        let peer_keys: Vec<PeerId> = self.peers.keys().copied().collect();
+        for pk in peer_keys {
+            self.send_to_peer(&pk, encoded.clone());
+        }
+    }
+
+    /// Handle an incoming CapabilityAnnounce: verify, dedup by (origin, seq),
+    /// drop expired/future, record, then flood-forward to all peers but the sender.
+    pub fn handle_capabilities(&mut self, from: PeerId, ann: crate::packet::CapabilityAnnounce) {
+        if ann.origin == self.pub_key {
+            return;
+        }
+        let vk = match VerifyingKey::from_bytes(&ann.origin) {
+            Ok(v) => v,
+            Err(_) => return,
+        };
+        if vk
+            .verify_strict(&ann.sign_bytes(), &ed25519_dalek::Signature::from_bytes(&ann.sig))
+            .is_err()
+        {
+            warn!("invalid CapabilityAnnounce sig from origin {:?}", &ann.origin[..4]);
+            return;
+        }
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        if now_ms.saturating_sub(ann.valid_from_ms) > CAPABILITY_VALIDITY_MS {
+            debug!("CapabilityAnnounce too old, dropping");
+            return;
+        }
+        if ann.valid_from_ms > now_ms.saturating_add(60_000) {
+            debug!("CapabilityAnnounce from too far in future, dropping");
+            return;
+        }
+        let is_newer = match self.peer_capabilities.get(&ann.origin) {
+            Some((_, prev_seq, _)) => ann.seq > *prev_seq,
+            None => true,
+        };
+        if !is_newer {
+            return;
+        }
+        self.record_capability(ann.origin, ann.caps, ann.seq);
+        let encoded = ann.encode();
+        let peer_keys: Vec<PeerId> = self.peers.keys().copied().collect();
+        for pk in peer_keys {
+            if pk != from {
+                self.send_to_peer(&pk, encoded.clone());
+            }
+        }
+    }
+
+    /// Record a peer's capabilities, bounded by MAX_CAPABILITY_ENTRIES (evicts a
+    /// non-peer entry when full). Mirrors record_remote_onion_key.
+    fn record_capability(&mut self, origin: [u8; 32], caps: u32, seq: u64) {
+        if !self.peer_capabilities.contains_key(&origin)
+            && self.peer_capabilities.len() >= MAX_CAPABILITY_ENTRIES
+        {
+            let victim = self
+                .peer_capabilities
+                .keys()
+                .find(|k| !self.peers.contains_key(*k) && **k != self.pub_key)
+                .copied();
+            if let Some(v) = victim {
+                self.peer_capabilities.remove(&v);
+            } else {
+                return;
+            }
+        }
+        self.peer_capabilities.insert(origin, (caps, seq, Instant::now()));
+    }
+
+    /// Does every hop (relays + dst) advertise Sphinx support, recently enough,
+    /// and does the path fit `sphinx::MAX_HOPS`? Used by the Auto onion selector
+    /// so we never send a `TYPE_ONION_SPHINX` cell to a node that would drop it.
+    fn path_supports_sphinx(&self, relays: &[crate::onion::OnionHop], dst: &[u8; 32]) -> bool {
+        if relays.len() + 1 > crate::sphinx::MAX_HOPS {
+            return false;
+        }
+        let supported = |id: &[u8; 32]| {
+            matches!(
+                self.peer_capabilities.get(id),
+                Some((caps, _, recorded))
+                    if caps & crate::packet::CAP_ONION_SPHINX != 0
+                        && recorded.elapsed() < Duration::from_millis(CAPABILITY_VALIDITY_MS)
+            )
+        };
+        relays.iter().all(|h| supported(&h.identity_ed_pub)) && supported(dst)
     }
 
     /// Pick one (peer, target_identity) pair where the peer's cuckoo claims
@@ -2723,6 +2863,11 @@ fn dispatch(state: &Arc<Mutex<RouterState>>, from: PeerId, frame: Vec<u8>) {
                 state.lock_or_recover().handle_onion_key_announce(from, ann);
             }
         }
+        crate::packet::TYPE_CAPABILITIES => {
+            if let Ok(ann) = crate::packet::CapabilityAnnounce::decode(data) {
+                state.lock_or_recover().handle_capabilities(from, ann);
+            }
+        }
         TYPE_REPUTATION_REPORT => {
             if let Ok(r) = ReputationReport::decode(data) {
                 state.lock_or_recover().handle_reputation_report(from, r);
@@ -2998,6 +3143,12 @@ impl PacketConn {
             let _ = self.obfs_key.set(key);
             tracing::info!("transport obfuscation enabled (roadmap #7)");
         }
+    }
+
+    /// Select which onion format `write_to_onion` builds (see
+    /// [`crate::config::OnionFormat`]). Call once at node startup from config.
+    pub fn set_onion_format(&self, fmt: crate::config::OnionFormat) {
+        self.inner.lock_or_recover().onion_format = fmt;
     }
 
     /// Roadmap #7: the derived obfuscation key, or `None` when
@@ -3453,6 +3604,22 @@ impl PacketConn {
     ) -> Result<()> {
         if relays.is_empty() {
             return self.write_to(payload, dst).await;
+        }
+
+        // Onion format selection (OnionFormat). Sphinx removes the legacy
+        // per-layer length leak; build it when forced, or under Auto when every
+        // hop advertises support. Otherwise fall through to the legacy builder
+        // below (also the Auto fallback for not-yet-capable paths).
+        let use_sphinx = {
+            let st = self.inner.lock_or_recover();
+            match st.onion_format {
+                crate::config::OnionFormat::Legacy => false,
+                crate::config::OnionFormat::Sphinx => true,
+                crate::config::OnionFormat::Auto => st.path_supports_sphinx(relays, dst),
+            }
+        };
+        if use_sphinx {
+            return self.write_to_onion_sphinx(payload, dst, relays).await;
         }
 
         // We need the destination's *current* onion ephemeral pub to build the
@@ -5263,6 +5430,104 @@ mod tests {
         };
         let sig = sk.sign(&unsigned.sign_bytes()).to_bytes();
         OnionKeyAnnounce { sig, ..unsigned }
+    }
+
+    fn make_cap(sk: &SigningKey, caps: u32, seq: u64, age_ms: i64) -> crate::packet::CapabilityAnnounce {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let valid_from_ms = if age_ms >= 0 {
+            now_ms.saturating_sub(age_ms as u64)
+        } else {
+            now_ms.saturating_add((-age_ms) as u64)
+        };
+        let unsigned = crate::packet::CapabilityAnnounce {
+            origin: sk.verifying_key().to_bytes(),
+            caps,
+            seq,
+            valid_from_ms,
+            sig: [0u8; 64],
+        };
+        let sig = sk.sign(&unsigned.sign_bytes()).to_bytes();
+        crate::packet::CapabilityAnnounce { sig, ..unsigned }
+    }
+
+    #[test]
+    fn capability_valid_is_recorded() {
+        let mut rs = make_router();
+        let sk = SigningKey::generate(&mut OsRng);
+        let origin = sk.verifying_key().to_bytes();
+        rs.handle_capabilities([0xFEu8; 32], make_cap(&sk, crate::packet::CAP_ONION_SPHINX, 1, 5_000));
+        let (caps, seq, _) = rs.peer_capabilities.get(&origin).expect("recorded");
+        assert_eq!(*seq, 1);
+        assert_ne!(caps & crate::packet::CAP_ONION_SPHINX, 0);
+    }
+
+    #[test]
+    fn capability_bad_sig_stale_and_self_rejected() {
+        let mut rs = make_router();
+        let sk = SigningKey::generate(&mut OsRng);
+        let origin = sk.verifying_key().to_bytes();
+        let mut bad = make_cap(&sk, crate::packet::CAP_ONION_SPHINX, 1, 0);
+        bad.sig[0] ^= 0xFF;
+        rs.handle_capabilities([0u8; 32], bad);
+        assert!(!rs.peer_capabilities.contains_key(&origin), "bad sig rejected");
+        rs.handle_capabilities([0u8; 32], make_cap(&sk, crate::packet::CAP_ONION_SPHINX, 1, 25 * 60 * 60 * 1000));
+        assert!(!rs.peer_capabilities.contains_key(&origin), "stale rejected");
+        // An announce purporting to be from ourselves must be ignored.
+        let self_sk = rs.signing_key.clone();
+        let self_ann = make_cap(&self_sk, crate::packet::CAP_ONION_SPHINX, 1, 0);
+        rs.handle_capabilities([0u8; 32], self_ann);
+        assert!(!rs.peer_capabilities.contains_key(&rs.pub_key), "self-origin rejected");
+    }
+
+    #[test]
+    fn capability_dedup_keeps_newest_seq() {
+        let mut rs = make_router();
+        let sk = SigningKey::generate(&mut OsRng);
+        let origin = sk.verifying_key().to_bytes();
+        rs.handle_capabilities([0u8; 32], make_cap(&sk, crate::packet::CAP_ONION_SPHINX, 5, 0));
+        rs.handle_capabilities([0u8; 32], make_cap(&sk, 0, 3, 0)); // older seq → ignored
+        let (caps, seq, _) = rs.peer_capabilities.get(&origin).unwrap();
+        assert_eq!(*seq, 5);
+        assert_ne!(caps & crate::packet::CAP_ONION_SPHINX, 0);
+        rs.handle_capabilities([0u8; 32], make_cap(&sk, 0, 6, 0)); // newer → updates
+        let (caps, seq, _) = rs.peer_capabilities.get(&origin).unwrap();
+        assert_eq!(*seq, 6);
+        assert_eq!(caps & crate::packet::CAP_ONION_SPHINX, 0, "newer announce cleared the bit");
+    }
+
+    #[test]
+    fn path_supports_sphinx_requires_every_hop_capable() {
+        let mut rs = make_router();
+        let relay_sks: Vec<SigningKey> = (0..2).map(|_| SigningKey::generate(&mut OsRng)).collect();
+        let dst_sk = SigningKey::generate(&mut OsRng);
+        let relays: Vec<crate::onion::OnionHop> = relay_sks.iter().map(|sk| crate::onion::OnionHop {
+            identity_ed_pub: sk.verifying_key().to_bytes(),
+            ephemeral_x_pub: [0u8; 32],
+        }).collect();
+        let dst = dst_sk.verifying_key().to_bytes();
+        for sk in relay_sks.iter().chain(std::iter::once(&dst_sk)) {
+            rs.handle_capabilities([0u8; 32], make_cap(sk, crate::packet::CAP_ONION_SPHINX, 1, 0));
+        }
+        assert!(rs.path_supports_sphinx(&relays, &dst), "all hops capable → true");
+        // A hop that advertises caps but WITHOUT the sphinx bit → false.
+        rs.handle_capabilities([0u8; 32], make_cap(&relay_sks[0], 0, 2, 0));
+        assert!(!rs.path_supports_sphinx(&relays, &dst), "a non-sphinx hop → false");
+    }
+
+    #[test]
+    fn path_supports_sphinx_rejects_too_many_hops() {
+        let rs = make_router();
+        let sks: Vec<SigningKey> = (0..crate::sphinx::MAX_HOPS).map(|_| SigningKey::generate(&mut OsRng)).collect();
+        let relays: Vec<crate::onion::OnionHop> = sks.iter().map(|sk| crate::onion::OnionHop {
+            identity_ed_pub: sk.verifying_key().to_bytes(),
+            ephemeral_x_pub: [0u8; 32],
+        }).collect();
+        let dst = SigningKey::generate(&mut OsRng).verifying_key().to_bytes();
+        // MAX_HOPS relays + dst = MAX_HOPS+1 > MAX_HOPS → rejected before cap checks.
+        assert!(!rs.path_supports_sphinx(&relays, &dst));
     }
 
     #[test]
