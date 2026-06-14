@@ -338,18 +338,17 @@ fn build_layer(target: &OnionHop, layer_type: u8, content: Vec<u8>) -> Result<On
     encode_uvarint(content.len() as u64, &mut plaintext);
     plaintext.extend_from_slice(&content);
 
-    // Pad the plaintext with random bytes so that every layer's AEAD ciphertext
-    // is the same size regardless of how many inner layers remain. We pad to a
-    // budget computed so the final wire packet hits exactly ONION_CELL_SIZE.
-    let outer_overhead = 1                       // TYPE_ONION
-        + 16                                     // routing_tag
-        + 32;                                    // epk
-    // We don't know varint(aead_len)'s size precisely — at worst 3 bytes for
-    // aead lengths up to ~2 MiB. Reserve 3 here; later truncation may waste
-    // 2 bytes but the constant-size property is preserved as long as we treat
-    // any underflow as zero-padding (we pad the OUTER encoded packet to
-    // ONION_CELL_SIZE anyway in encode()).
-    let _ = outer_overhead; // currently unused; pad in encode() instead.
+    // NOTE: the per-layer plaintext is deliberately NOT padded here. Only the
+    // OUTERMOST wire packet is zero-padded to ONION_CELL_SIZE (see `encode`), so
+    // every cell is 1280 B on the wire and relays re-pad on forward.
+    //
+    // KNOWN LIMITATION (REVIEW-FINDINGS #3): the per-layer `aead_len` varint is
+    // cleartext and shrinks ~67 B per hop, which leaks onion depth to anyone who
+    // can read consecutive hops' cells — mitigated by QUIC link encryption but
+    // exposed on the raw-TCP transport. Making `aead_len` constant is impossible
+    // with this nested-AEAD + variable-hop format (an equal-sized inner can't fit
+    // inside an equal-sized outer); removing the leak needs a Sphinx-style mix
+    // format with a fixed header + wide-block payload. Tracked as a follow-up.
 
     cipher
         .encrypt_in_place(&nonce, aad, &mut plaintext)
