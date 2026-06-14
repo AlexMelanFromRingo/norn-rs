@@ -1,6 +1,14 @@
 # Design: fixed-size (Sphinx-style) onion format — closes the `aead_len` depth leak
 
-Status: **design** (REVIEW-FINDINGS #3). Branch `feature/onion-sphinx`.
+Status: **implemented behind the opt-in `sphinx` Cargo feature** (REVIEW-FINDINGS
+#3). Branch `feature/onion-sphinx`, merged to `hardening-review`.
+
+> **Build gate.** The entire onion-routing layer described here and in
+> `onion-sphinx-activation-design.md` is **off by default**. It compiles only with
+> `cargo build --features sphinx`; a default build keeps the original protocol
+> behaviour (no Sphinx cells, no `CapabilityAnnounce` flooding). All "default
+> Auto" / "by default" statements below mean *when the `sphinx` feature is
+> enabled*.
 
 ## 1. Problem
 
