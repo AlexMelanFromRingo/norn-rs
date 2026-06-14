@@ -27,14 +27,21 @@ impl HypCoord {
     }
 
     /// Hyperbolic distance between two Poincaré disk points.
-    /// d(u,v) = 2·arctanh(|u-v| / |1 + ū·v|)  (Möbius formula)
+    /// d(u,v) = 2·arctanh(|u−v| / |1 − ū·v|)  (Möbius formula)
+    ///
+    /// Note the MINUS in the denominator: ū·v = (ax·bx + ay·by) + i(ax·by − ay·bx),
+    /// so 1 − ū·v has real part 1 − (ax·bx + ay·by). A `+` here is a classic
+    /// transcription error — it stays invisible whenever one point is the origin
+    /// (ū·v = 0) but grossly distorts every other pair (antipodal points read as
+    /// ~10× too far), silently degrading greedy routing. Cross-checked against the
+    /// independent arcosh form in `distance_matches_independent_arcosh_reference`.
     pub fn distance(self, other: Self) -> f64 {
         let (ax, ay) = self.to_cartesian();
         let (bx, by) = other.to_cartesian();
         let dx = ax - bx;
         let dy = ay - by;
         let num = (dx * dx + dy * dy).sqrt();
-        let denom_re = 1.0 + ax * bx + ay * by;
+        let denom_re = 1.0 - ax * bx - ay * by;
         let denom_im = ax * by - ay * bx;
         let denom = (denom_re * denom_re + denom_im * denom_im).sqrt();
         let ratio = num / denom;
@@ -261,15 +268,15 @@ mod tests {
         // Two distinct points: a=(0.3,0), b=(0.5,0) both on real axis.
         // dx = 0.3-0.5 = -0.2, dy=0
         // num = 0.2
-        // denom_re = 1 + 0.3*0.5 + 0 = 1.15
+        // denom_re = 1 - 0.3*0.5 - 0 = 0.85
         // denom_im = 0.3*0 - 0*0.5 = 0
-        // ratio = 0.2/1.15 ≈ 0.17391
-        // distance = 2*atanh(0.17391...)
+        // ratio = 0.2/0.85 ≈ 0.23529
+        // distance = 2*atanh(0.23529...)
         let a = HypCoord { r: 0.3, theta: 0.0 };
         let b = HypCoord { r: 0.5, theta: 0.0 };
         let ax = 0.3f64; let bx = 0.5f64;
         let num = (ax - bx).abs();
-        let denom = 1.0 + ax * bx;
+        let denom = 1.0 - ax * bx;
         let expected = 2.0 * (num / denom).atanh();
         let d = a.distance(b);
         assert!((d - expected).abs() < 1e-9,
@@ -277,7 +284,7 @@ mod tests {
     }
 
     #[test]
-    fn distance_formula_denominator_uses_plus_for_ay_by() {
+    fn distance_formula_denominator_includes_ay_by_term() {
         // a=(0.5, π/2) → (0, 0.5) and b=(0.3, 0) → (0.3, 0)
         // dx=0-0.3=-0.3, dy=0.5-0=0.5
         // num = sqrt(0.09+0.25) = sqrt(0.34) ≈ 0.58310
@@ -295,7 +302,7 @@ mod tests {
         let (bx, by) = b.to_cartesian();
         let dx = ax - bx; let dy = ay - by;
         let num = (dx * dx + dy * dy).sqrt();
-        let denom_re = 1.0 + ax * bx + ay * by; // the correct formula
+        let denom_re = 1.0 - ax * bx - ay * by; // the correct formula (1 − ū·v)
         let denom_im = ax * by - ay * bx;
         let denom = (denom_re * denom_re + denom_im * denom_im).sqrt();
         let expected = 2.0 * (num / denom).atanh();
@@ -395,7 +402,7 @@ mod tests {
         let dy = ay - by;
         // Compute expected with explicit % formula
         let num = (dx * dx + dy * dy).sqrt();
-        let denom_re = 1.0 + ax * bx + ay * by;
+        let denom_re = 1.0 - ax * bx - ay * by;
         let denom_im = ax * by - ay * bx;
         let denom = (denom_re * denom_re + denom_im * denom_im).sqrt();
         let expected = 2.0 * (num / denom).atanh();
@@ -441,5 +448,40 @@ mod tests {
             "angle_from_key must use (val/u64::MAX)*2π formula: got {got}, expected {expected}");
         // Sanity: must be strictly positive for a non-zero hash (key=0x42 gives nonzero val)
         assert!(got > 0.0, "angle for key=[0x42;32] must be > 0");
+    }
+
+    /// Independent cross-check of `distance` against the arcosh form of the
+    /// Poincaré-disk metric:  d = arcosh(1 + 2|u−v|² / ((1−|u|²)(1−|v|²))).
+    /// This formula is mathematically independent of the Möbius/arctanh
+    /// implementation, so — unlike the self-referential pinning tests — it
+    /// catches sign/term errors in the denominator. Regression guard for the
+    /// `1 + ū·v` → `1 − ū·v` fix.
+    #[test]
+    fn distance_matches_independent_arcosh_reference() {
+        fn arcosh_ref(u: HypCoord, v: HypCoord) -> f64 {
+            let (ax, ay) = u.to_cartesian();
+            let (bx, by) = v.to_cartesian();
+            let d2 = (ax - bx).powi(2) + (ay - by).powi(2);
+            let nu = (1.0 - (ax * ax + ay * ay)) * (1.0 - (bx * bx + by * by));
+            (1.0 + 2.0 * d2 / nu).acosh()
+        }
+        // Deliberately non-origin, non-collinear pairs — exactly the cases the
+        // old `1 + ū·v` denominator got wrong (antipodal read as ~23 instead of
+        // ~2.2; same-ray points read as closer than they truly are).
+        let cases = [
+            (HypCoord { r: 0.5, theta: 0.0 }, HypCoord { r: 0.5, theta: PI }),
+            (HypCoord { r: 0.6, theta: 0.3 }, HypCoord { r: 0.6, theta: 2.8 }),
+            (HypCoord { r: 0.3, theta: 0.0 }, HypCoord { r: 0.8, theta: 0.0 }),
+            (HypCoord { r: 0.7, theta: 1.0 }, HypCoord { r: 0.7, theta: 4.0 }),
+            (HypCoord { r: 0.2, theta: 0.5 }, HypCoord { r: 0.8, theta: 3.0 }),
+        ];
+        for (a, b) in cases {
+            let got = a.distance(b);
+            let want = arcosh_ref(a, b);
+            assert!(
+                (got - want).abs() < 1e-9,
+                "distance {got} != arcosh reference {want} for {a:?} → {b:?}"
+            );
+        }
     }
 }
