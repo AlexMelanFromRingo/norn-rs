@@ -17,6 +17,7 @@ impl RouterState {
         let coord_bytes = self.own_coord.encode();
         let onion_eph_pub = *self.onion_keys.pub_key().as_bytes();
         let unsigned = CoordAnnounce {
+            version: COORD_FORMAT_V4,
             coord: coord_bytes,
             tree_depth: self.own_depth,
             onion_eph_pub,
@@ -45,7 +46,7 @@ impl RouterState {
             return;
         }
         let coord = HypCoord::decode(&ann.coord);
-        if !coord.r.is_finite() || !coord.theta.is_finite() {
+        if !coord.rho.is_finite() || !coord.theta.is_finite() {
             warn!("coord announce from {:?} has non-finite values, ignoring", &from_key[..4]);
             return;
         }

@@ -1104,6 +1104,7 @@
 
     fn make_coord_announce(sk: &SigningKey, tree_depth: u32, coord: HypCoord) -> CoordAnnounce {
         let unsigned = CoordAnnounce {
+            version: COORD_FORMAT_V4,
             coord: coord.encode(),
             tree_depth,
             onion_eph_pub: [0u8; 32],
@@ -1131,19 +1132,19 @@
     #[test]
     fn coord_announce_spoofed_r_rejected() {
         // Attack: declare depth=10 (legitimate-looking) but claim coord
-        // r=0.001 (near origin → near every dst → wins greedy routing).
+        // rho=0.001 (near origin → near every dst → wins greedy routing).
         let mut rs = make_router();
         let sk = SigningKey::generate(&mut OsRng);
         let pk = sk.verifying_key().to_bytes();
         add_dummy_peer(&mut rs, pk);
         let spoof = HypCoord {
-            r: 0.001,
+            rho: 0.001,
             theta: HypCoord::angle_from_key(&pk),
         };
         let ann = make_coord_announce(&sk, 10, spoof);
         rs.handle_coord_announce(pk, ann);
         assert!(!rs.coord_table.contains_key(&pk),
-            "spoofed CoordAnnounce (r ≠ tanh(depth*DELTA)) must be rejected");
+            "spoofed CoordAnnounce (rho ≠ depth*RADIAL_STEP) must be rejected");
     }
 
     #[test]
@@ -1153,8 +1154,8 @@
         let pk = sk.verifying_key().to_bytes();
         add_dummy_peer(&mut rs, pk);
         let spoof = HypCoord {
-            r: (3.0_f64 * 0.5).tanh(), // correct r for depth=3
-            theta: 1.234,              // arbitrary theta, NOT derived from pk
+            rho: 3.0,     // correct rho for depth=3 (RADIAL_STEP=1.0)
+            theta: 1.234, // arbitrary theta, NOT derived from pk
         };
         let ann = make_coord_announce(&sk, 3, spoof);
         rs.handle_coord_announce(pk, ann);
@@ -2038,16 +2039,16 @@
 
         let dst_key = [0xD0u8; 32];
 
-        // Place dst far along the real axis
-        let dst_coord = HypCoord { r: 0.8, theta: 0.0 };
+        // Place dst far along its ray (rho = radial hyperbolic distance, v4)
+        let dst_coord = HypCoord { rho: 0.8, theta: 0.0 };
         // Place peer_A close to dst (same direction, slightly closer to origin)
-        let coord_a = HypCoord { r: 0.7, theta: 0.0 };
+        let coord_a = HypCoord { rho: 0.7, theta: 0.0 };
         // Place peer_B far from dst (opposite direction)
-        let coord_b = HypCoord { r: 0.6, theta: std::f64::consts::PI };
+        let coord_b = HypCoord { rho: 0.6, theta: std::f64::consts::PI };
 
-        // own_dist = origin.distance(dst_coord) = 2*atanh(0.8) ≈ 2.197
-        // d_A = coord_a.distance(dst_coord) = 2*atanh(0.1/1.56) ≈ 0.128 (< own_dist → greedy step ✓)
-        // d_B = coord_b.distance(dst_coord) = much larger (≈ 4+)
+        // own_dist = origin.distance(dst_coord) = rho = 0.8
+        // d_A = coord_a.distance(dst_coord) = |0.8 − 0.7| = 0.1 (< own_dist → greedy step ✓)
+        // d_B = coord_b.distance(dst_coord) ≈ 1.39 (opposite ray) → much larger
 
         rs.coord_table.insert(dst_key, dst_coord);
         rs.peers.get_mut(&peer_a_key).unwrap().pub_key = peer_a_key;

@@ -279,7 +279,7 @@ async fn hyperbolic_routing_two_nodes() {
 
     // Sanity-check the HypCoord distance function directly
     let origin = HypCoord::origin();
-    let far = HypCoord { r: 0.9, theta: 1.0 };
+    let far = HypCoord { rho: 0.9, theta: 1.0 };
     assert!(
         origin.distance(far) > 0.0,
         "distance from origin to far point should be positive"

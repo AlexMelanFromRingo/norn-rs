@@ -16,6 +16,11 @@ pub const PATH_NOTIFY: u8 = 7;
 pub const PATH_BROKEN: u8 = 8;
 pub const TRAFFIC: u8 = 9;
 pub const TYPE_COORD_ANNOUNCE: u8 = 10;
+/// Coordinate wire format. v4 carries `rho` (radial hyperbolic distance, linear
+/// in depth) on the hyperboloid model instead of the legacy Poincaré `r =
+/// tanh(depth/2)`, which saturated in f64 at depth ~24–38. Flag-day bump: a
+/// `CoordAnnounce` with any other version is rejected (no v3↔v4 negotiation).
+pub const COORD_FORMAT_V4: u8 = 4;
 pub const TYPE_ONION: u8 = 11;
 pub const TYPE_ONION_KEY_ANNOUNCE: u8 = 12;
 pub const TYPE_REPUTATION_REPORT: u8 = 13;
@@ -852,13 +857,16 @@ impl ReputationReport {
 /// and signed by its long-term ed25519 key.
 ///
 /// Wire layout (v2):
-///   [coord: 16][tree_depth: u32 LE][onion_eph_pub: 32][sig: 64]
+///   [version: 1 = COORD_FORMAT_V4][coord: 16][tree_depth: u32 LE][onion_eph_pub: 32][sig: 64]
 ///
-/// Signature covers: coord || tree_depth || onion_eph_pub. The receiver
+/// Signature covers: version || coord || tree_depth || onion_eph_pub. The receiver
 /// authenticates the announced ephemeral pub against the sender's identity
 /// before using it for onion DH.
 #[derive(Clone, Debug)]
 pub struct CoordAnnounce {
+    /// Coordinate wire-format version (`COORD_FORMAT_V4`). Authenticated (in
+    /// `sign_bytes`) and checked on decode, so a v3 frame cannot be accepted.
+    pub version: u8,
     pub coord: [u8; 16],
     pub tree_depth: u32,
     pub onion_eph_pub: [u8; 32],
@@ -868,7 +876,8 @@ pub struct CoordAnnounce {
 impl CoordAnnounce {
     /// Bytes that the sender must sign (everything *but* the signature).
     pub fn sign_bytes(&self) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(16 + 4 + 32);
+        let mut buf = Vec::with_capacity(1 + 16 + 4 + 32);
+        buf.push(self.version);
         buf.extend_from_slice(&self.coord);
         buf.extend_from_slice(&self.tree_depth.to_le_bytes());
         buf.extend_from_slice(&self.onion_eph_pub);
@@ -876,6 +885,7 @@ impl CoordAnnounce {
     }
 
     pub fn encode_into(&self, buf: &mut Vec<u8>) {
+        buf.push(self.version);
         buf.extend_from_slice(&self.coord);
         buf.extend_from_slice(&self.tree_depth.to_le_bytes());
         buf.extend_from_slice(&self.onion_eph_pub);
@@ -883,18 +893,22 @@ impl CoordAnnounce {
     }
 
     pub fn decode(data: &[u8]) -> Result<Self> {
-        let need = 16 + 4 + 32 + 64;
+        let need = 1 + 16 + 4 + 32 + 64;
         if data.len() < need {
             bail!("CoordAnnounce too short: got {} (need {})", data.len(), need);
         }
+        let version = data[0];
+        if version != COORD_FORMAT_V4 {
+            bail!("CoordAnnounce unsupported version {} (expected {})", version, COORD_FORMAT_V4);
+        }
         let mut coord = [0u8; 16];
-        coord.copy_from_slice(&data[0..16]);
-        let tree_depth = u32::from_le_bytes(data[16..20].try_into().unwrap());
+        coord.copy_from_slice(&data[1..17]);
+        let tree_depth = u32::from_le_bytes(data[17..21].try_into().unwrap());
         let mut onion_eph_pub = [0u8; 32];
-        onion_eph_pub.copy_from_slice(&data[20..52]);
+        onion_eph_pub.copy_from_slice(&data[21..53]);
         let mut sig = [0u8; 64];
-        sig.copy_from_slice(&data[52..116]);
-        Ok(CoordAnnounce { coord, tree_depth, onion_eph_pub, sig })
+        sig.copy_from_slice(&data[53..117]);
+        Ok(CoordAnnounce { version, coord, tree_depth, onion_eph_pub, sig })
     }
 }
 
@@ -1495,6 +1509,7 @@ mod tests {
     #[test]
     fn coord_announce_roundtrip() {
         let ann = CoordAnnounce {
+            version: COORD_FORMAT_V4,
             coord: [0xABu8; 16],
             tree_depth: 42,
             onion_eph_pub: [0x77u8; 32],
@@ -1503,6 +1518,7 @@ mod tests {
         let mut buf = Vec::new();
         ann.encode_into(&mut buf);
         let dec = CoordAnnounce::decode(&buf).unwrap();
+        assert_eq!(dec.version, ann.version);
         assert_eq!(dec.coord, ann.coord);
         assert_eq!(dec.tree_depth, ann.tree_depth);
         assert_eq!(dec.onion_eph_pub, ann.onion_eph_pub);
@@ -1512,6 +1528,7 @@ mod tests {
     #[test]
     fn coord_announce_tree_depth_is_little_endian() {
         let ann = CoordAnnounce {
+            version: COORD_FORMAT_V4,
             coord: [0u8; 16],
             tree_depth: 0x01020304,
             onion_eph_pub: [0u8; 32],
@@ -1519,13 +1536,30 @@ mod tests {
         };
         let mut buf = Vec::new();
         ann.encode_into(&mut buf);
-        // bytes 16..20 must be LE representation of 0x01020304
-        assert_eq!(buf[16], 0x04, "LE byte 0");
-        assert_eq!(buf[17], 0x03, "LE byte 1");
-        assert_eq!(buf[18], 0x02, "LE byte 2");
-        assert_eq!(buf[19], 0x01, "LE byte 3");
+        // byte 0 is the version; tree_depth occupies bytes 17..21 (after version+coord).
+        assert_eq!(buf[0], COORD_FORMAT_V4, "version byte");
+        assert_eq!(buf[17], 0x04, "LE byte 0");
+        assert_eq!(buf[18], 0x03, "LE byte 1");
+        assert_eq!(buf[19], 0x02, "LE byte 2");
+        assert_eq!(buf[20], 0x01, "LE byte 3");
         let dec = CoordAnnounce::decode(&buf).unwrap();
         assert_eq!(dec.tree_depth, 0x01020304);
+    }
+
+    #[test]
+    fn coord_announce_rejects_non_v4_version() {
+        let ann = CoordAnnounce {
+            version: COORD_FORMAT_V4,
+            coord: [1u8; 16],
+            tree_depth: 3,
+            onion_eph_pub: [2u8; 32],
+            sig: [3u8; 64],
+        };
+        let mut buf = Vec::new();
+        ann.encode_into(&mut buf);
+        buf[0] = 3; // a legacy / unknown coordinate version
+        assert!(CoordAnnounce::decode(&buf).is_err(),
+            "a CoordAnnounce with a non-v4 version must be rejected (flag-day break)");
     }
 
     // ── Anti-amplification audit: wire-size invariants ──────────────────────
@@ -1710,11 +1744,14 @@ mod tests {
 
     #[test]
     fn coord_announce_decode_truncated_fails() {
-        // v2 layout: 16 (coord) + 4 (tree_depth) + 32 (onion_eph_pub) + 64 (sig) = 116 bytes
-        let need = 16 + 4 + 32 + 64;
-        assert!(CoordAnnounce::decode(&[0u8; 115]).is_err(), "{} - 1 bytes must fail", need);
+        // v4 layout: 1 (version) + 16 (coord) + 4 (tree_depth) + 32 (onion_eph_pub) + 64 (sig) = 117
+        let need = 1 + 16 + 4 + 32 + 64;
+        assert!(CoordAnnounce::decode(&[0u8; 116]).is_err(), "need-1 bytes must fail");
         assert!(CoordAnnounce::decode(&[0u8; 0]).is_err(), "empty must fail");
-        assert!(CoordAnnounce::decode(&vec![0u8; need]).is_ok(), "{} bytes must succeed", need);
+        // Full length is necessary but not sufficient: the version byte must be v4.
+        let mut ok = vec![0u8; need];
+        ok[0] = COORD_FORMAT_V4;
+        assert!(CoordAnnounce::decode(&ok).is_ok(), "{need} bytes with the v4 version must succeed");
     }
 
     // ── Traffic decode boundary ───────────────────────────────────────────────
