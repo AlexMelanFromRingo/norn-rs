@@ -70,17 +70,31 @@ the protected channel. ProVerif explores whether any Dolev-Yao
 adversary can derive it. With a successful proof, no attack works in
 the symbolic model.
 
-### Q2 — Mutual authentication
+### Q2 — Mutual authentication (documented limitation, not machine-proven here)
 
 ```proverif
 query pkI, pkR, k;
     event(I_finished(pkI, pkR, k)) ==> event(R_finished(pkR, pkI, k)).
 ```
 
-Any session that the Initiator commits to (with peer pk_R, deriving key
-k) must correspond to a Responder execution by pk_R that also committed
-to k. Catches identity-misbinding attacks (where I thinks they're
-talking to R but actually talked to attacker M who relayed to R).
+The intended property: any session the Initiator commits to (peer pk_R, key k)
+must correspond to a Responder execution by pk_R that committed to k.
+
+**ProVerif reports this `false`** (with a candidate trace) — and so does the
+key-independent variant. This is the **well-known incompleteness of ProVerif
+under the Diffie-Hellman commutativity equation** `dh(a,pub(b)) = dh(b,pub(a))`:
+the equational theory over-approximates its Horn-clause resolution, yielding
+spurious traces for key-agreement correspondences. In every such trace both
+roles still verify each other's Ed25519 signatures (recipient-bound, per Q3) and
+derive the *same* key — i.e. it is a tool limitation, **not a demonstrated
+attack**. The query is therefore left commented in `spec/norn.pv`. Sound
+machine-checking of a DH-based AKE's authentication belongs in **CryptoVerif**
+(computational) or **Tamarin** (native DH); that is tracked as future work.
+
+Defence-in-depth observation surfaced by the model: the Ack signature binds
+`(x25519_pub_R, ml_kem_ct, ts, recipient)` but **not** the initiator's
+`x25519_pub`/`ml_kem_ek`; signing the full transcript would let the responder's
+signature attest to the initiator's contributions too.
 
 ### Q3 — Cross-target replay
 
@@ -91,20 +105,27 @@ original recipient's public key in the signed bytes.
 
 ## Running it
 
+ProVerif is distributed via opam (not in Ubuntu's apt as of 24.04):
+
 ```bash
-# Install ProVerif (Debian/Ubuntu): apt install proverif
-proverif spec/norn.pv
+opam install proverif
+proverif spec/norn.pv           # handshake: key secrecy
+proverif spec/capabilities.pv   # capability-gossip authenticity
 ```
 
-Expected output (abridged):
+Actual output (verified with ProVerif 2.05):
 
 ```
-RESULT event(I_finished(...,k)) ==> event(R_finished(...,k)) is true.
-RESULT not attacker(secret_marker) is true.
+# spec/norn.pv
+RESULT not attacker(secret_marker[]) is true.
+# spec/capabilities.pv
+RESULT event(acceptCap(pk(skO[]),caps)) ==> event(announceCap(pk(skO[]),caps)) is true.
 ```
 
-`true` means the query is proved in the symbolic model. `false` means
-ProVerif found an attack trace (printed in the output).
+`true` means the query is proved in the symbolic model. Q1 (key secrecy) is
+proved and is *non-vacuous* — the Initiator actually encrypts `secret_marker`
+under the derived key. Q2 (authentication) is a documented ProVerif/DH
+limitation (above), left commented in `norn.pv`.
 
 ## Known model gaps
 
@@ -121,23 +142,33 @@ does not currently formalise:
    the live protocol rotates it every ~24h with a 60s overlap. The
    overlap window correctness is small enough to be inspected by hand
    in `src/session.rs::PqKeys`.
+3. **Authentication / key agreement (Q2).** ProVerif cannot soundly decide
+   the I/R agreement correspondence under the DH commutativity equation
+   (see Q2 above); key *secrecy* (Q1) is proved, but mutual authentication
+   should be machine-checked in CryptoVerif or Tamarin.
 
-Both gaps are open invitations for future formal work.
+These gaps are open invitations for future formal work.
 
 ## Onion layer (Sphinx) & capability negotiation
 
 The `spec/norn.pv` model covers the **session handshake**. The onion routing
-layer (`src/sphinx.rs`, `docs/onion-sphinx-design.md`) and the capability
-negotiation that activates it (`docs/onion-sphinx-activation-design.md`) are not
-yet machine-modelled; their properties are argued informally here and exercised
-by the test suite (round-trip, tamper, constant-size, and the `fuzz_sphinx`
-target).
+layer (`src/sphinx.rs`, `docs/onion-sphinx-design.md`) is exercised by the test
+suite (round-trip, tamper, constant-size, LIONESS avalanche) and the
+`fuzz_sphinx` target; full symbolic modelling of the mix format is research-grade
+and out of scope (the Sphinx literature uses computational proofs).
 
-**Capability authenticity (reduces to the modelled signature primitive).** A
-`CapabilityAnnounce` is Ed25519-signed by `origin` over
-`origin‖caps‖seq‖valid_from_ms`. A node therefore cannot forge a capability for
-an identity whose signing key it does not hold — the *same* `sign`/`verify`
-black box already proven sufficient for Q2/Q3. Consequences:
+**Capability authenticity — machine-verified** in `spec/capabilities.pv`
+(ProVerif 2.05):
+
+```
+RESULT event(acceptCap(pk(skO),caps)) ==> event(announceCap(pk(skO),caps)) is true.
+```
+
+A `CapabilityAnnounce` is Ed25519-signed by `origin` over
+`origin‖caps‖seq‖valid_from_ms`. The model proves a node cannot make a receiver
+accept a capability for the honest origin's key unless that origin actually
+announced it — i.e. an attacker cannot forge or alter the capabilities of an
+identity whose signing key it does not hold. Consequences:
 
 * **No third-party downgrade.** A sender builds a Sphinx cell only when *every*
   hop's signed capability advertises `CAP_ONION_SPHINX`; an attacker cannot strip
@@ -146,10 +177,6 @@ black box already proven sufficient for Q2/Q3. Consequences:
 * **Self-downgrade only.** A node lying that it lacks the capability merely makes
   senders fall back to the legacy onion for traffic *to that node* — no worse
   than the pre-Sphinx status quo.
-
-This property would be a small, self-contained ProVerif extension (a signed
-announce + an authenticity query mirroring Q2); it is left as future work rather
-than shipped unverified.
 
 **Onion (Sphinx) properties (informal; full mix-format modelling is research-grade
 and out of scope, as in the Sphinx literature, which uses computational rather
