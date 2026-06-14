@@ -1,0 +1,61 @@
+(* ───────────────────────────────────────────────────────────────────────── *)
+(*  norn-rs — CapabilityAnnounce authenticity (ProVerif symbolic model)        *)
+(*                                                                             *)
+(*  Models the signed, flooded capability gossip (TYPE_CAPABILITIES, part of   *)
+(*  the opt-in `sphinx` feature). An honest origin O signs (pk_O ‖ caps) with  *)
+(*  its long-term Ed25519 key and floods it; any node may verify and "accept"  *)
+(*  the advertised capabilities. The Dolev-Yao adversary controls the network  *)
+(*  (intercept / modify / replay / inject) and may run its own origins with    *)
+(*  keys it owns.                                                              *)
+(*                                                                             *)
+(*  Query (expected to hold):                                                  *)
+(*    A1  Authenticity — if any receiver ACCEPTS capabilities `caps` for the   *)
+(*        honest origin's key pk(skO), then skO actually ANNOUNCED `caps`.     *)
+(*        ⇒ an attacker cannot forge or alter the capabilities attributed to   *)
+(*           an identity whose signing key it does not hold (no third-party    *)
+(*           downgrade/upgrade of the onion-format capability bit).            *)
+(*                                                                             *)
+(*  Out of scope (as in norn.pv): the (origin, seq) dedup + freshness window   *)
+(*  are liveness/anti-replay, enforced numerically at runtime; replaying a     *)
+(*  validly-signed capability is idempotent and does not break authenticity,   *)
+(*  so the correspondence below is intentionally non-injective.                *)
+(*                                                                             *)
+(*  Run:  proverif spec/capabilities.pv                                        *)
+(* ───────────────────────────────────────────────────────────────────────── *)
+
+free c: channel.                 (* the network — adversary-controlled *)
+
+type skey.
+type pkey.
+
+(* Ed25519 as a black box, exactly as in norn.pv. *)
+fun pk(skey): pkey.
+fun sign(skey, bitstring): bitstring.
+reduc forall k: skey, m: bitstring; verify(pk(k), m, sign(k, m)) = true.
+
+(* Honest origin's long-term signing key — the adversary does NOT know it. *)
+free skO: skey [private].
+
+event announceCap(pkey, bitstring).
+event acceptCap(pkey, bitstring).
+
+(* A1: every capability accepted for the honest key was announced by it. *)
+query caps: bitstring;
+    event(acceptCap(pk(skO), caps)) ==> event(announceCap(pk(skO), caps)).
+
+(* Honest origin: choose a capability set, record it, sign (pk‖caps) and flood. *)
+let origin =
+    new caps: bitstring;
+    event announceCap(pk(skO), caps);
+    out(c, (pk(skO), caps, sign(skO, (pk(skO), caps)))).
+
+(* Any node: receive a claimed (pk, caps, sig); accept the caps iff the sig
+   verifies under the claimed key. *)
+let receiver =
+    in(c, (p: pkey, caps: bitstring, sig: bitstring));
+    if verify(p, (p, caps), sig) = true then
+        event acceptCap(p, caps).
+
+process
+    out(c, pk(skO));                 (* publish the honest origin's PUBLIC key *)
+    ( !origin | !receiver )
