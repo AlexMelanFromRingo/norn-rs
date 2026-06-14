@@ -95,12 +95,16 @@ pub struct NodeConfig {
     /// (see [`OnionFormat`]). Default `auto`: the fixed-size Sphinx format on
     /// paths whose every hop advertises support, legacy onion otherwise. Inbound
     /// always accepts both formats regardless of this setting.
+    /// Only present with the opt-in `sphinx` feature.
+    #[cfg(feature = "sphinx")]
     #[serde(default)]
     pub onion_format: OnionFormat,
 }
 
 /// Which onion-routing wire format a node builds when sending. Receiving/relaying
-/// always accepts both — this only governs what we construct.
+/// always accepts both — this only governs what we construct. Part of the opt-in
+/// `sphinx` feature.
+#[cfg(feature = "sphinx")]
 #[derive(Deserialize, Serialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum OnionFormat {
@@ -141,6 +145,7 @@ impl Default for NodeConfig {
             mdns_enabled: true,
             crypto_workers: 0,
             obfuscation_psk: String::new(),
+            #[cfg(feature = "sphinx")]
             onion_format: OnionFormat::default(),
         }
     }

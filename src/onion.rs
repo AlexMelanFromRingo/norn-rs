@@ -120,6 +120,8 @@ impl OnionKeyChain {
     /// current, the previous key during the rotation overlap, and the
     /// identity-derived fallback — the same key set `try_decrypt` tries for the
     /// legacy onion. Returned by reference so no secret material is copied.
+    /// Only used by the opt-in `sphinx` feature.
+    #[cfg(feature = "sphinx")]
     pub fn sphinx_privs(&self) -> Vec<&StaticSecret> {
         let mut v = Vec::with_capacity(3);
         v.push(&self.current_priv);

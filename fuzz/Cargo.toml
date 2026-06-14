@@ -13,6 +13,9 @@ x25519-dalek = "2"
 
 [dependencies.norn-rs]
 path = ".."
+# Fuzz targets exercise the opt-in onion routing too (fuzz_sphinx, and the
+# CapabilityAnnounce decode in fuzz_packet_decode).
+features = ["sphinx"]
 
 # Prevent this from interfering with workspace
 [workspace]

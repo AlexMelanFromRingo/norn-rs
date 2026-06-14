@@ -25,9 +25,11 @@ pub const TYPE_HOLE_PUNCH: u8 = 14;
 /// or when TTL runs out. Receiver caches (peer, tag) as a negative entry for
 /// a short TTL so the next packet picks an alternative neighbour.
 pub const TYPE_PATH_NEGATIVE: u8 = 15;
-// 0x10 (16) = TYPE_ONION_SPHINX, defined in `crate::sphinx`.
+// 0x10 (16) = TYPE_ONION_SPHINX, defined in `crate::sphinx` (feature "sphinx").
 /// Signed, flooded capability gossip — see [`CapabilityAnnounce`]. Additive:
 /// legacy nodes that don't know this byte drop it via the dispatcher's `_` arm.
+/// Part of the opt-in `sphinx` feature.
+#[cfg(feature = "sphinx")]
 pub const TYPE_CAPABILITIES: u8 = 0x11;
 
 /// Encode a uvarint into a byte buffer.
@@ -897,6 +899,8 @@ impl CoordAnnounce {
 }
 
 /// Capability bit: this node can receive/relay `TYPE_ONION_SPHINX` cells.
+/// Part of the opt-in `sphinx` feature.
+#[cfg(feature = "sphinx")]
 pub const CAP_ONION_SPHINX: u32 = 1 << 0;
 
 /// Signed, flooded advertisement of a node's protocol capabilities. Modelled on
@@ -908,7 +912,9 @@ pub const CAP_ONION_SPHINX: u32 = 1 << 0;
 /// Wire layout (116 bytes):
 ///   [origin:32][caps:u32 LE][seq:u64 LE][valid_from_ms:u64 LE][sig:64]
 ///
-/// `sig` covers `origin || caps || seq || valid_from_ms`.
+/// `sig` covers `origin || caps || seq || valid_from_ms`. Part of the opt-in
+/// `sphinx` feature.
+#[cfg(feature = "sphinx")]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CapabilityAnnounce {
     pub origin: [u8; 32],
@@ -918,6 +924,7 @@ pub struct CapabilityAnnounce {
     pub sig: [u8; 64],
 }
 
+#[cfg(feature = "sphinx")]
 impl CapabilityAnnounce {
     /// Bytes the origin signs (everything but the signature).
     pub fn sign_bytes(&self) -> Vec<u8> {
@@ -962,6 +969,7 @@ impl CapabilityAnnounce {
 mod tests {
     use super::*;
 
+    #[cfg(feature = "sphinx")]
     #[test]
     fn capability_announce_roundtrip() {
         let ann = CapabilityAnnounce {
@@ -977,12 +985,14 @@ mod tests {
         assert_eq!(CapabilityAnnounce::decode(&enc[1..]).unwrap(), ann);
     }
 
+    #[cfg(feature = "sphinx")]
     #[test]
     fn capability_announce_decode_truncated_fails() {
         assert!(CapabilityAnnounce::decode(&[]).is_err());
         assert!(CapabilityAnnounce::decode(&[0u8; 115]).is_err()); // one short of 116
     }
 
+    #[cfg(feature = "sphinx")]
     #[test]
     fn capability_sign_bytes_changes_with_each_field_but_not_sig() {
         let base = CapabilityAnnounce {
