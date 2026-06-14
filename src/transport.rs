@@ -6,7 +6,7 @@
 // session layer — TCP is just a reliable byte pipe.
 
 use anyhow::{bail, Context, Result};
-use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use rand::rngs::OsRng;
 use rand::RngCore;
 use std::collections::HashMap;
@@ -205,7 +205,7 @@ pub(crate) fn verify_handshake_sig(
     buf.extend_from_slice(our_nonce);
     buf.extend_from_slice(their_pub_for_msg);
     buf.extend_from_slice(our_pub_for_msg);
-    vk.verify(&buf, &Signature::from_bytes(sig))
+    vk.verify_strict(&buf, &Signature::from_bytes(sig))
         .context("handshake: signature verification failed")
 }
 

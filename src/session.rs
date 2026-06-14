@@ -15,7 +15,7 @@
 
 use anyhow::{bail, Context, Result};
 use chacha20poly1305::{AeadInPlace, ChaCha20Poly1305, Key, KeyInit, Nonce};
-use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use hkdf::Hkdf;
 use ml_kem::array::Array;
 use ml_kem::kem::{Decapsulate, Encapsulate, Kem};
@@ -452,7 +452,13 @@ impl SessionInfo {
 
         // Anti-replay sliding window (64 slots).
         const WINDOW: u64 = 64;
-        if seq + WINDOW <= self.remote_seq_high {
+        // `seq` is attacker-controlled and parsed BEFORE AEAD authentication, so
+        // it can be any u64. Use saturating arithmetic: a naive `seq + WINDOW`
+        // overflows for seq near u64::MAX — panicking under debug/test
+        // (overflow-checks) and wrapping in release, where the wrapped value
+        // only "accidentally" still rejects. saturating_sub is correct for all
+        // inputs: seq > high → 0 (not old); seq ≤ high → high-seq.
+        if self.remote_seq_high.saturating_sub(seq) >= WINDOW {
             bail!("replay: seq {} too old (high={})", seq, self.remote_seq_high);
         }
         if seq <= self.remote_seq_high {
@@ -677,7 +683,7 @@ impl SessionInit {
             &self.ed_pub, &self.x25519_pub, self.timestamp_ms, &self.recipient_ed_pub,
             &self.ml_kem_pub,
         );
-        vk.verify(&sign_data, &Signature::from_bytes(&self.signature))?;
+        vk.verify_strict(&sign_data, &Signature::from_bytes(&self.signature))?;
         Ok(())
     }
 }
@@ -771,7 +777,7 @@ impl SessionAck {
             &self.ed_pub, &self.x25519_pub, self.timestamp_ms, &self.recipient_ed_pub,
             &self.ml_kem_ct,
         );
-        vk.verify(&sign_data, &Signature::from_bytes(&self.signature))?;
+        vk.verify_strict(&sign_data, &Signature::from_bytes(&self.signature))?;
         Ok(())
     }
 }
@@ -1918,5 +1924,23 @@ mod tests {
         mgr.init_rate_log.insert(src, vec![old; MAX_INITS_PER_WINDOW]);
         assert!(!mgr.rate_limited(&src),
             "old timestamps (>WINDOW) must be evicted, freeing the source's quota");
+    }
+
+    #[test]
+    fn decrypt_hostile_max_seq_is_rejected_not_panic() {
+        // Regression: `seq` is parsed from the wire BEFORE AEAD authentication,
+        // so an attacker can set seq=u64::MAX. The old replay check did
+        // `seq + WINDOW`, which overflows — panicking under test/debug
+        // overflow-checks and wrapping in release. Must reject cleanly.
+        let local = StaticSecret::random_from_rng(OsRng);
+        let remote_pub = X25519PublicKey::from(&StaticSecret::random_from_rng(OsRng));
+        let mut info = SessionInfo::new([7u8; 32], local, remote_pub);
+        info.established = true;
+        let mut ct = Vec::new();
+        ct.extend_from_slice(&[0u8; 32]);              // sender x25519 pub
+        ct.extend_from_slice(&u64::MAX.to_le_bytes()); // hostile seq
+        ct.extend_from_slice(&[0u8; 16]);              // tag-sized garbage
+        // Must return Err (AEAD fails on garbage) and, crucially, not panic.
+        assert!(info.decrypt(&ct).is_err());
     }
 }
