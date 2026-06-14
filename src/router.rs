@@ -3523,6 +3523,110 @@ impl PacketConn {
         Ok(())
     }
 
+    /// Like [`Self::write_to_onion`] but builds a fixed-size Sphinx-style cell
+    /// (`crate::sphinx`) — no per-layer cleartext length, so no onion-depth leak
+    /// (REVIEW-FINDINGS #3). Additive and opt-in: every hop on the path (relays
+    /// and `dst`) must understand `TYPE_ONION_SPHINX`, so callers must negotiate
+    /// support before using this (a capability bit in CoordAnnounce is the planned
+    /// signal). `relays.len() + 1` must be ≤ `sphinx::MAX_HOPS`, and the
+    /// session-encrypted Traffic must fit `sphinx::MAX_TRAFFIC_LEN`.
+    ///
+    /// The session-setup + Traffic-build prefix mirrors `write_to_onion`
+    /// deliberately (kept separate so the proven legacy path is untouched).
+    #[mutants::skip]
+    pub async fn write_to_onion_sphinx(
+        &self,
+        payload: &[u8],
+        dst: &[u8; 32],
+        relays: &[crate::onion::OnionHop],
+    ) -> Result<()> {
+        if relays.is_empty() {
+            return self.write_to(payload, dst).await;
+        }
+        if relays.len() + 1 > crate::sphinx::MAX_HOPS {
+            bail!(
+                "sphinx onion: {} relays + dst exceeds MAX_HOPS {}",
+                relays.len(), crate::sphinx::MAX_HOPS
+            );
+        }
+        let dest_hop = self.onion_hop_for(dst).ok_or_else(|| {
+            anyhow::anyhow!(
+                "no onion ephemeral pub known for dst {:?}; wait for CoordAnnounce or use write_to",
+                &dst[..4]
+            )
+        })?;
+
+        // Session must be established (else kick off the handshake and bail).
+        {
+            let established = {
+                let state = self.inner.lock_or_recover();
+                state.sessions.read_or_recover().is_established(dst)
+            };
+            if !established {
+                let init_data = {
+                    let state = self.inner.lock_or_recover();
+                    let mut sm = state.sessions.write_or_recover();
+                    sm.get_or_initiate_bytes(dst).unwrap_or_default()
+                };
+                if !init_data.is_empty() {
+                    self.inner.lock_or_recover().send_traffic_to(dst, init_data);
+                }
+                bail!("session not established with {:?}", &dst[..4]);
+            }
+        }
+
+        let padded = pad_payload(payload);
+        let ciphertext = {
+            let state = self.inner.lock_or_recover();
+            state.sessions.read_or_recover().encrypt(dst, &padded)?
+        };
+        let pub_key = self.pub_key;
+        let (enc_header, tag) = encrypt_header(&pub_key, dst);
+        let traffic = Traffic {
+            path: vec![],
+            from: pub_key,
+            enc_header,
+            routing_tag: tag,
+            pkt_type: packet::PKT_DATA,
+            watermark: 0,
+            payload: ciphertext,
+        };
+        let traffic_bytes = traffic.encode();
+        if traffic_bytes.len() > crate::sphinx::MAX_TRAFFIC_LEN {
+            bail!(
+                "sphinx onion: Traffic {} B exceeds payload budget {} B (use fewer hops or smaller payload)",
+                traffic_bytes.len(), crate::sphinx::MAX_TRAFFIC_LEN
+            );
+        }
+
+        // Map (relays.., dst) → Sphinx hops. Each hop's tag is BLAKE2b of its
+        // identity; its onion_pub is the advertised ephemeral (FS) or the
+        // identity-derived fallback (see onion_hop_for).
+        let mut hops: Vec<crate::sphinx::SphinxHop> = relays
+            .iter()
+            .map(|h| crate::sphinx::SphinxHop {
+                routing_tag: routing_tag(&h.identity_ed_pub),
+                onion_pub: h.ephemeral_x_pub,
+            })
+            .collect();
+        hops.push(crate::sphinx::SphinxHop {
+            routing_tag: routing_tag(&dest_hop.identity_ed_pub),
+            onion_pub: dest_hop.ephemeral_x_pub,
+        });
+
+        let cell = crate::sphinx::build_sphinx(&hops, &traffic_bytes)
+            .map_err(|e| anyhow::anyhow!("build sphinx cell: {e}"))?;
+
+        let first_relay = relays[0].identity_ed_pub;
+        let next_hop = self.inner.lock_or_recover().lookup(&first_relay);
+        if let Some(next) = next_hop {
+            self.inner.lock_or_recover().send_to_peer(&next, cell);
+        } else {
+            bail!("no route to first relay {:?}", &first_relay[..4]);
+        }
+        Ok(())
+    }
+
     pub fn mtu(&self) -> u64 {
         // u16::MAX - 2 (length header) - 16 (AEAD tag) - 128 (enc_header)
         // - small overhead; keep round number that's safely below u16::MAX.
