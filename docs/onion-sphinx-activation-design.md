@@ -140,9 +140,28 @@ fn write_to_onion(payload, dst, relays):
 
 ## 9. Implementation phases (each: TDD, commit, push)
 
-1. `packet.rs`: `CapabilityAnnounce` + `TYPE_CAPABILITIES` + tests.
-2. `router.rs`: state, `broadcast_capabilities`, `handle_capabilities`, dispatch
-   arm, cleanup/eviction + tests.
-3. `OnionFormat` config + plumbing (`set_onion_format`) + `path_supports_sphinx` +
-   `write_to_onion` selection + tests.
-4. Wire broadcast into the maintenance tick; REVIEW-FINDINGS + design updates.
+1. ✅ `packet.rs`: `CapabilityAnnounce` + `TYPE_CAPABILITIES` + `CAP_ONION_SPHINX`
+   + tests (round-trip, truncation, per-field sign_bytes).
+2. ✅ `router.rs`: `peer_capabilities`/`own_caps_seq` state (bounded + non-peer
+   eviction), `broadcast_capabilities`, `handle_capabilities`, `record_capability`,
+   dispatch arm, maintenance-tick broadcast (tick 1 then every ~60 s). Read-time
+   freshness in `path_supports_sphinx` covers expiry (no separate sweep needed).
+   Tests: record / dedup / reject(bad-sig, stale, self).
+3. ✅ `OnionFormat` config (Auto default / Sphinx / Legacy) + plumbing
+   (`set_onion_format`, `Node::new`), `path_supports_sphinx`, and `write_to_onion`
+   selection. Tests: every-hop-capable required; > MAX_HOPS rejected.
+4. ✅ Maintenance-tick broadcast wired; design + REVIEW-FINDINGS updated.
+
+**Result:** with the default `onion_format = auto`, a node automatically builds the
+Sphinx onion on any path whose every hop has gossiped `CAP_ONION_SPHINX`, and falls
+back to the legacy onion otherwise — so the depth leak is closed wherever the path
+supports it, with zero impact on legacy nodes. 460 norn-rs tests pass, clippy clean,
+release build clean.
+
+### Remaining / optional
+- `spec/norn.pv` ProVerif note for the new header + capability flood.
+- Optional `fuzz_targets/fuzz_sphinx_process` (panic-safety already unit-tested).
+- Optional §9 hardening from the format design (ristretto blinding, LIONESS).
+- Onion routing itself is still only reachable via `PacketConn::write_to_onion`
+  (no internal callers today); wiring it into a data plane is a separate product
+  decision, now leak-free when it happens.
