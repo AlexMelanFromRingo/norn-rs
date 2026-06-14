@@ -18,8 +18,9 @@ default = ["tun-support"]
 tun-support = ["dep:tun2"]
 # Opt-in fixed-size (Sphinx-style) onion routing + capability negotiation.
 # OFF by default: the default build keeps the original protocol behaviour
-# (no CapabilityAnnounce flooding, no Sphinx cell construction/selection).
-sphinx = []
+# (no CapabilityAnnounce flooding, no Sphinx cell construction/selection) and
+# does NOT pull the chacha20 dep — it's enabled only with this feature.
+sphinx = ["dep:chacha20"]
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
@@ -27,8 +28,10 @@ ed25519-dalek = { version = "2", features = ["rand_core"] }
 x25519-dalek = { version = "2", features = ["reusable_secrets", "static_secrets"] }
 chacha20poly1305 = "0.10"
 # Raw ChaCha20 keystream PRG for the Sphinx-style onion header/payload (src/sphinx.rs).
-# Same version chacha20poly1305 already pulls in, so no new tree entry.
-chacha20 = "0.9"
+# Optional: only pulled in by the `sphinx` feature, so the default build's
+# dependency graph is unchanged from the original. Same version chacha20poly1305
+# already uses transitively.
+chacha20 = { version = "0.9", optional = true }
 blake2 = "0.10"
 rand = "0.8"
 hex = "0.4"
