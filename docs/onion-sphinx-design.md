@@ -59,12 +59,21 @@ HOP_PAYLOAD       = FLAGS_LEN+TAG_LEN+EPK_LEN = 49   (per-hop routing for next h
 PER_HOP           = HOP_PAYLOAD + MAC_LEN     = 65    (β block consumed per hop)
 BETA_LEN          = PER_HOP * MAX_HOPS        = 325   (routing header, constant)
 HEADER_LEN        = EPK_LEN + MAC_LEN + BETA_LEN = 373
-PAYLOAD_LEN       = ONION_CELL_SIZE - 1 - HEADER_LEN = 906
+PAYLOAD_LEN       = ONION_CELL_SIZE - 1 - TAG_LEN - HEADER_LEN = 890
 ```
 
-Wire cell: `[TYPE_ONION_SPHINX:1][epk:32][gamma:16][beta:325][payload:906]` = 1280.
+Wire cell: `[TYPE_ONION_SPHINX:1][routing_tag:16][epk:32][gamma:16][beta:325][payload:890]`
+= 1280.
 
-`MAX_HOPS=5` keeps a 906-byte payload (vs the legacy onion's ~1100 effective). This
+The leading **cleartext `routing_tag`** is per-segment routing metadata: norn's
+onion hops are not necessarily direct neighbours, so — exactly as the legacy onion
+does with its outer tag — the mesh greedily routes the cell to the current onion hop
+on this tag, and each peeling hop rewrites it to the next hop's tag. It is **not**
+covered by the MAC (mutable hop-by-hop, like an IP header); the authenticated `beta`
+carries the real routing. It changes every onion hop, so it leaks neither path
+length nor position.
+
+`MAX_HOPS=5` keeps an 890-byte payload (vs the legacy onion's ~1100 effective). This
 is the inherent MTU cost of a constant-size onion; §9's blinding optimisation would
 recover ~160 B by replacing the per-hop epks with one element.
 

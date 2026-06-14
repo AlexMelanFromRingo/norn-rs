@@ -6,8 +6,11 @@
 //! byte-for-byte structurally identical at every hop:
 //!
 //! ```text
-//! [TYPE_ONION_SPHINX:1][epk:32][gamma:16][beta:325][payload:906]   = 1280
+//! [TYPE_ONION_SPHINX:1][routing_tag:16][epk:32][gamma:16][beta:325][payload:890] = 1280
 //! ```
+//! `routing_tag` is cleartext per-segment routing metadata (mesh routes the cell to
+//! the current onion hop on it, like the legacy onion's outer tag); each peeling hop
+//! rewrites it to the next hop's tag. Everything else is fresh-pseudorandom per hop.
 //!
 //! The routing header (`beta`) is kept constant-size across hops by the Sphinx
 //! filler trick (BOLT-04 mechanics). Per-hop X25519 ephemerals are independent
@@ -47,18 +50,22 @@ const HEADER_LEN: usize = EPK_LEN + MAC_LEN + BETA_LEN; // 373
 /// Total cell size on the wire — identical to the legacy onion cell.
 pub const CELL_SIZE: usize = crate::onion::ONION_CELL_SIZE; // 1280
 /// Constant onion payload budget (the innermost `[len:2][traffic][pad]`).
-pub const PAYLOAD_LEN: usize = CELL_SIZE - 1 - HEADER_LEN; // 906
+pub const PAYLOAD_LEN: usize = CELL_SIZE - 1 - TAG_LEN - HEADER_LEN; // 890
 
 const FLAG_FORWARD: u8 = 0x00;
 const FLAG_EXIT: u8 = 0x01;
 
-// Wire offsets within a cell (after the 1-byte type).
-const OFF_EPK: usize = 1;
-const OFF_GAMMA: usize = OFF_EPK + EPK_LEN; // 33
-const OFF_BETA: usize = OFF_GAMMA + MAC_LEN; // 49
-const OFF_PAYLOAD: usize = OFF_BETA + BETA_LEN; // 374
+// Wire offsets within a cell (after the 1-byte type). The cleartext `routing_tag`
+// (per-segment, mutable) lets the mesh greedily route the cell to the current
+// onion hop, exactly like the legacy onion's outer tag. It is NOT covered by the
+// MAC — it is routing metadata, rewritten by each peeling hop to the next tag.
+const OFF_TAG: usize = 1;
+const OFF_EPK: usize = OFF_TAG + TAG_LEN; // 17
+const OFF_GAMMA: usize = OFF_EPK + EPK_LEN; // 49
+const OFF_BETA: usize = OFF_GAMMA + MAC_LEN; // 65
+const OFF_PAYLOAD: usize = OFF_BETA + BETA_LEN; // 390
 
-const _: () = assert!(1 + HEADER_LEN + PAYLOAD_LEN == CELL_SIZE);
+const _: () = assert!(1 + TAG_LEN + HEADER_LEN + PAYLOAD_LEN == CELL_SIZE);
 const _: () = assert!(OFF_PAYLOAD + PAYLOAD_LEN == CELL_SIZE);
 // Max bytes of caller traffic that fit (2-byte length prefix lives inside payload).
 /// Largest `traffic` payload `build` accepts.
@@ -194,6 +201,7 @@ pub fn build_sphinx(hops: &[SphinxHop], traffic: &[u8]) -> Result<Vec<u8>> {
 
     let mut cell = Vec::with_capacity(CELL_SIZE);
     cell.push(TYPE_ONION_SPHINX);
+    cell.extend_from_slice(&hops[0].routing_tag); // cleartext per-segment routing tag
     cell.extend_from_slice(&epks[0]);
     cell.extend_from_slice(&mac_acc); // gamma_0
     cell.extend_from_slice(&beta);
@@ -208,7 +216,7 @@ pub fn build_sphinx(hops: &[SphinxHop], traffic: &[u8]) -> Result<Vec<u8>> {
 /// (current / previous / identity-derived) and uses the one whose derived key
 /// authenticates `beta`. Returns `Forward` or `Deliver`; never panics on
 /// malformed input (only the fixed `CELL_SIZE` is asserted up front).
-pub fn process_sphinx(cell: &[u8], onion_privs: &[StaticSecret]) -> Result<SphinxPeeled> {
+pub fn process_sphinx(cell: &[u8], onion_privs: &[&StaticSecret]) -> Result<SphinxPeeled> {
     if cell.len() != CELL_SIZE {
         bail!("sphinx process: cell is {} bytes, expected {CELL_SIZE}", cell.len());
     }
@@ -222,7 +230,7 @@ pub fn process_sphinx(cell: &[u8], onion_privs: &[StaticSecret]) -> Result<Sphin
 
     // Identify our key via the MAC (also the "is this for me?" check).
     let mut shared: Option<[u8; 32]> = None;
-    for priv_ in onion_privs {
+    for &priv_ in onion_privs {
         let s = x25519_shared(priv_, &epk);
         if bool::from(mac16(&mu_key(&s), beta)[..].ct_eq(gamma)) {
             shared = Some(s);
@@ -259,6 +267,7 @@ pub fn process_sphinx(cell: &[u8], onion_privs: &[StaticSecret]) -> Result<Sphin
         FLAG_FORWARD => {
             let mut next_cell = Vec::with_capacity(CELL_SIZE);
             next_cell.push(TYPE_ONION_SPHINX);
+            next_cell.extend_from_slice(&next_tag); // rewrite the per-segment routing tag
             next_cell.extend_from_slice(next_epk);
             next_cell.extend_from_slice(next_mac);
             next_cell.extend_from_slice(beta2);
@@ -268,6 +277,20 @@ pub fn process_sphinx(cell: &[u8], onion_privs: &[StaticSecret]) -> Result<Sphin
         }
         other => bail!("sphinx process: unknown flags byte 0x{other:02x}"),
     }
+}
+
+/// Replay-cache digest for a cell: BLAKE2b over (epk || first 16 `beta` bytes) —
+/// the per-hop-fresh fields. The mutable cleartext routing tag is deliberately
+/// excluded so a relay can't dodge the cache by rewriting it. `None` on bad size.
+pub fn replay_digest(cell: &[u8]) -> Option<[u8; 32]> {
+    if cell.len() != CELL_SIZE {
+        return None;
+    }
+    let mut h = Blake2b::<U32>::new();
+    h.update(b"norn:sphinx-replay");
+    h.update(&cell[OFF_EPK..OFF_EPK + EPK_LEN]);
+    h.update(&cell[OFF_BETA..OFF_BETA + 16]);
+    Some(h.finalize().into())
 }
 
 #[cfg(test)]
@@ -296,7 +319,9 @@ mod tests {
         for (i, priv_) in privs.iter().enumerate() {
             assert_eq!(cell.len(), CELL_SIZE, "hop {i}: cell must stay constant size");
             assert_eq!(cell[0], TYPE_ONION_SPHINX, "hop {i}: type byte preserved");
-            match process_sphinx(&cell, std::slice::from_ref(priv_)).expect("process") {
+            assert_eq!(&cell[OFF_TAG..OFF_TAG + TAG_LEN], &hops[i].routing_tag,
+                "hop {i}: cleartext routing tag must address this hop");
+            match process_sphinx(&cell, &[priv_]).expect("process") {
                 SphinxPeeled::Forward { next_tag, cell: next } => {
                     assert!(i < nu - 1, "hop {i} forwarded but should have delivered");
                     assert_eq!(next_tag, hops[i + 1].routing_tag, "hop {i}: wrong next tag");
@@ -347,7 +372,7 @@ mod tests {
         let (hops, privs) = make_hops(3);
         let mut cell = build_sphinx(&hops, b"payload").unwrap();
         cell[OFF_BETA + 10] ^= 0xFF; // flip a beta byte
-        assert!(process_sphinx(&cell, std::slice::from_ref(&privs[0])).is_err(),
+        assert!(process_sphinx(&cell, &[&privs[0]]).is_err(),
             "tampered beta must fail the MAC, not forward");
     }
 
@@ -356,7 +381,7 @@ mod tests {
         let (hops, privs) = make_hops(2);
         let mut cell = build_sphinx(&hops, b"x").unwrap();
         cell[OFF_GAMMA] ^= 0x01;
-        assert!(process_sphinx(&cell, std::slice::from_ref(&privs[0])).is_err());
+        assert!(process_sphinx(&cell, &[&privs[0]]).is_err());
     }
 
     #[test]
@@ -364,7 +389,7 @@ mod tests {
         let (hops, _privs) = make_hops(3);
         let cell = build_sphinx(&hops, b"x").unwrap();
         let stranger = StaticSecret::random_from_rng(OsRng);
-        assert!(process_sphinx(&cell, std::slice::from_ref(&stranger)).is_err(),
+        assert!(process_sphinx(&cell, &[&stranger]).is_err(),
             "a relay not on the path must not authenticate the cell");
     }
 
@@ -372,14 +397,14 @@ mod tests {
     fn process_never_panics_on_garbage() {
         let sk = StaticSecret::random_from_rng(OsRng);
         // wrong size
-        assert!(process_sphinx(&[0u8; 10], std::slice::from_ref(&sk)).is_err());
+        assert!(process_sphinx(&[0u8; 10], &[&sk]).is_err());
         // right size, random content (wrong type byte / MAC)
         let mut junk = vec![0u8; CELL_SIZE];
         OsRng.fill_bytes(&mut junk);
-        let _ = process_sphinx(&junk, std::slice::from_ref(&sk)); // must not panic
+        let _ = process_sphinx(&junk, &[&sk]); // must not panic
         // right type byte, random rest
         junk[0] = TYPE_ONION_SPHINX;
-        assert!(process_sphinx(&junk, std::slice::from_ref(&sk)).is_err());
+        assert!(process_sphinx(&junk, &[&sk]).is_err());
     }
 
     #[test]
