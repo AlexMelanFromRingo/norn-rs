@@ -16,6 +16,12 @@
 (*        previously ran the protocol with peer pk_I.                       *)
 (*    Q3  An Init message bound to recipient R cannot be replayed against   *)
 (*        any other recipient R' to make R' establish a session.            *)
+(*                                                                          *)
+(*  Scope: this model covers the session HANDSHAKE. The onion layer         *)
+(*  (Sphinx) and capability negotiation are documented — with their         *)
+(*  security properties and an informal authenticity argument — in          *)
+(*  docs/FORMAL.md ("Onion layer & capability negotiation"). Capability     *)
+(*  authenticity reduces to the same sign/verify primitive used below.      *)
 (* ─────────────────────────────────────────────────────────────────────── *)
 
 free c: channel.                                  (* the network *)
