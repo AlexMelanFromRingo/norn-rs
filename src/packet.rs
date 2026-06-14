@@ -25,6 +25,12 @@ pub const TYPE_HOLE_PUNCH: u8 = 14;
 /// or when TTL runs out. Receiver caches (peer, tag) as a negative entry for
 /// a short TTL so the next packet picks an alternative neighbour.
 pub const TYPE_PATH_NEGATIVE: u8 = 15;
+// 0x10 (16) = TYPE_ONION_SPHINX, defined in `crate::sphinx` (feature "sphinx").
+/// Signed, flooded capability gossip — see [`CapabilityAnnounce`]. Additive:
+/// legacy nodes that don't know this byte drop it via the dispatcher's `_` arm.
+/// Part of the opt-in `sphinx` feature.
+#[cfg(feature = "sphinx")]
+pub const TYPE_CAPABILITIES: u8 = 0x11;
 
 /// Encode a uvarint into a byte buffer.
 // Skip all mutations of this function: two are permanently untestable —
@@ -892,9 +898,117 @@ impl CoordAnnounce {
     }
 }
 
+/// Capability bit: this node can receive/relay `TYPE_ONION_SPHINX` cells.
+/// Part of the opt-in `sphinx` feature.
+#[cfg(feature = "sphinx")]
+pub const CAP_ONION_SPHINX: u32 = 1 << 0;
+
+/// Signed, flooded advertisement of a node's protocol capabilities. Modelled on
+/// [`OnionKeyAnnounce`]: receivers verify, dedup by `(origin, seq)`, store
+/// `origin → caps`, and flood-forward. Lets a sender learn which nodes can process
+/// a given onion format before choosing it (so it never sends a `TYPE_ONION_SPHINX`
+/// cell to a legacy node, which would silently drop it).
+///
+/// Wire layout (116 bytes):
+///   [origin:32][caps:u32 LE][seq:u64 LE][valid_from_ms:u64 LE][sig:64]
+///
+/// `sig` covers `origin || caps || seq || valid_from_ms`. Part of the opt-in
+/// `sphinx` feature.
+#[cfg(feature = "sphinx")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CapabilityAnnounce {
+    pub origin: [u8; 32],
+    pub caps: u32,
+    pub seq: u64,
+    pub valid_from_ms: u64,
+    pub sig: [u8; 64],
+}
+
+#[cfg(feature = "sphinx")]
+impl CapabilityAnnounce {
+    /// Bytes the origin signs (everything but the signature).
+    pub fn sign_bytes(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(32 + 4 + 8 + 8);
+        buf.extend_from_slice(&self.origin);
+        buf.extend_from_slice(&self.caps.to_le_bytes());
+        buf.extend_from_slice(&self.seq.to_le_bytes());
+        buf.extend_from_slice(&self.valid_from_ms.to_le_bytes());
+        buf
+    }
+
+    pub fn encode(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(1 + 32 + 4 + 8 + 8 + 64);
+        buf.push(TYPE_CAPABILITIES);
+        buf.extend_from_slice(&self.origin);
+        buf.extend_from_slice(&self.caps.to_le_bytes());
+        buf.extend_from_slice(&self.seq.to_le_bytes());
+        buf.extend_from_slice(&self.valid_from_ms.to_le_bytes());
+        buf.extend_from_slice(&self.sig);
+        buf
+    }
+
+    /// Decode from bytes *without* the leading TYPE byte.
+    pub fn decode(data: &[u8]) -> Result<Self> {
+        let need = 32 + 4 + 8 + 8 + 64;
+        if data.len() < need {
+            bail!("CapabilityAnnounce too short: got {} (need {})", data.len(), need);
+        }
+        let mut pos = 0;
+        let mut origin = [0u8; 32];
+        origin.copy_from_slice(&data[pos..pos + 32]); pos += 32;
+        let caps = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()); pos += 4;
+        let seq = u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap()); pos += 8;
+        let valid_from_ms = u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap()); pos += 8;
+        let mut sig = [0u8; 64];
+        sig.copy_from_slice(&data[pos..pos + 64]);
+        Ok(CapabilityAnnounce { origin, caps, seq, valid_from_ms, sig })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "sphinx")]
+    #[test]
+    fn capability_announce_roundtrip() {
+        let ann = CapabilityAnnounce {
+            origin: [0x11u8; 32],
+            caps: CAP_ONION_SPHINX,
+            seq: 0xDEAD_BEEF,
+            valid_from_ms: 1_700_000_000_123,
+            sig: [0x5Au8; 64],
+        };
+        let enc = ann.encode();
+        assert_eq!(enc[0], TYPE_CAPABILITIES);
+        assert_eq!(enc.len(), 1 + 32 + 4 + 8 + 8 + 64);
+        assert_eq!(CapabilityAnnounce::decode(&enc[1..]).unwrap(), ann);
+    }
+
+    #[cfg(feature = "sphinx")]
+    #[test]
+    fn capability_announce_decode_truncated_fails() {
+        assert!(CapabilityAnnounce::decode(&[]).is_err());
+        assert!(CapabilityAnnounce::decode(&[0u8; 115]).is_err()); // one short of 116
+    }
+
+    #[cfg(feature = "sphinx")]
+    #[test]
+    fn capability_sign_bytes_changes_with_each_field_but_not_sig() {
+        let base = CapabilityAnnounce {
+            origin: [0xAAu8; 32], caps: 0, seq: 1, valid_from_ms: 100, sig: [0u8; 64],
+        };
+        let mut c_origin = base.clone(); c_origin.origin = [0xBBu8; 32];
+        let mut c_caps = base.clone();   c_caps.caps = CAP_ONION_SPHINX;
+        let mut c_seq = base.clone();    c_seq.seq = 2;
+        let mut c_ts = base.clone();     c_ts.valid_from_ms = 101;
+        assert_ne!(base.sign_bytes(), c_origin.sign_bytes());
+        assert_ne!(base.sign_bytes(), c_caps.sign_bytes());
+        assert_ne!(base.sign_bytes(), c_seq.sign_bytes());
+        assert_ne!(base.sign_bytes(), c_ts.sign_bytes());
+        let mut c_sig = base.clone(); c_sig.sig = [0xFFu8; 64];
+        assert_eq!(base.sign_bytes(), c_sig.sign_bytes(), "sig must not be covered");
+    }
 
     #[test]
     fn uvarint_roundtrip() {

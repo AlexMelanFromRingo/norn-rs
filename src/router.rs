@@ -259,6 +259,18 @@ const ONION_KEY_VALIDITY_MS: u64 = 24 * 60 * 60 * 1_000;
 /// Cap on remembered foreign onion keys (LRU-ish via HashMap, evicts on insert
 /// when full — see record_remote_onion_key).
 const MAX_REMOTE_ONION_KEYS: usize = 16_384;
+/// Re-flood our CapabilityAnnounce every N ticks (≈ 60 s), and once at tick 1, so
+/// newly-joined peers learn our capabilities promptly. Caps are static, so the
+/// seq-dedup makes re-floods cheap.
+#[cfg(feature = "sphinx")]
+const CAPABILITY_BROADCAST_TICKS: u32 = 60;
+/// Maximum age (ms) of a CapabilityAnnounce we still trust / forward.
+#[cfg(feature = "sphinx")]
+const CAPABILITY_VALIDITY_MS: u64 = 24 * 60 * 60 * 1_000;
+/// Cap on remembered foreign capability records (evicts a non-peer entry on
+/// insert when full — mirrors record_remote_onion_key).
+#[cfg(feature = "sphinx")]
+const MAX_CAPABILITY_ENTRIES: usize = 16_384;
 /// Issue one path-validation probe every N maintenance ticks.
 const PROBE_INTERVAL_TICKS: u32 = 15;
 /// How long a `(peer, routing_tag)` negative-route hint stays in cache.
@@ -517,6 +529,18 @@ struct RouterState {
     remote_onion_keys: HashMap<[u8; 32], (u64, [u8; 32], Instant)>,
     /// Monotonic seq for our own OnionKeyAnnounce broadcasts.
     own_onion_key_seq: u64,
+    /// Network-wide table of advertised capabilities per identity, from
+    /// CapabilityAnnounce floods. (caps_bitfield, seq, recorded_at); latest seq
+    /// per origin wins. A sender consults this before choosing the Sphinx onion.
+    #[cfg(feature = "sphinx")]
+    peer_capabilities: HashMap<[u8; 32], (u32, u64, Instant)>,
+    /// Monotonic seq for our own CapabilityAnnounce broadcasts.
+    #[cfg(feature = "sphinx")]
+    own_caps_seq: u64,
+    /// Which onion format we BUILD when sending (config; default Auto). Inbound
+    /// always accepts both. See `path_supports_sphinx` for the Auto decision.
+    #[cfg(feature = "sphinx")]
+    onion_format: crate::config::OnionFormat,
     /// Outgoing probe table: probe_id → (peer-we-sent-via, sent_at).
     /// On matching PathNotify → boost trust + remove. On timeout (handled
     /// in cleanup_stale_probes) → decay trust + remove.
@@ -820,6 +844,12 @@ impl RouterState {
             onion_seen_set: std::collections::HashSet::with_capacity(ONION_REPLAY_CACHE_SIZE),
             remote_onion_keys: HashMap::new(),
             own_onion_key_seq: 0,
+            #[cfg(feature = "sphinx")]
+            peer_capabilities: HashMap::new(),
+            #[cfg(feature = "sphinx")]
+            own_caps_seq: 0,
+            #[cfg(feature = "sphinx")]
+            onion_format: crate::config::OnionFormat::Auto,
             pending_probes: HashMap::new(),
             reputation: HashMap::new(),
             own_reputation_seq: 0,
@@ -1370,6 +1400,12 @@ impl RouterState {
         if self.tick == 1 || self.tick.is_multiple_of(ONION_KEY_ANNOUNCE_TICKS) {
             self.broadcast_onion_key_announce();
         }
+        // Capability gossip — cold-start at tick 1, then periodically so newly
+        // joined peers learn we accept the Sphinx onion.
+        #[cfg(feature = "sphinx")]
+        if self.tick == 1 || self.tick.is_multiple_of(CAPABILITY_BROADCAST_TICKS) {
+            self.broadcast_capabilities();
+        }
         // Active route validation: probe one cuckoo claim per cycle.
         if self.tick.is_multiple_of(PROBE_INTERVAL_TICKS) && self.tick > 0 {
             self.probe_cuckoo_claim();
@@ -1504,6 +1540,124 @@ impl RouterState {
                 self.send_to_peer(&pk, encoded.clone());
             }
         }
+    }
+
+    /// Periodic CapabilityAnnounce broadcast — mirrors broadcast_onion_key_announce:
+    /// strictly increasing seq, signed, self-recorded, flooded to all peers.
+    #[mutants::skip]
+    #[cfg(feature = "sphinx")]
+    fn broadcast_capabilities(&mut self) {
+        self.own_caps_seq += 1;
+        let seq = self.own_caps_seq;
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        // We always accept Sphinx cells inbound (the code is compiled in),
+        // independent of our own *send* preference, so advertise unconditionally.
+        let caps = crate::packet::CAP_ONION_SPHINX;
+        let unsigned = crate::packet::CapabilityAnnounce {
+            origin: self.pub_key,
+            caps,
+            seq,
+            valid_from_ms: now_ms,
+            sig: [0u8; 64],
+        };
+        let sig = self.signing_key.sign(&unsigned.sign_bytes()).to_bytes();
+        let ann = crate::packet::CapabilityAnnounce { sig, ..unsigned };
+        self.peer_capabilities.insert(self.pub_key, (caps, seq, Instant::now()));
+        let encoded = ann.encode();
+        let peer_keys: Vec<PeerId> = self.peers.keys().copied().collect();
+        for pk in peer_keys {
+            self.send_to_peer(&pk, encoded.clone());
+        }
+    }
+
+    /// Handle an incoming CapabilityAnnounce: verify, dedup by (origin, seq),
+    /// drop expired/future, record, then flood-forward to all peers but the sender.
+    #[cfg(feature = "sphinx")]
+    pub fn handle_capabilities(&mut self, from: PeerId, ann: crate::packet::CapabilityAnnounce) {
+        if ann.origin == self.pub_key {
+            return;
+        }
+        let vk = match VerifyingKey::from_bytes(&ann.origin) {
+            Ok(v) => v,
+            Err(_) => return,
+        };
+        if vk
+            .verify_strict(&ann.sign_bytes(), &ed25519_dalek::Signature::from_bytes(&ann.sig))
+            .is_err()
+        {
+            warn!("invalid CapabilityAnnounce sig from origin {:?}", &ann.origin[..4]);
+            return;
+        }
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        if now_ms.saturating_sub(ann.valid_from_ms) > CAPABILITY_VALIDITY_MS {
+            debug!("CapabilityAnnounce too old, dropping");
+            return;
+        }
+        if ann.valid_from_ms > now_ms.saturating_add(60_000) {
+            debug!("CapabilityAnnounce from too far in future, dropping");
+            return;
+        }
+        let is_newer = match self.peer_capabilities.get(&ann.origin) {
+            Some((_, prev_seq, _)) => ann.seq > *prev_seq,
+            None => true,
+        };
+        if !is_newer {
+            return;
+        }
+        self.record_capability(ann.origin, ann.caps, ann.seq);
+        let encoded = ann.encode();
+        let peer_keys: Vec<PeerId> = self.peers.keys().copied().collect();
+        for pk in peer_keys {
+            if pk != from {
+                self.send_to_peer(&pk, encoded.clone());
+            }
+        }
+    }
+
+    /// Record a peer's capabilities, bounded by MAX_CAPABILITY_ENTRIES (evicts a
+    /// non-peer entry when full). Mirrors record_remote_onion_key.
+    #[cfg(feature = "sphinx")]
+    fn record_capability(&mut self, origin: [u8; 32], caps: u32, seq: u64) {
+        if !self.peer_capabilities.contains_key(&origin)
+            && self.peer_capabilities.len() >= MAX_CAPABILITY_ENTRIES
+        {
+            let victim = self
+                .peer_capabilities
+                .keys()
+                .find(|k| !self.peers.contains_key(*k) && **k != self.pub_key)
+                .copied();
+            if let Some(v) = victim {
+                self.peer_capabilities.remove(&v);
+            } else {
+                return;
+            }
+        }
+        self.peer_capabilities.insert(origin, (caps, seq, Instant::now()));
+    }
+
+    /// Does every hop (relays + dst) advertise Sphinx support, recently enough,
+    /// and does the path fit `sphinx::MAX_HOPS`? Used by the Auto onion selector
+    /// so we never send a `TYPE_ONION_SPHINX` cell to a node that would drop it.
+    #[cfg(feature = "sphinx")]
+    fn path_supports_sphinx(&self, relays: &[crate::onion::OnionHop], dst: &[u8; 32]) -> bool {
+        if relays.len() + 1 > crate::sphinx::MAX_HOPS {
+            return false;
+        }
+        let supported = |id: &[u8; 32]| {
+            matches!(
+                self.peer_capabilities.get(id),
+                Some((caps, _, recorded))
+                    if caps & crate::packet::CAP_ONION_SPHINX != 0
+                        && recorded.elapsed() < Duration::from_millis(CAPABILITY_VALIDITY_MS)
+            )
+        };
+        relays.iter().all(|h| supported(&h.identity_ed_pub)) && supported(dst)
     }
 
     /// Pick one (peer, target_identity) pair where the peer's cuckoo claims
@@ -2520,10 +2674,14 @@ impl RouterState {
         h.update(pkt.epk);
         let prefix_len = pkt.aead_payload.len().min(16);
         h.update(&pkt.aead_payload[..prefix_len]);
-        let digest: [u8; 32] = h.finalize().into();
-        // O(1) membership test (was an O(n) linear scan over up to
-        // ONION_REPLAY_CACHE_SIZE entries on every onion packet). `insert`
-        // returns false iff the digest was already present → replay.
+        self.onion_digest_seen(h.finalize().into())
+    }
+
+    /// Record an onion replay digest; returns true if it was already seen.
+    /// Shared by the legacy onion and the Sphinx-style cell. O(1) membership via
+    /// the HashSet mirror; FIFO-evicted by `onion_seen` (bounded by
+    /// ONION_REPLAY_CACHE_SIZE). `insert` returns false iff already present.
+    fn onion_digest_seen(&mut self, digest: [u8; 32]) -> bool {
         if !self.onion_seen_set.insert(digest) {
             return true;
         }
@@ -2533,6 +2691,41 @@ impl RouterState {
         }
         self.onion_seen.push_back(digest);
         false
+    }
+
+    /// Handle an inbound Sphinx-style onion cell addressed to us (the dispatch
+    /// already matched the cleartext routing tag). Mirrors [`Self::handle_onion`]:
+    /// replay-check, MAC-authenticate + peel one layer, then forward the
+    /// constant-size cell toward the next tag or deliver the inner Traffic packet.
+    #[cfg(feature = "sphinx")]
+    pub fn handle_sphinx(&mut self, from: PeerId, cell: Vec<u8>) {
+        if let Some(peer) = self.peers.get_mut(&from) {
+            peer.last_rx_time = Instant::now();
+        }
+        if let Some(digest) = crate::sphinx::replay_digest(&cell)
+            && self.onion_digest_seen(digest) {
+            debug!("sphinx: replay detected, dropping");
+            return;
+        }
+        match crate::sphinx::process_sphinx(&cell, &self.onion_keys.sphinx_privs()) {
+            Ok(crate::sphinx::SphinxPeeled::Forward { next_tag, cell }) => {
+                if let Some(next) = self.lookup_by_tag_excluding(&next_tag, Some(from)) {
+                    self.send_to_peer(&next, cell);
+                } else {
+                    debug!("sphinx: no route for next tag {:?}", &next_tag[..4]);
+                    self.send_path_negative(from, next_tag, PATH_NEG_INITIAL_TTL);
+                }
+            }
+            Ok(crate::sphinx::SphinxPeeled::Deliver(traffic_bytes)) => {
+                if traffic_bytes.first() == Some(&TRAFFIC) {
+                    match Traffic::decode(&traffic_bytes[1..]) {
+                        Ok(traffic) => self.handle_traffic(from, traffic),
+                        Err(e) => debug!("sphinx: inner Traffic decode failed: {}", e),
+                    }
+                }
+            }
+            Err(e) => debug!("sphinx process failed from {:?}: {}", &from[..4], e),
+        }
     }
 
     /// Route lookup using only the 16-byte routing_tag (for forwarding Traffic
@@ -2685,6 +2878,12 @@ fn dispatch(state: &Arc<Mutex<RouterState>>, from: PeerId, frame: Vec<u8>) {
                 state.lock_or_recover().handle_onion_key_announce(from, ann);
             }
         }
+        #[cfg(feature = "sphinx")]
+        crate::packet::TYPE_CAPABILITIES => {
+            if let Ok(ann) = crate::packet::CapabilityAnnounce::decode(data) {
+                state.lock_or_recover().handle_capabilities(from, ann);
+            }
+        }
         TYPE_REPUTATION_REPORT => {
             if let Ok(r) = ReputationReport::decode(data) {
                 state.lock_or_recover().handle_reputation_report(from, r);
@@ -2736,6 +2935,40 @@ fn dispatch(state: &Arc<Mutex<RouterState>>, from: PeerId, frame: Vec<u8>) {
                         }
                     });
                 }
+            }
+        }
+        #[cfg(feature = "sphinx")]
+        crate::sphinx::TYPE_ONION_SPHINX => {
+            if frame.len() != crate::sphinx::CELL_SIZE {
+                debug!("sphinx: bad cell size {} from {:?}", frame.len(), &from[..4]);
+                return;
+            }
+            // Cleartext per-segment routing tag — route to it exactly like a
+            // legacy onion's outer tag. Copy it out before `frame` is moved.
+            let cell_tag: [u8; 16] = frame[1..17].try_into().unwrap();
+            let my_pub = state.lock_or_recover().pub_key;
+            if routing_tag_eq(&cell_tag, &routing_tag(&my_pub)) {
+                // We are this onion hop — peel and re-address.
+                let state2 = state.clone();
+                tokio::spawn(async move {
+                    state2.lock_or_recover().handle_sphinx(from, frame);
+                });
+            } else {
+                // Forwarding node: relay the unchanged cell toward cell_tag, jittered.
+                let permit = forward_sem().clone().try_acquire_owned();
+                let state_fwd = state.clone();
+                tokio::spawn(async move {
+                    let _permit = permit.ok();
+                    let jitter_ms = rand::random::<u64>() % 50;
+                    tokio::time::sleep(Duration::from_millis(jitter_ms)).await;
+                    let next = state_fwd.lock_or_recover()
+                        .lookup_by_tag_excluding(&cell_tag, Some(from));
+                    match next {
+                        Some(next) => state_fwd.lock_or_recover().send_to_peer(&next, frame),
+                        None => state_fwd.lock_or_recover()
+                            .send_path_negative(from, cell_tag, PATH_NEG_INITIAL_TTL),
+                    }
+                });
             }
         }
         _ => {
@@ -2927,6 +3160,13 @@ impl PacketConn {
             let _ = self.obfs_key.set(key);
             tracing::info!("transport obfuscation enabled (roadmap #7)");
         }
+    }
+
+    /// Select which onion format `write_to_onion` builds (see
+    /// [`crate::config::OnionFormat`]). Call once at node startup from config.
+    #[cfg(feature = "sphinx")]
+    pub fn set_onion_format(&self, fmt: crate::config::OnionFormat) {
+        self.inner.lock_or_recover().onion_format = fmt;
     }
 
     /// Roadmap #7: the derived obfuscation key, or `None` when
@@ -3384,6 +3624,24 @@ impl PacketConn {
             return self.write_to(payload, dst).await;
         }
 
+        // Onion format selection (OnionFormat). Sphinx removes the legacy
+        // per-layer length leak; build it when forced, or under Auto when every
+        // hop advertises support. Otherwise fall through to the legacy builder
+        // below (also the Auto fallback for not-yet-capable paths).
+        #[cfg(feature = "sphinx")]
+        let use_sphinx = {
+            let st = self.inner.lock_or_recover();
+            match st.onion_format {
+                crate::config::OnionFormat::Legacy => false,
+                crate::config::OnionFormat::Sphinx => true,
+                crate::config::OnionFormat::Auto => st.path_supports_sphinx(relays, dst),
+            }
+        };
+        #[cfg(feature = "sphinx")]
+        if use_sphinx {
+            return self.write_to_onion_sphinx(payload, dst, relays).await;
+        }
+
         // We need the destination's *current* onion ephemeral pub to build the
         // innermost layer. If we don't have one yet, abort — caller should
         // wait for a CoordAnnounce from the destination (or use write_to
@@ -3446,6 +3704,111 @@ impl PacketConn {
         let next_hop = self.inner.lock_or_recover().lookup(&first_relay);
         if let Some(next) = next_hop {
             self.inner.lock_or_recover().send_to_peer(&next, encoded);
+        } else {
+            bail!("no route to first relay {:?}", &first_relay[..4]);
+        }
+        Ok(())
+    }
+
+    /// Like [`Self::write_to_onion`] but builds a fixed-size Sphinx-style cell
+    /// (`crate::sphinx`) — no per-layer cleartext length, so no onion-depth leak
+    /// (REVIEW-FINDINGS #3). Additive and opt-in: every hop on the path (relays
+    /// and `dst`) must understand `TYPE_ONION_SPHINX`, so callers must negotiate
+    /// support before using this (a capability bit in CoordAnnounce is the planned
+    /// signal). `relays.len() + 1` must be ≤ `sphinx::MAX_HOPS`, and the
+    /// session-encrypted Traffic must fit `sphinx::MAX_TRAFFIC_LEN`.
+    ///
+    /// The session-setup + Traffic-build prefix mirrors `write_to_onion`
+    /// deliberately (kept separate so the proven legacy path is untouched).
+    #[mutants::skip]
+    #[cfg(feature = "sphinx")]
+    pub async fn write_to_onion_sphinx(
+        &self,
+        payload: &[u8],
+        dst: &[u8; 32],
+        relays: &[crate::onion::OnionHop],
+    ) -> Result<()> {
+        if relays.is_empty() {
+            return self.write_to(payload, dst).await;
+        }
+        if relays.len() + 1 > crate::sphinx::MAX_HOPS {
+            bail!(
+                "sphinx onion: {} relays + dst exceeds MAX_HOPS {}",
+                relays.len(), crate::sphinx::MAX_HOPS
+            );
+        }
+        let dest_hop = self.onion_hop_for(dst).ok_or_else(|| {
+            anyhow::anyhow!(
+                "no onion ephemeral pub known for dst {:?}; wait for CoordAnnounce or use write_to",
+                &dst[..4]
+            )
+        })?;
+
+        // Session must be established (else kick off the handshake and bail).
+        {
+            let established = {
+                let state = self.inner.lock_or_recover();
+                state.sessions.read_or_recover().is_established(dst)
+            };
+            if !established {
+                let init_data = {
+                    let state = self.inner.lock_or_recover();
+                    let mut sm = state.sessions.write_or_recover();
+                    sm.get_or_initiate_bytes(dst).unwrap_or_default()
+                };
+                if !init_data.is_empty() {
+                    self.inner.lock_or_recover().send_traffic_to(dst, init_data);
+                }
+                bail!("session not established with {:?}", &dst[..4]);
+            }
+        }
+
+        let padded = pad_payload(payload);
+        let ciphertext = {
+            let state = self.inner.lock_or_recover();
+            state.sessions.read_or_recover().encrypt(dst, &padded)?
+        };
+        let pub_key = self.pub_key;
+        let (enc_header, tag) = encrypt_header(&pub_key, dst);
+        let traffic = Traffic {
+            path: vec![],
+            from: pub_key,
+            enc_header,
+            routing_tag: tag,
+            pkt_type: packet::PKT_DATA,
+            watermark: 0,
+            payload: ciphertext,
+        };
+        let traffic_bytes = traffic.encode();
+        if traffic_bytes.len() > crate::sphinx::MAX_TRAFFIC_LEN {
+            bail!(
+                "sphinx onion: Traffic {} B exceeds payload budget {} B (use fewer hops or smaller payload)",
+                traffic_bytes.len(), crate::sphinx::MAX_TRAFFIC_LEN
+            );
+        }
+
+        // Map (relays.., dst) → Sphinx hops. Each hop's tag is BLAKE2b of its
+        // identity; its onion_pub is the advertised ephemeral (FS) or the
+        // identity-derived fallback (see onion_hop_for).
+        let mut hops: Vec<crate::sphinx::SphinxHop> = relays
+            .iter()
+            .map(|h| crate::sphinx::SphinxHop {
+                routing_tag: routing_tag(&h.identity_ed_pub),
+                onion_pub: h.ephemeral_x_pub,
+            })
+            .collect();
+        hops.push(crate::sphinx::SphinxHop {
+            routing_tag: routing_tag(&dest_hop.identity_ed_pub),
+            onion_pub: dest_hop.ephemeral_x_pub,
+        });
+
+        let cell = crate::sphinx::build_sphinx(&hops, &traffic_bytes)
+            .map_err(|e| anyhow::anyhow!("build sphinx cell: {e}"))?;
+
+        let first_relay = relays[0].identity_ed_pub;
+        let next_hop = self.inner.lock_or_recover().lookup(&first_relay);
+        if let Some(next) = next_hop {
+            self.inner.lock_or_recover().send_to_peer(&next, cell);
         } else {
             bail!("no route to first relay {:?}", &first_relay[..4]);
         }
@@ -3904,6 +4267,55 @@ mod tests {
         let sk = SigningKey::generate(&mut OsRng);
         let (tx, _rx) = mpsc::channel(32);
         RouterState::new(sk, tx)
+    }
+
+    #[cfg(feature = "sphinx")]
+    fn sphinx_hop_for(rs: &RouterState) -> crate::sphinx::SphinxHop {
+        crate::sphinx::SphinxHop {
+            routing_tag: routing_tag(&rs.pub_key),
+            onion_pub: *rs.onion_keys.pub_key().as_bytes(),
+        }
+    }
+
+    // A cell built to a router's *advertised* onion pub must be processed by that
+    // router's `sphinx_privs()` — i.e. the key a peer learns (CoordAnnounce /
+    // OnionKeyAnnounce → pub_key()) matches the keys we decrypt with.
+    #[test]
+    #[cfg(feature = "sphinx")]
+    fn sphinx_cell_built_for_us_is_delivered() {
+        let rs = make_router();
+        let traffic = b"arbitrary inner bytes";
+        let cell = crate::sphinx::build_sphinx(&[sphinx_hop_for(&rs)], traffic).unwrap();
+        match crate::sphinx::process_sphinx(&cell, &rs.onion_keys.sphinx_privs()) {
+            Ok(crate::sphinx::SphinxPeeled::Deliver(t)) => assert_eq!(t, traffic),
+            other => panic!("expected Deliver, got {other:?}"),
+        }
+    }
+
+    // Full relay→exit chain across two routers using their advertised keys: r0
+    // forwards toward r1's tag (constant-size cell), r1 delivers the traffic.
+    #[test]
+    #[cfg(feature = "sphinx")]
+    fn sphinx_two_hop_relay_then_deliver() {
+        let r0 = make_router();
+        let r1 = make_router();
+        let hops = vec![sphinx_hop_for(&r0), sphinx_hop_for(&r1)];
+        let traffic = b"two-hop payload bytes";
+        let cell = crate::sphinx::build_sphinx(&hops, traffic).unwrap();
+        assert_eq!(cell.len(), crate::sphinx::CELL_SIZE);
+
+        let next_cell = match crate::sphinx::process_sphinx(&cell, &r0.onion_keys.sphinx_privs()) {
+            Ok(crate::sphinx::SphinxPeeled::Forward { next_tag, cell }) => {
+                assert_eq!(next_tag, routing_tag(&r1.pub_key), "r0 must forward to r1's tag");
+                assert_eq!(cell.len(), crate::sphinx::CELL_SIZE, "forwarded cell stays constant size");
+                cell
+            }
+            other => panic!("r0 should Forward, got {other:?}"),
+        };
+        match crate::sphinx::process_sphinx(&next_cell, &r1.onion_keys.sphinx_privs()) {
+            Ok(crate::sphinx::SphinxPeeled::Deliver(t)) => assert_eq!(t, traffic),
+            other => panic!("r1 should Deliver, got {other:?}"),
+        }
     }
 
     fn add_dummy_peer(rs: &mut RouterState, key: PeerId) {
@@ -5042,6 +5454,110 @@ mod tests {
         };
         let sig = sk.sign(&unsigned.sign_bytes()).to_bytes();
         OnionKeyAnnounce { sig, ..unsigned }
+    }
+
+    #[cfg(feature = "sphinx")]
+    fn make_cap(sk: &SigningKey, caps: u32, seq: u64, age_ms: i64) -> crate::packet::CapabilityAnnounce {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let valid_from_ms = if age_ms >= 0 {
+            now_ms.saturating_sub(age_ms as u64)
+        } else {
+            now_ms.saturating_add((-age_ms) as u64)
+        };
+        let unsigned = crate::packet::CapabilityAnnounce {
+            origin: sk.verifying_key().to_bytes(),
+            caps,
+            seq,
+            valid_from_ms,
+            sig: [0u8; 64],
+        };
+        let sig = sk.sign(&unsigned.sign_bytes()).to_bytes();
+        crate::packet::CapabilityAnnounce { sig, ..unsigned }
+    }
+
+    #[test]
+    #[cfg(feature = "sphinx")]
+    fn capability_valid_is_recorded() {
+        let mut rs = make_router();
+        let sk = SigningKey::generate(&mut OsRng);
+        let origin = sk.verifying_key().to_bytes();
+        rs.handle_capabilities([0xFEu8; 32], make_cap(&sk, crate::packet::CAP_ONION_SPHINX, 1, 5_000));
+        let (caps, seq, _) = rs.peer_capabilities.get(&origin).expect("recorded");
+        assert_eq!(*seq, 1);
+        assert_ne!(caps & crate::packet::CAP_ONION_SPHINX, 0);
+    }
+
+    #[test]
+    #[cfg(feature = "sphinx")]
+    fn capability_bad_sig_stale_and_self_rejected() {
+        let mut rs = make_router();
+        let sk = SigningKey::generate(&mut OsRng);
+        let origin = sk.verifying_key().to_bytes();
+        let mut bad = make_cap(&sk, crate::packet::CAP_ONION_SPHINX, 1, 0);
+        bad.sig[0] ^= 0xFF;
+        rs.handle_capabilities([0u8; 32], bad);
+        assert!(!rs.peer_capabilities.contains_key(&origin), "bad sig rejected");
+        rs.handle_capabilities([0u8; 32], make_cap(&sk, crate::packet::CAP_ONION_SPHINX, 1, 25 * 60 * 60 * 1000));
+        assert!(!rs.peer_capabilities.contains_key(&origin), "stale rejected");
+        // An announce purporting to be from ourselves must be ignored.
+        let self_sk = rs.signing_key.clone();
+        let self_ann = make_cap(&self_sk, crate::packet::CAP_ONION_SPHINX, 1, 0);
+        rs.handle_capabilities([0u8; 32], self_ann);
+        assert!(!rs.peer_capabilities.contains_key(&rs.pub_key), "self-origin rejected");
+    }
+
+    #[test]
+    #[cfg(feature = "sphinx")]
+    fn capability_dedup_keeps_newest_seq() {
+        let mut rs = make_router();
+        let sk = SigningKey::generate(&mut OsRng);
+        let origin = sk.verifying_key().to_bytes();
+        rs.handle_capabilities([0u8; 32], make_cap(&sk, crate::packet::CAP_ONION_SPHINX, 5, 0));
+        rs.handle_capabilities([0u8; 32], make_cap(&sk, 0, 3, 0)); // older seq → ignored
+        let (caps, seq, _) = rs.peer_capabilities.get(&origin).unwrap();
+        assert_eq!(*seq, 5);
+        assert_ne!(caps & crate::packet::CAP_ONION_SPHINX, 0);
+        rs.handle_capabilities([0u8; 32], make_cap(&sk, 0, 6, 0)); // newer → updates
+        let (caps, seq, _) = rs.peer_capabilities.get(&origin).unwrap();
+        assert_eq!(*seq, 6);
+        assert_eq!(caps & crate::packet::CAP_ONION_SPHINX, 0, "newer announce cleared the bit");
+    }
+
+    #[test]
+    #[cfg(feature = "sphinx")]
+    fn path_supports_sphinx_requires_every_hop_capable() {
+        let mut rs = make_router();
+        let relay_sks: Vec<SigningKey> = (0..2).map(|_| SigningKey::generate(&mut OsRng)).collect();
+        let dst_sk = SigningKey::generate(&mut OsRng);
+        let relays: Vec<crate::onion::OnionHop> = relay_sks.iter().map(|sk| crate::onion::OnionHop {
+            identity_ed_pub: sk.verifying_key().to_bytes(),
+            ephemeral_x_pub: [0u8; 32],
+        }).collect();
+        let dst = dst_sk.verifying_key().to_bytes();
+        for sk in relay_sks.iter().chain(std::iter::once(&dst_sk)) {
+            rs.handle_capabilities([0u8; 32], make_cap(sk, crate::packet::CAP_ONION_SPHINX, 1, 0));
+        }
+        assert!(rs.path_supports_sphinx(&relays, &dst), "all hops capable → true");
+        // A hop that advertises caps but WITHOUT the sphinx bit → false.
+        rs.handle_capabilities([0u8; 32], make_cap(&relay_sks[0], 0, 2, 0));
+        assert!(!rs.path_supports_sphinx(&relays, &dst), "a non-sphinx hop → false");
+    }
+
+    #[test]
+    #[cfg(feature = "sphinx")]
+    fn path_supports_sphinx_rejects_too_many_hops() {
+        let rs = make_router();
+        let sks: Vec<SigningKey> = (0..crate::sphinx::MAX_HOPS).map(|_| SigningKey::generate(&mut OsRng)).collect();
+        let relays: Vec<crate::onion::OnionHop> = sks.iter().map(|sk| crate::onion::OnionHop {
+            identity_ed_pub: sk.verifying_key().to_bytes(),
+            ephemeral_x_pub: [0u8; 32],
+        }).collect();
+        let dst = SigningKey::generate(&mut OsRng).verifying_key().to_bytes();
+        // MAX_HOPS relays + dst = MAX_HOPS+1 > MAX_HOPS → rejected before cap checks.
+        assert!(!rs.path_supports_sphinx(&relays, &dst));
     }
 
     #[test]

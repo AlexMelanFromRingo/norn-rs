@@ -90,6 +90,33 @@ pub struct NodeConfig {
     /// does not hide packet sizes or timing.
     #[serde(default)]
     pub obfuscation_psk: String,
+
+    /// Onion wire format this node *builds* when sending via `write_to_onion`
+    /// (see [`OnionFormat`]). Default `auto`: the fixed-size Sphinx format on
+    /// paths whose every hop advertises support, legacy onion otherwise. Inbound
+    /// always accepts both formats regardless of this setting.
+    /// Only present with the opt-in `sphinx` feature.
+    #[cfg(feature = "sphinx")]
+    #[serde(default)]
+    pub onion_format: OnionFormat,
+}
+
+/// Which onion-routing wire format a node builds when sending. Receiving/relaying
+/// always accepts both — this only governs what we construct. Part of the opt-in
+/// `sphinx` feature.
+#[cfg(feature = "sphinx")]
+#[derive(Deserialize, Serialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum OnionFormat {
+    /// Sphinx where every hop on the path advertises support (via
+    /// CapabilityAnnounce), else fall back to the legacy onion. Safe default for
+    /// a mixed-version mesh.
+    #[default]
+    Auto,
+    /// Always build Sphinx cells (homogeneous / test networks).
+    Sphinx,
+    /// Always build the legacy onion.
+    Legacy,
 }
 
 fn default_listen() -> Vec<String> { vec!["tcp://0.0.0.0:9001".to_string()] }
@@ -118,6 +145,8 @@ impl Default for NodeConfig {
             mdns_enabled: true,
             crypto_workers: 0,
             obfuscation_psk: String::new(),
+            #[cfg(feature = "sphinx")]
+            onion_format: OnionFormat::default(),
         }
     }
 }

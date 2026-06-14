@@ -4,7 +4,7 @@ use libfuzzer_sys::fuzz_target;
 use norn_rs::packet::{
     decode_uvarint, decode_path, SigReq, SigRes, Announce, CuckooMsg,
     PathLookup, PathNotify, PathBroken, Traffic, CoordAnnounce, OnionKeyAnnounce,
-    ReputationReport, HolePunch,
+    ReputationReport, HolePunch, CapabilityAnnounce,
 };
 
 fuzz_target!(|data: &[u8]| {
@@ -25,4 +25,5 @@ fuzz_target!(|data: &[u8]| {
     let _ = OnionKeyAnnounce::decode(data);
     let _ = ReputationReport::decode(data);
     let _ = HolePunch::decode(data);
+    let _ = CapabilityAnnounce::decode(data);
 });

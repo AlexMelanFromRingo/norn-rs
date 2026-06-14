@@ -116,6 +116,24 @@ impl OnionKeyChain {
         self.current_pub
     }
 
+    /// Candidate X25519 private keys to try when processing an inbound Sphinx cell:
+    /// current, the previous key during the rotation overlap, and the
+    /// identity-derived fallback — the same key set `try_decrypt` tries for the
+    /// legacy onion. Returned by reference so no secret material is copied.
+    /// Only used by the opt-in `sphinx` feature.
+    #[cfg(feature = "sphinx")]
+    pub fn sphinx_privs(&self) -> Vec<&StaticSecret> {
+        let mut v = Vec::with_capacity(3);
+        v.push(&self.current_priv);
+        if let Some(p) = &self.previous_priv {
+            v.push(p);
+        }
+        if let Some(p) = &self.identity_x_priv {
+            v.push(p);
+        }
+        v
+    }
+
     /// Rotate: move current → previous (zeroize-on-drop happens automatically
     /// when `previous` is overwritten on the *next* rotation), generate fresh.
     pub fn rotate(&mut self) {

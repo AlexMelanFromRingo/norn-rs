@@ -123,3 +123,50 @@ does not currently formalise:
    in `src/session.rs::PqKeys`.
 
 Both gaps are open invitations for future formal work.
+
+## Onion layer (Sphinx) & capability negotiation
+
+The `spec/norn.pv` model covers the **session handshake**. The onion routing
+layer (`src/sphinx.rs`, `docs/onion-sphinx-design.md`) and the capability
+negotiation that activates it (`docs/onion-sphinx-activation-design.md`) are not
+yet machine-modelled; their properties are argued informally here and exercised
+by the test suite (round-trip, tamper, constant-size, and the `fuzz_sphinx`
+target).
+
+**Capability authenticity (reduces to the modelled signature primitive).** A
+`CapabilityAnnounce` is Ed25519-signed by `origin` over
+`origin‖caps‖seq‖valid_from_ms`. A node therefore cannot forge a capability for
+an identity whose signing key it does not hold — the *same* `sign`/`verify`
+black box already proven sufficient for Q2/Q3. Consequences:
+
+* **No third-party downgrade.** A sender builds a Sphinx cell only when *every*
+  hop's signed capability advertises `CAP_ONION_SPHINX`; an attacker cannot strip
+  or forge another node's capability, so cannot force a downgrade (or upgrade)
+  of traffic between honest parties.
+* **Self-downgrade only.** A node lying that it lacks the capability merely makes
+  senders fall back to the legacy onion for traffic *to that node* — no worse
+  than the pre-Sphinx status quo.
+
+This property would be a small, self-contained ProVerif extension (a signed
+announce + an authenticity query mirroring Q2); it is left as future work rather
+than shipped unverified.
+
+**Onion (Sphinx) properties (informal; full mix-format modelling is research-grade
+and out of scope, as in the Sphinx literature, which uses computational rather
+than symbolic proofs):**
+
+* *Per-hop confidentiality* — each layer key is `X25519(ephemeral_i, onion_priv_hop)`
+  with an independent per-hop ephemeral; a relay learns nothing of other layers.
+* *Header integrity* — a per-hop BLAKE2b MAC over `beta` (the relay drops any
+  tampered or not-for-it cell; doubles as the "addressed to me?" test).
+* *Constant size / indistinguishability* — every cell is exactly 1280 B with no
+  length field, so position in the path and remaining hop count are unobservable
+  (this is the property that closes the legacy `aead_len` depth leak, #3).
+* *Per-hop unlinkability* — `epk`, `gamma`, `beta`, and the payload are fresh
+  pseudorandom at every hop; nothing is equal across two hops of one packet.
+* *Replay resistance* — a per-hop seen-cache keyed on `(epk, beta[..16])`.
+* *End-to-end payload integrity* — the payload is the session-AEAD-protected
+  `Traffic` packet, i.e. it inherits the integrity of the **modelled** handshake
+  key; a relay tampering with payload bytes is detected (and dropped) at the
+  destination. (Tagging-attack *non-localisability* would additionally need a
+  wide-block payload cipher — LIONESS — a documented optional hardening.)
