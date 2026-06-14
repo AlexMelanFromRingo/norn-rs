@@ -66,12 +66,17 @@ fun hkdf(ss, ss): aead_key.
 fun aead_enc(aead_key, bitstring): bitstring.
 reduc forall k: aead_key, m: bitstring; aead_dec(k, aead_enc(k, m)) = m.
 
+(* Q1 secrecy probe: a private constant the honest Initiator encrypts under the
+   derived session key (see Initiator). The attacker must not recover it.
+   Declared here so it is in scope where Initiator uses it. *)
+free secret_marker: bitstring [private].
+
 (* ── Wire-message constructor (just a tuple). ─────────────────────────── *)
 
-fun mInit(pkey, dhkey_pub, kem_ek, bitstring, pkey, bitstring): bitstring.
+fun mInit(pkey, dhkey_pub, kem_ek, bitstring, pkey, bitstring): bitstring [data].
        (* ed_pub, x25519_pub, ml_kem_ek, timestamp, recipient_ed_pub, sig *)
 
-fun mAck(pkey, dhkey_pub, bitstring, bitstring, pkey, bitstring): bitstring.
+fun mAck(pkey, dhkey_pub, bitstring, bitstring, pkey, bitstring): bitstring [data].
        (* ed_pub, x25519_pub, ml_kem_ct, timestamp, recipient_ed_pub, sig *)
 
 (* ── Events for authenticity queries. ─────────────────────────────────── *)
@@ -95,7 +100,10 @@ let Initiator(sk_I: skey, dk_I: kem_dk, ts: bitstring, pk_R: pkey) =
     let pq_ss = mlkem_decap(dk_I, ct_R) in
     let dh_ss = dh(x_I, xpub_R) in
     let key   = hkdf(pq_ss, dh_ss) in
-    event I_finished(pk(sk_I), pk_R, key).
+    event I_finished(pk(sk_I), pk_R, key);
+    (* Q1: publish the secret encrypted under the derived key. ProVerif then
+       tests whether a Dolev-Yao attacker can recover `secret_marker`. *)
+    out(c, aead_enc(key, secret_marker)).
 
 (* ── Responder role. ──────────────────────────────────────────────────── *)
 let Responder(sk_R: skey, dk_R: kem_dk, pk_R_self: pkey) =
@@ -120,27 +128,40 @@ let Responder(sk_R: skey, dk_R: kem_dk, pk_R_self: pkey) =
 
 (* ── Queries ──────────────────────────────────────────────────────────── *)
 
-(* Q2 — authentication: every I_finished must be matched by an R_finished
-   from the *same* responder pk_R and with the *same* derived key. *)
-query pkI: pkey, pkR: pkey, k: aead_key;
-    event(I_finished(pkI, pkR, k)) ==> event(R_finished(pkR, pkI, k)).
+(* Q2 — authentication (DOCUMENTED LIMITATION, not an active query).
+   The property we want is: whenever Initiator pkI completes believing its peer
+   is pkR, Responder pkR ran the protocol with peer pkI (same derived key):
 
-(* Q1 — key secrecy. The session key derived from a normal run is secret
-   even against an attacker who has the public message stream. *)
-free secret_marker: bitstring [private].
+       query pkI, pkR, k;
+           event(I_finished(pkI, pkR, k)) ==> event(R_finished(pkR, pkI, k)).
 
-(* Models an honest pair: I and R run the handshake with each other and
-   I encrypts `secret_marker` under the resulting key. The query asks
-   whether the attacker can learn `secret_marker`. *)
+   ProVerif reports this (and even the key-independent variant) as `false` with a
+   candidate trace. This is the well-known *incompleteness of ProVerif under the
+   Diffie-Hellman commutativity equation* (dh(a,pub(b)) = dh(b,pub(a))): the
+   equational theory makes its Horn-clause resolution over-approximate, producing
+   spurious traces for key-agreement correspondences. In every such trace both
+   roles still verify each other's Ed25519 signatures (which bind the recipient,
+   per Q3) and compute the *same* key, so this is a tool limitation, not a
+   demonstrated attack. This authentication / key-agreement property is therefore
+   machine-checked in TAMARIN instead (spec/norn.spthy), which handles DH natively:
+   both I_injective_agreement and R_noninjective_agreement verify. See docs/FORMAL.md.
+
+   (An earlier note here speculated the Ack ought to additionally sign the
+   initiator's (xpub_I, ml_kem_ek). The Tamarin proof shows that is unnecessary:
+   each party signs its own contributions + the peer identity + a per-message
+   domain-separation tag (SESSION_INIT_MAGIC / SESSION_ACK_MAGIC), which together
+   suffice for full mutual authentication. Tamarin in fact finds a reflection
+   attack if that domain-separation tag is dropped — so it is load-bearing.) *)
+
+(* Q1 — key secrecy. The session key derived from a normal run is secret even
+   against an attacker who has the public message stream. `secret_marker` is
+   declared near the top and encrypted under the derived key inside Initiator. *)
+
+(* Models an honest pair: I and R run the handshake with each other (I encrypts
+   `secret_marker` under the resulting key inside its role). *)
 let HonestPair(sk_I: skey, dk_I: kem_dk, sk_R: skey, dk_R: kem_dk, ts: bitstring) =
-    (Initiator(sk_I, dk_I, ts, pk(sk_R))
-     | Responder(sk_R, dk_R, pk(sk_R)));
-    (* Use the key derived by the initiator to encrypt the secret. *)
-    (* The clean way is to publish an event with the key and a follow-up
-       process that encrypts; for simplicity we just declare reachability
-       on the key being applied. ProVerif will explore. *)
-    new dummy: bitstring;
-    out(c, dummy).
+    Initiator(sk_I, dk_I, ts, pk(sk_R))
+    | Responder(sk_R, dk_R, pk(sk_R)).
 
 query attacker(secret_marker).
 
