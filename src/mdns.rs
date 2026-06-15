@@ -25,7 +25,7 @@ use std::sync::Arc;
 use tracing::{debug, info, warn};
 
 use crate::router::PacketConn;
-use crate::transport::{dial, ConnectedPeers};
+use crate::transport::{dial_discovered, ConnectedPeers};
 
 const SERVICE_TYPE: &str = "_norn._tcp.local.";
 const TXT_PUB_KEY: &str = "pub_key";
@@ -143,7 +143,7 @@ fn handle_event(
         let conn_clone = conn.clone();
         let connected_clone = connected.clone();
         tokio::spawn(async move {
-            dial(&uri, conn_clone, connected_clone).await;
+            dial_discovered(&uri, conn_clone, connected_clone).await;
         });
     }
 }

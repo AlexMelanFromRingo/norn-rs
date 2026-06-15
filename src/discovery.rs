@@ -13,7 +13,7 @@ use tokio::net::UdpSocket;
 use tracing::{debug, info, warn};
 
 use crate::router::PacketConn;
-use crate::transport::{dial, ConnectedPeers};
+use crate::transport::{dial_discovered, ConnectedPeers};
 
 /// Link-local multicast group for norn discovery.
 const MULTICAST_GROUP: Ipv6Addr = Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0x01, 0x09);
@@ -99,7 +99,7 @@ pub async fn start(
         let conn_clone = conn.clone();
         let connected_clone = connected.clone();
         tokio::spawn(async move {
-            dial(&dial_uri, conn_clone, connected_clone).await;
+            dial_discovered(&dial_uri, conn_clone, connected_clone).await;
         });
 
         debug!("multicast beacon from {:?}", &remote_pub[..4]);

@@ -43,6 +43,16 @@ const MAX_PENDING_HANDSHAKES: usize = 256;
 /// and arbitrary CPU still cannot occupy more than 4 slots.
 const MAX_PER_IP_HANDSHAKES: usize = 4;
 
+/// Max consecutive FAILED attempts a discovery-triggered dial makes before it
+/// gives up. Unauthenticated mDNS / multicast beacons must not be able to spawn
+/// unbounded *persistent* dial tasks: without this, an on-LAN attacker
+/// advertising many fake pub_keys would create one infinite retry loop per fake
+/// key (each handshake fails, but the loop retries forever) → unbounded tasks,
+/// breaking the flat per-node memory property. A successful connection resets
+/// the counter, so only repeatedly-failing dials give up; a dropped legitimate
+/// peer is re-dialled on its next beacon. Configured/admin dials are unbounded.
+const DISCOVERY_DIAL_MAX_ATTEMPTS: u32 = 4;
+
 /// Shared set of currently-connected peer pub keys (for dedup).
 /// Per-peer connection counter. Replaces the historical
 /// `HashSet<PubKey>` that allowed exactly one TCP/QUIC link per peer.
@@ -462,14 +472,46 @@ pub async fn listen(
 // Skip mutations: retry loop with real TcpStream connect and backoff —
 // mutations to connection logic, dedup, and backoff require a live network.
 #[mutants::skip]
+/// Persistent dial: retries forever with capped backoff. Used for configured
+/// peers, the peer cache, and operator-initiated (admin) dials, where we want
+/// to keep trying to reach a known, trusted endpoint indefinitely.
 pub async fn dial(uri: &str, conn: Arc<PacketConn>, connected: ConnectedPeers) {
+    dial_inner(uri, conn, connected, None).await;
+}
+
+/// Discovery-triggered dial: bounded retry. Used for unauthenticated mDNS /
+/// multicast beacons so a flood of fake pub_keys can't spawn unbounded
+/// persistent dial tasks (see [`DISCOVERY_DIAL_MAX_ATTEMPTS`]). A genuine peer
+/// that drops is re-dialled when it next beacons.
+pub async fn dial_discovered(uri: &str, conn: Arc<PacketConn>, connected: ConnectedPeers) {
+    dial_inner(uri, conn, connected, Some(DISCOVERY_DIAL_MAX_ATTEMPTS)).await;
+}
+
+async fn dial_inner(
+    uri: &str,
+    conn: Arc<PacketConn>,
+    connected: ConnectedPeers,
+    max_attempts: Option<u32>,
+) {
     let addr = match parse_tcp_uri(uri) {
         Ok(a) => a,
         Err(e) => { warn!("bad peer URI {}: {}", uri, e); return; }
     };
 
     let mut delay = Duration::from_secs(1);
+    // Consecutive failed iterations (reset on a successful connection). When
+    // `max_attempts` is Some, give up once this reaches the cap so an
+    // unauthenticated beacon cannot keep a retry loop alive forever. Checked at
+    // the top so EVERY retry path (connect fail, handshake fail, difficulty
+    // refusal, link-cap poll) counts uniformly.
+    let mut attempts: u32 = 0;
     loop {
+        if let Some(max) = max_attempts
+            && attempts >= max {
+            debug!("dial to {} giving up after {} failed attempts", addr, attempts);
+            return;
+        }
+        attempts += 1;
         match TcpStream::connect(&addr).await {
             Ok(stream) => {
                 configure_socket(&stream);
@@ -597,8 +639,11 @@ pub async fn dial(uri: &str, conn: Arc<PacketConn>, connected: ConnectedPeers) {
                                 }
                             }
                         }
-                        // Reset backoff on successful connect
+                        // Reset backoff + failure counter on successful connect:
+                        // a peer that genuinely connects (its handshake validated)
+                        // is never given up on by the discovery bound.
                         delay = Duration::from_secs(5);
+                        attempts = 0;
                     }
                     Err(e) => warn!("handshake with {} failed: {}", addr, e),
                 }
@@ -696,5 +741,28 @@ mod tests {
         // they're really compile-time invariants.
         const _: () = assert!(MAX_PER_IP_HANDSHAKES > 0);
         const _: () = assert!(MAX_PER_IP_HANDSHAKES * 16 <= MAX_PENDING_HANDSHAKES);
+    }
+
+    // ── Discovery dial is bounded (DoS: unbounded persistent dials) ───────────
+
+    #[tokio::test(start_paused = true)]
+    async fn dial_discovered_gives_up_on_persistent_failure() {
+        // A discovery-triggered dial to an endpoint that never accepts MUST
+        // give up (return) rather than retry forever. Otherwise an on-LAN
+        // attacker flooding fake-pub beacons spawns one unbounded persistent
+        // task per fake key. `dial()` (None) loops forever by design; the
+        // bounded `dial_discovered()` must terminate. 127.0.0.1:1 refuses
+        // instantly and `start_paused` auto-advances the backoff sleeps, so
+        // this completes fast in virtual time.
+        use std::collections::HashMap;
+        let sk = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        let conn = Arc::new(crate::router::PacketConn::new(sk));
+        let connected: ConnectedPeers = Arc::new(Mutex::new(HashMap::new()));
+        let done = tokio::time::timeout(
+            Duration::from_secs(3600),
+            dial_discovered("tcp://127.0.0.1:1", conn, connected),
+        ).await;
+        assert!(done.is_ok(),
+            "bounded discovery dial must terminate on persistent failure, not hang forever");
     }
 }
