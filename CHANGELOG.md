@@ -4,6 +4,28 @@ All notable changes to norn-rs are documented here. Versions follow Cargo's
 0.x semver: the **minor** number is bumped for breaking (wire/protocol) changes,
 the **patch** number for backward-compatible fixes.
 
+## v0.10.1
+
+> Backward-compatible patch. The wire protocol is **unchanged** from v0.10.0 —
+> v0.10.1 and v0.10.0 nodes interoperate freely; upgrade at your own pace.
+
+### Performance
+- **Exponential backoff for handshake-init retransmission.** v0.10.0 retransmits
+  a lost `SessionInit` on a flat interval; under churn that flat-rate retry
+  dominated egress. Backoff (1 s base, doubling, 30 s cap) keeps reliability
+  while cutting the handshake retry cost. Measured on the 100-node WAN harness
+  (50 ms ± 10, 2 % loss, mid-run kill+restore of 10 % of nodes):
+  handshake `traffic` **439 MB → 187 MB (−57 %)**, total egress
+  **10.0 → 7.6 MB/node (−24 %)**, with connectivity (4 peers/node), trust
+  (≈3.5/peer) and memory (≈2.8 MiB/node) all preserved. The remaining egress is
+  legitimate cuckoo gossip (the cost of a *connected* mesh), not retry waste.
+
+### Added — observability
+- **Per-message-type egress counters** — `norn_tx_bytes_by_type{type="…"}`
+  (cuckoo / traffic / announce / coord / reputation / …) on `/metrics`, so node
+  bandwidth can be attributed to gossip vs handshake/data vs control. This is the
+  instrumentation behind the v0.9 → v0.10 bandwidth analysis above.
+
 ## v0.10.0
 
 > ⚠️ **Breaking, flag-day release.** The on-the-wire protocol changed
