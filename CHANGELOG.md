@@ -4,6 +4,25 @@ All notable changes to norn-rs are documented here. Versions follow Cargo's
 0.x semver: the **minor** number is bumped for breaking (wire/protocol) changes,
 the **patch** number for backward-compatible fixes.
 
+## v0.10.2
+
+> Backward-compatible patch. Wire protocol unchanged from v0.10.0/v0.10.1.
+
+### Hardening
+- **Transport locks recover from poisoning instead of cascading.** The TCP
+  accept loop, the per-IP handshake rate-limiter (`PerIpGuard`), and the
+  connected-peer map used raw `.lock().unwrap()` — a panic-while-holding any of
+  those mutexes would poison the lock and cascade-panic every subsequent task
+  (the rest of the codebase already used the poison-recovering `lock_or_recover`).
+  Converted all production sites in `transport.rs`; a poison event now logs,
+  bumps `norn_mutex_poison_total`, and continues on possibly-inconsistent state
+  rather than taking the node down.
+
+### Docs
+- Corrected a stale `SessionManager.pq_keys` comment that described PQ-key
+  rotation + prior-`dk` zeroize as a future TODO — both already exist
+  (`PqKeys::rotate_if_due`, driven by maintenance; ml-kem `zeroize`-on-drop).
+
 ## v0.10.1
 
 > Backward-compatible patch. The wire protocol is **unchanged** from v0.10.0 —

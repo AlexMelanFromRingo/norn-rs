@@ -827,11 +827,13 @@ pub type SessionHandle = std::sync::Arc<std::sync::Mutex<SessionInfo>>;
 pub struct SessionManager {
     pub sessions: HashMap<[u8; 32], SessionHandle>,
     our_signing_key: SigningKey,
-    /// Long-term ML-KEM-768 keypair, generated once per process. The encap
-    /// pub is advertised in every outbound SessionInit; the dk is used to
-    /// decap inbound SessionAck ciphertexts. For PQ forward secrecy this
-    /// keypair should rotate; a daily rotation hook is straightforward to
-    /// add (TODO) and would zeroize the prior dk after the grace window.
+    /// Long-term ML-KEM-768 keypair. The encap pub is advertised in every
+    /// outbound SessionInit; the dk decaps inbound SessionAck ciphertexts.
+    /// For PQ forward secrecy the keypair rotates: `PqKeys::rotate_if_due`
+    /// (driven by `rotate_pq_keys_if_due` in maintenance) promotes a fresh
+    /// keypair and keeps the prior dk for one overlap window so in-flight
+    /// Acks still decap, then drops it — ml-kem's `zeroize` feature zeroizes
+    /// the prior dk on drop.
     pq_keys: PqKeys,
     /// Per-pending-initiate cache of the encap secret the initiator chose
     /// when sending an Init. On a crossing-init race this lets us reuse the

@@ -16,7 +16,7 @@ use tracing::{debug, warn};
 mod diagnostics;
 pub use diagnostics::*;
 mod lockutil;
-use lockutil::*;
+pub(crate) use lockutil::*;
 mod onion;
 mod handlers;
 mod reputation;

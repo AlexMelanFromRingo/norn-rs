@@ -20,7 +20,7 @@ use tokio::time::timeout;
 use tracing::{debug, info, warn};
 
 use crate::obfs::{ObfsReader, ObfsWriter};
-use crate::router::PacketConn;
+use crate::router::{LockOrRecover, PacketConn};
 
 /// Handshake protocol version. Bump on incompatible wire changes.
 const HANDSHAKE_MAGIC: [u8; 4] = *b"NRN1";
@@ -73,7 +73,7 @@ struct PerIpGuard {
 
 impl Drop for PerIpGuard {
     fn drop(&mut self) {
-        let mut counts = self.counts.lock().unwrap();
+        let mut counts = self.counts.lock_or_recover();
         if let Some(c) = counts.get_mut(&self.ip) {
             *c = c.saturating_sub(1);
             if *c == 0 {
@@ -362,7 +362,7 @@ pub async fn listen(
         // not leak slots.
         let ip = peer_addr.ip();
         {
-            let mut counts = per_ip_counts.lock().unwrap();
+            let mut counts = per_ip_counts.lock_or_recover();
             let entry = counts.entry(ip).or_insert(0);
             if *entry >= MAX_PER_IP_HANDSHAKES {
                 warn!(
@@ -437,7 +437,7 @@ pub async fn listen(
             // exit.
             {
                 use crate::router::MAX_PARALLEL_LINKS_PER_PEER;
-                let mut map = connected.lock().unwrap();
+                let mut map = connected.lock_or_recover();
                 let count = map.entry(remote_pub).or_insert(0);
                 if (*count as usize) >= MAX_PARALLEL_LINKS_PER_PEER {
                     debug!(
@@ -456,7 +456,7 @@ pub async fn listen(
             // so subsequent dials don't see a stale zero blocking
             // them on the cap.
             {
-                let mut map = connected.lock().unwrap();
+                let mut map = connected.lock_or_recover();
                 if let Some(count) = map.get_mut(&remote_pub) {
                     *count = count.saturating_sub(1);
                     if *count == 0 {
@@ -580,7 +580,7 @@ async fn dial_inner(
                         if our_pub > remote_pub {
                             tokio::time::sleep(Duration::from_secs(3)).await;
                             let peer_reached_us = {
-                                let map = connected.lock().unwrap();
+                                let map = connected.lock_or_recover();
                                 map.get(&remote_pub).copied().unwrap_or(0) > 0
                             };
                             if peer_reached_us {
@@ -606,7 +606,7 @@ async fn dial_inner(
                         // before the `await` below — `MutexGuard` isn't
                         // `Send` so it can't live across an await point.
                         let count_now = {
-                            let map = connected.lock().unwrap();
+                            let map = connected.lock_or_recover();
                             map.get(&remote_pub).copied().unwrap_or(0)
                         };
                         use crate::router::MAX_PARALLEL_LINKS_PER_PEER;
@@ -619,7 +619,7 @@ async fn dial_inner(
                             continue;
                         }
                         {
-                            let mut map = connected.lock().unwrap();
+                            let mut map = connected.lock_or_recover();
                             *map.entry(remote_pub).or_insert(0) += 1;
                         }
                         info!("connected to peer {:?} at {}", &remote_pub[..4], addr);
@@ -631,7 +631,7 @@ async fn dial_inner(
                         // Decrement link count on disconnect so re-dials
                         // can grab the slot back.
                         {
-                            let mut map = connected.lock().unwrap();
+                            let mut map = connected.lock_or_recover();
                             if let Some(count) = map.get_mut(&remote_pub) {
                                 *count = count.saturating_sub(1);
                                 if *count == 0 {
