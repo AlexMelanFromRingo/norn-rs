@@ -33,7 +33,8 @@ use crate::onion::{build_onion, OnionPacket, PeeledOnion};
 use crate::packet::{self, routing_tag, *};
 use crate::session::{
     ed25519_priv_to_x25519, ed25519_pub_to_x25519,
-    SessionManager, SharedSessionManager, SESSION_INIT_MAGIC, SESSION_ACK_MAGIC,
+    SessionManager, SharedSessionManager, SessionInit, SessionAck,
+    SESSION_INIT_MAGIC, SESSION_ACK_MAGIC,
 };
 
 // ──────────────────────────────────────────────

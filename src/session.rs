@@ -229,10 +229,11 @@ pub const ML_KEM_PUB_BYTES: usize = 1184;
 pub const ML_KEM_CT_BYTES: usize = 1088;
 pub const ML_KEM_SHARED_BYTES: usize = 32;
 
-/// Total bytes of an encoded SessionInit (v3) frame on the wire.
-pub const SESSION_INIT_WIRE_BYTES: usize = 1 + 32 + 64 + 32 + 8 + 32 + ML_KEM_PUB_BYTES;
+/// Total bytes of an encoded SessionInit (v3) frame on the wire. The trailing
+/// 16 bytes are the sender's hyperbolic coord (advisory, unsigned — see struct).
+pub const SESSION_INIT_WIRE_BYTES: usize = 1 + 32 + 64 + 32 + 8 + 32 + ML_KEM_PUB_BYTES + 16;
 /// Total bytes of an encoded SessionAck (v3) frame on the wire.
-pub const SESSION_ACK_WIRE_BYTES: usize = 1 + 32 + 64 + 32 + 8 + 32 + ML_KEM_CT_BYTES;
+pub const SESSION_ACK_WIRE_BYTES: usize = 1 + 32 + 64 + 32 + 8 + 32 + ML_KEM_CT_BYTES + 16;
 
 // Anti-amplification: response (Ack) MUST NOT be larger than the trigger (Init).
 // SessionInit carries ml_kem_pub (1184 B); SessionAck carries ml_kem_ct (1088 B).
@@ -584,6 +585,14 @@ pub struct SessionInit {
     pub timestamp_ms: u64,
     pub recipient_ed_pub: [u8; 32],
     pub ml_kem_pub: [u8; ML_KEM_PUB_BYTES],
+    /// Sender's current hyperbolic coordinate (`HypCoord::encode`, 16 B), so the
+    /// recipient learns where the sender sits in the embedding and can stamp a
+    /// real `dest_coord` on reverse traffic → greedy works multi-hop (Phase 2).
+    /// NOT part of the signed payload (the formally-verified sign_bytes are
+    /// unchanged): it is an advisory routing hint, identity-attributed by the
+    /// authenticated handshake; a transit node tampering it only degrades greedy
+    /// to the cuckoo fallback, which trust-decay + active probing already defend.
+    pub sender_coord: [u8; 16],
 }
 
 fn now_ms() -> u64 {
@@ -641,6 +650,7 @@ impl SessionInit {
         x25519_pub: &X25519PublicKey,
         recipient_ed_pub: &[u8; 32],
         ml_kem_pub: &[u8; ML_KEM_PUB_BYTES],
+        sender_coord: [u8; 16],
     ) -> Self {
         let ed_pub = signing_key.verifying_key().to_bytes();
         let x_bytes = *x25519_pub.as_bytes();
@@ -652,12 +662,12 @@ impl SessionInit {
         SessionInit {
             ed_pub, signature, x25519_pub: x_bytes,
             timestamp_ms, recipient_ed_pub: *recipient_ed_pub,
-            ml_kem_pub: *ml_kem_pub,
+            ml_kem_pub: *ml_kem_pub, sender_coord,
         }
     }
 
     pub fn encode(&self) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(1 + 32 + 64 + 32 + 8 + 32 + ML_KEM_PUB_BYTES);
+        let mut buf = Vec::with_capacity(SESSION_INIT_WIRE_BYTES);
         buf.push(SESSION_INIT_MAGIC);
         buf.extend_from_slice(&self.ed_pub);
         buf.extend_from_slice(&self.signature);
@@ -665,6 +675,7 @@ impl SessionInit {
         buf.extend_from_slice(&self.timestamp_ms.to_le_bytes());
         buf.extend_from_slice(&self.recipient_ed_pub);
         buf.extend_from_slice(&self.ml_kem_pub);
+        buf.extend_from_slice(&self.sender_coord);
         buf
     }
 
@@ -672,7 +683,7 @@ impl SessionInit {
         if data.is_empty() || data[0] != SESSION_INIT_MAGIC {
             bail!("invalid SessionInit magic");
         }
-        let need = 1 + 32 + 64 + 32 + 8 + 32 + ML_KEM_PUB_BYTES;
+        let need = SESSION_INIT_WIRE_BYTES;
         if data.len() < need {
             bail!("SessionInit too short: {} (need {})", data.len(), need);
         }
@@ -689,8 +700,10 @@ impl SessionInit {
         let mut recipient_ed_pub = [0u8; 32];
         recipient_ed_pub.copy_from_slice(&data[pos..pos + 32]); pos += 32;
         let mut ml_kem_pub = [0u8; ML_KEM_PUB_BYTES];
-        ml_kem_pub.copy_from_slice(&data[pos..pos + ML_KEM_PUB_BYTES]);
-        Ok(SessionInit { ed_pub, signature, x25519_pub, timestamp_ms, recipient_ed_pub, ml_kem_pub })
+        ml_kem_pub.copy_from_slice(&data[pos..pos + ML_KEM_PUB_BYTES]); pos += ML_KEM_PUB_BYTES;
+        let mut sender_coord = [0u8; 16];
+        sender_coord.copy_from_slice(&data[pos..pos + 16]);
+        Ok(SessionInit { ed_pub, signature, x25519_pub, timestamp_ms, recipient_ed_pub, ml_kem_pub, sender_coord })
     }
 
     /// Verify the signature *and* that the init is fresh and addressed to `expected_recipient`.
@@ -733,6 +746,10 @@ pub struct SessionAck {
     pub timestamp_ms: u64,
     pub recipient_ed_pub: [u8; 32],
     pub ml_kem_ct: [u8; ML_KEM_CT_BYTES],
+    /// Sender's current hyperbolic coordinate (advisory, unsigned — see
+    /// `SessionInit::sender_coord`). Lets the initiator learn the responder's
+    /// coord so it can stamp `dest_coord` and route greedily (Phase 2).
+    pub sender_coord: [u8; 16],
 }
 
 impl SessionAck {
@@ -741,6 +758,7 @@ impl SessionAck {
         x25519_pub: &X25519PublicKey,
         recipient_ed_pub: &[u8; 32],
         ml_kem_ct: &[u8; ML_KEM_CT_BYTES],
+        sender_coord: [u8; 16],
     ) -> Self {
         let ed_pub = signing_key.verifying_key().to_bytes();
         let x_bytes = *x25519_pub.as_bytes();
@@ -752,12 +770,12 @@ impl SessionAck {
         SessionAck {
             ed_pub, signature, x25519_pub: x_bytes,
             timestamp_ms, recipient_ed_pub: *recipient_ed_pub,
-            ml_kem_ct: *ml_kem_ct,
+            ml_kem_ct: *ml_kem_ct, sender_coord,
         }
     }
 
     pub fn encode(&self) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(1 + 32 + 64 + 32 + 8 + 32 + ML_KEM_CT_BYTES);
+        let mut buf = Vec::with_capacity(SESSION_ACK_WIRE_BYTES);
         buf.push(SESSION_ACK_MAGIC);
         buf.extend_from_slice(&self.ed_pub);
         buf.extend_from_slice(&self.signature);
@@ -765,6 +783,7 @@ impl SessionAck {
         buf.extend_from_slice(&self.timestamp_ms.to_le_bytes());
         buf.extend_from_slice(&self.recipient_ed_pub);
         buf.extend_from_slice(&self.ml_kem_ct);
+        buf.extend_from_slice(&self.sender_coord);
         buf
     }
 
@@ -772,7 +791,7 @@ impl SessionAck {
         if data.is_empty() || data[0] != SESSION_ACK_MAGIC {
             bail!("invalid SessionAck magic");
         }
-        let need = 1 + 32 + 64 + 32 + 8 + 32 + ML_KEM_CT_BYTES;
+        let need = SESSION_ACK_WIRE_BYTES;
         if data.len() < need {
             bail!("SessionAck too short: {} (need {})", data.len(), need);
         }
@@ -789,8 +808,10 @@ impl SessionAck {
         let mut recipient_ed_pub = [0u8; 32];
         recipient_ed_pub.copy_from_slice(&data[pos..pos + 32]); pos += 32;
         let mut ml_kem_ct = [0u8; ML_KEM_CT_BYTES];
-        ml_kem_ct.copy_from_slice(&data[pos..pos + ML_KEM_CT_BYTES]);
-        Ok(SessionAck { ed_pub, signature, x25519_pub, timestamp_ms, recipient_ed_pub, ml_kem_ct })
+        ml_kem_ct.copy_from_slice(&data[pos..pos + ML_KEM_CT_BYTES]); pos += ML_KEM_CT_BYTES;
+        let mut sender_coord = [0u8; 16];
+        sender_coord.copy_from_slice(&data[pos..pos + 16]);
+        Ok(SessionAck { ed_pub, signature, x25519_pub, timestamp_ms, recipient_ed_pub, ml_kem_ct, sender_coord })
     }
 
     pub fn verify(&self, expected_recipient: &[u8; 32]) -> Result<()> {
@@ -853,6 +874,10 @@ pub struct SessionManager {
     /// Sybil-PoW cost (`min_peer_difficulty_bits`) to generate enough
     /// distinct ed_pubs to amplify around this cap.
     init_rate_log: HashMap<[u8; 32], Vec<std::time::Instant>>,
+    /// Our current hyperbolic coordinate (`HypCoord::encode`), pushed in by the
+    /// router whenever it recomputes `own_coord`. Stamped into outbound
+    /// SessionInit/Ack so peers learn where we sit in the embedding (Phase 2).
+    own_coord: [u8; 16],
 }
 
 /// Per-source rate-limit window for inbound `handle_init`. Must be short
@@ -874,7 +899,15 @@ impl SessionManager {
             pq_keys: PqKeys::generate(),
             _pq_pending: HashMap::new(),
             init_rate_log: HashMap::new(),
+            own_coord: [0u8; 16], // origin until the router pushes the real coord
         }
+    }
+
+    /// Push our current hyperbolic coord (called by the router's
+    /// `update_own_coord`). Stamped into outbound SessionInit/Ack so peers learn
+    /// our position and can route to us greedily.
+    pub fn set_own_coord(&mut self, coord: [u8; 16]) {
+        self.own_coord = coord;
     }
 
     /// Record an init attempt from `source` and return whether the source is
@@ -997,7 +1030,7 @@ impl SessionManager {
             }
             let local_pub = X25519PublicKey::from(&existing.local_x25519_priv);
             let ack = SessionAck::create(
-                &self.our_signing_key, &local_pub, &init.ed_pub, &ml_kem_ct,
+                &self.our_signing_key, &local_pub, &init.ed_pub, &ml_kem_ct, self.own_coord,
             );
             return Ok(ack.encode());
         }
@@ -1012,7 +1045,7 @@ impl SessionManager {
             .insert(init.ed_pub, std::sync::Arc::new(std::sync::Mutex::new(info)));
 
         let ack = SessionAck::create(
-            &self.our_signing_key, &local_pub, &init.ed_pub, &ml_kem_ct,
+            &self.our_signing_key, &local_pub, &init.ed_pub, &ml_kem_ct, self.own_coord,
         );
         Ok(ack.encode())
     }
@@ -1069,7 +1102,7 @@ impl SessionManager {
             std::sync::Arc::new(std::sync::Mutex::new(info)),
         );
         SessionInit::create(
-            &self.our_signing_key, &local_pub, remote_ed_pub, self.pq_keys.pub_bytes(),
+            &self.our_signing_key, &local_pub, remote_ed_pub, self.pq_keys.pub_bytes(), self.own_coord,
         ).encode()
     }
 
@@ -1154,7 +1187,7 @@ impl SessionManager {
             let local_pub = info.local_x25519_pub;
             drop(info);
             let init = SessionInit::create(
-                &self.our_signing_key, &local_pub, ed_pub, self.pq_keys.pub_bytes(),
+                &self.our_signing_key, &local_pub, ed_pub, self.pq_keys.pub_bytes(), self.own_coord,
             )
             .encode();
             out.push((*ed_pub, init));
@@ -1309,9 +1342,10 @@ mod tests {
         let pub_b = sk_b.verifying_key().to_bytes();
         let mut mgr_a = SessionManager::new(sk_a);
         let mut init_bytes = mgr_a.initiate(&pub_b);
-        // Corrupt the signature bytes (last 64 bytes of SessionInit)
-        let n = init_bytes.len();
-        init_bytes[n - 1] ^= 0xFF;
+        // Corrupt a signature byte (sig is at offset 33..97). NB the trailing
+        // 16 bytes are the unsigned advisory sender_coord, so flipping those
+        // would (correctly) NOT be caught by signature verification.
+        init_bytes[50] ^= 0xFF;
         let mut mgr_b = SessionManager::new(sk_b);
         assert!(mgr_b.handle_init(&init_bytes).is_err(),
             "tampered SessionInit signature must be rejected");
@@ -1326,9 +1360,8 @@ mod tests {
         let mut mgr_b = SessionManager::new(sk_b);
         let init = mgr_a.initiate(&pub_b);
         let mut ack = mgr_b.handle_init(&init).unwrap();
-        // Corrupt ACK signature
-        let n = ack.len();
-        ack[n - 1] ^= 0xFF;
+        // Corrupt a signature byte (offset 33..97); trailing coord is unsigned.
+        ack[50] ^= 0xFF;
         assert!(mgr_a.handle_ack(&ack).is_err(),
             "tampered SessionAck signature must be rejected");
     }
@@ -1587,13 +1620,13 @@ mod tests {
         let x_priv = StaticSecret::random_from_rng(OsRng);
         let x_pub = X25519PublicKey::from(&x_priv);
         let ek = dummy_ml_kem_pub();
-        let init = SessionInit::create(&sk, &x_pub, &recipient, &ek);
+        let init = SessionInit::create(&sk, &x_pub, &recipient, &ek, [0u8; 16]);
         assert!(init.verify(&recipient).is_ok(), "valid init must verify");
         // Tamper with x25519_pub — signature no longer matches
         let bad_init = SessionInit { x25519_pub: [0xFFu8; 32], ..init };
         assert!(bad_init.verify(&recipient).is_err(), "tampered x25519_pub must fail verify");
         // Tamper with ed_pub — signature fails
-        let init = SessionInit::create(&sk, &x_pub, &recipient, &ek);
+        let init = SessionInit::create(&sk, &x_pub, &recipient, &ek, [0u8; 16]);
         let bad_init = SessionInit {
             x25519_pub: init.x25519_pub,
             ed_pub: [0xEEu8; 32],
@@ -1607,7 +1640,7 @@ mod tests {
         let sk = SigningKey::generate(&mut OsRng);
         let recipient = SigningKey::generate(&mut OsRng).verifying_key().to_bytes();
         let x_pub = X25519PublicKey::from(&StaticSecret::random_from_rng(OsRng));
-        let init = SessionInit::create(&sk, &x_pub, &recipient, &dummy_ml_kem_pub());
+        let init = SessionInit::create(&sk, &x_pub, &recipient, &dummy_ml_kem_pub(), [0u8; 16]);
         let bad_init = SessionInit { ml_kem_pub: [0xCDu8; ML_KEM_PUB_BYTES], ..init };
         assert!(bad_init.verify(&recipient).is_err(),
             "tampered ml_kem_pub must invalidate the signature");
@@ -1619,7 +1652,7 @@ mod tests {
         let intended = SigningKey::generate(&mut OsRng).verifying_key().to_bytes();
         let other    = SigningKey::generate(&mut OsRng).verifying_key().to_bytes();
         let x_pub = X25519PublicKey::from(&StaticSecret::random_from_rng(OsRng));
-        let init = SessionInit::create(&sk, &x_pub, &intended, &dummy_ml_kem_pub());
+        let init = SessionInit::create(&sk, &x_pub, &intended, &dummy_ml_kem_pub(), [0u8; 16]);
         // Wrong recipient must reject (anti cross-target replay)
         assert!(init.verify(&other).is_err(), "init bound to {:?} must not verify for {:?}", &intended[..4], &other[..4]);
         assert!(init.verify(&intended).is_ok());
@@ -1630,7 +1663,7 @@ mod tests {
         let sk = SigningKey::generate(&mut OsRng);
         let recipient = SigningKey::generate(&mut OsRng).verifying_key().to_bytes();
         let x_pub = X25519PublicKey::from(&StaticSecret::random_from_rng(OsRng));
-        let mut init = SessionInit::create(&sk, &x_pub, &recipient, &dummy_ml_kem_pub());
+        let mut init = SessionInit::create(&sk, &x_pub, &recipient, &dummy_ml_kem_pub(), [0u8; 16]);
         // Roll the timestamp 10 minutes into the past and re-sign to keep the sig valid.
         init.timestamp_ms = init.timestamp_ms.saturating_sub(10 * 60 * 1000);
         let sign_data = build_init_sign_bytes(

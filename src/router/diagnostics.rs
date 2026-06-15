@@ -109,6 +109,22 @@ pub static TREE_PARENT_CHANGES: std::sync::atomic::AtomicU64 =
 pub static CUCKOO_NO_ROUTE: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
+/// Transit forwarding path taken (Phase 1/2 validation): GREEDY = forwarded by
+/// hyperbolic distance toward a stamped dest_coord; CUCKOO = fell back to
+/// cuckoo-filter reachability (no coord, or greedy local minimum). The ratio
+/// shows how load-bearing greedy actually is. Surfaced as
+/// `norn_transit_greedy_total` / `norn_transit_cuckoo_total`.
+pub static TRANSIT_GREEDY: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub static TRANSIT_CUCKOO: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Snapshot of the transit-path counters `(greedy, cuckoo)`.
+pub fn transit_path_counts() -> (u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (TRANSIT_GREEDY.load(Relaxed), TRANSIT_CUCKOO.load(Relaxed))
+}
+
 /// Snapshot of the convergence counters `(parent_changes, no_route)` for the
 /// Prometheus exposition.
 pub fn convergence_counts() -> (u64, u64) {

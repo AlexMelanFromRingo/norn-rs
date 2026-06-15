@@ -292,14 +292,24 @@ impl RouterState {
                     };
                     if raw.first().copied() == Some(SESSION_INIT_MAGIC) {
                         let ack_opt = self.sessions.write_or_recover().handle_init(&raw).ok();
-                        if let Some(ack_bytes) = ack_opt
-                            && raw.len() >= 33 {
+                        if let Some(ack_bytes) = ack_opt {
+                            // Learn the initiator's coord (Phase 2): now we can
+                            // stamp dest_coord on reverse traffic to it.
+                            if let Ok(init) = SessionInit::decode(&raw) {
+                                self.note_peer_coord(init.ed_pub, init.sender_coord);
+                            }
+                            if raw.len() >= 33 {
                                 let mut sender = [0u8; 32];
                                 sender.copy_from_slice(&raw[1..33]);
                                 self.send_traffic_to(&sender, ack_bytes);
                             }
-                    } else if raw.first().copied() == Some(SESSION_ACK_MAGIC) {
-                        let _ = self.sessions.write_or_recover().handle_ack(&raw);
+                        }
+                    } else if raw.first().copied() == Some(SESSION_ACK_MAGIC)
+                        && self.sessions.write_or_recover().handle_ack(&raw).is_ok()
+                        && let Ok(ack) = SessionAck::decode(&raw)
+                    {
+                        // Learn the responder's coord (Phase 2).
+                        self.note_peer_coord(ack.ed_pub, ack.sender_coord);
                     }
                 }
                 packet::PKT_DATA => {
@@ -377,10 +387,22 @@ impl RouterState {
             // FALLBACK: cuckoo reachability on routing_tag (local minimum, or
             // the source didn't stamp a coord). Excluding `from` avoids the
             // trivial 2-cycle that bidirectional cuckoo gossip routinely makes.
-            let next_hop = traffic.dest_coord
+            let greedy_hop = traffic.dest_coord
                 .map(|c| HypCoord::decode(&c))
-                .and_then(|dc| self.greedy_next_hop(dc, Some(from)))
-                .or_else(|| self.lookup_by_tag_excluding(&traffic.routing_tag, Some(from)));
+                .and_then(|dc| self.greedy_next_hop(dc, Some(from)));
+            let next_hop = match greedy_hop {
+                Some(h) => {
+                    TRANSIT_GREEDY.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    Some(h)
+                }
+                None => {
+                    let h = self.lookup_by_tag_excluding(&traffic.routing_tag, Some(from));
+                    if h.is_some() {
+                        TRANSIT_CUCKOO.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    h
+                }
+            };
 
             if let Some(next_hop) = next_hop {
                 let mut fwd = traffic;

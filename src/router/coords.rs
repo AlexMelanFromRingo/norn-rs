@@ -19,6 +19,35 @@ impl RouterState {
         self.own_coord =
             HypCoord::from_tree_position(self.own_depth, parent_theta, &self.pub_key);
         self.coord_table.insert(self.pub_key, self.own_coord);
+        // Push the fresh coord into the session layer so outbound SessionInit/Ack
+        // advertise our current position (Phase 2 coord dissemination).
+        self.sessions.write_or_recover().set_own_coord(self.own_coord.encode());
+    }
+
+    /// Record a peer's hyperbolic coord learned from a session handshake
+    /// (Phase 2). This is what makes greedy work multi-hop: once we know the
+    /// destination's coord we stamp it as `dest_coord` on Traffic so transit
+    /// nodes route greedily. Advisory — beyond the handshake's identity auth the
+    /// coord is unverified (we don't know the peer's depth here), so a bogus
+    /// coord only degrades greedy to the cuckoo fallback and is caught by the
+    /// trust/probing defence. O(active sessions); respects the coord-table cap.
+    pub(crate) fn note_peer_coord(&mut self, peer: [u8; 32], coord_bytes: [u8; 16]) {
+        let coord = HypCoord::decode(&coord_bytes);
+        if !coord.rho.is_finite() || !coord.theta.is_finite() {
+            return;
+        }
+        if self.coord_table.len() >= MAX_COORD_TABLE_SIZE
+            && !self.coord_table.contains_key(&peer)
+        {
+            let victim = self.coord_table.keys()
+                .find(|k| !self.peers.contains_key(*k) && **k != self.pub_key)
+                .copied();
+            match victim {
+                Some(v) => { self.coord_table.remove(&v); }
+                None => return,
+            }
+        }
+        self.coord_table.insert(peer, coord);
     }
 
     /// Broadcast our hyperbolic coordinate + onion ephemeral pub to all peers.
