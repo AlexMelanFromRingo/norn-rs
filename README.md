@@ -19,8 +19,9 @@ norn-rs creates an encrypted IPv6 mesh network. Each node gets a unique `200::/7
 | Feature | Status |
 |---------|--------|
 | K=3 spanning trees (Urd/Verdandi/Skuld) | ✅ |
-| Hyperbolic geometric routing (v4 hyperboloid, cancellation-free distance) | ✅ |
-| Transit greedy routing (destination coord stamped in Traffic) | ✅ |
+| Hyperbolic greedy routing — load-bearing primary (v5 tree-position embedding) | ✅ |
+| Coordinate dissemination at session setup (handshake-carried, O(sessions)) | ✅ |
+| Transit greedy routing (destination coord stamped in Traffic; cuckoo fallback) | ✅ |
 | Cuckoo filter gossip (2-byte fingerprints, FPR 0.012%) | ✅ |
 | ChaCha20-Poly1305 session encryption | ✅ |
 | X25519 + ML-KEM-768 PQ-hybrid session keys | ✅ |
@@ -83,9 +84,26 @@ Addresses fall in the `200::/7` range. The address is **permanent** as long as t
 
 ### Routing
 
-Traffic is routed using **cuckoo filter gossip**: each node broadcasts a compact probabilistic set of all reachable addresses to its neighbors. Intermediate nodes forward packets toward peers whose filter contains the destination routing tag. No full routing table is exchanged — only 4096-byte bloom-like filters.
+Routing is **greedy hyperbolic, with cuckoo-filter gossip as the fallback** (v0.11+):
 
-The routing tag is `BLAKE2b("norn:route" || dest_pub_key)[..16]` — a privacy-preserving identifier that prevents intermediate nodes from learning the destination's public key.
+- **Greedy hyperbolic (primary, load-bearing).** Each node has a coordinate on the
+  hyperbolic plane derived from its position in the K=3 spanning trees (a
+  Kleinberg/Sarkar-style embedding: radius from tree depth, angle from the parent's
+  angle plus a depth-shrinking per-node offset, so descendants cluster under their
+  ancestor). A source learns a destination's coordinate when it sets up a session
+  (the coordinate rides in the handshake — O(active sessions), no flooding), stamps
+  it on each packet, and every transit hop forwards to the neighbour strictly
+  closer to it in hyperbolic distance. This is loop-free by construction. In a
+  100-node WAN cluster ~50% of transit forwards go via greedy (the rest fall back to
+  cuckoo for first-contact bootstrap and greedy local minima); see
+  `norn_transit_greedy_total` / `norn_transit_cuckoo_total` on `/metrics`.
+- **Cuckoo-filter gossip (fallback + bootstrap).** Each node broadcasts a compact
+  probabilistic set of reachable addresses, aggregated along the trees. Used to
+  route the first handshake to a never-before-contacted destination (before its
+  coordinate is known) and whenever greedy hits a local minimum. No full routing
+  table is exchanged — only 4096-byte bloom-like filters.
+
+The routing tag is `BLAKE2b("norn:route" || dest_pub_key)[..16]` — a privacy-preserving identifier that prevents intermediate nodes from learning the destination's public key. (Transit nodes also see the destination's coordinate *region*, not its identity; the opt-in onion layer hides even that.)
 
 ### Security
 
@@ -295,14 +313,17 @@ The 81 % consensus is achieved under simultaneous NetEm 50 ms ± 10 ms / 2 %
 loss AND mid-run chaos (~10 % of nodes killed and restored). Without
 churn, all 100 nodes converge on one root per tree.
 
-**Known limitation** — `own_depth` (the local hop-distance estimate
-tracked for tree 0) inflates well past the true mesh diameter under
-rapid parent changes — a classic distance-vector count-to-infinity
-artefact. The routing layer doesn't depend on `own_depth` for correctness
-(it only feeds the optional hyperbolic-coord initialisation), so this
-shows up only in `/metrics` rather than as functional breakage. Fixing
-it cleanly needs a separate split-horizon / poisoned-reverse pass and
-is tracked separately.
+**Known limitation (tolerated)** — `own_depth` (the tree-0 hop-distance estimate)
+inflates past the true mesh diameter under rapid parent changes — a classic
+distance-vector count-to-infinity artefact. It is **deliberately tolerated**:
+routing is healthy at 100 nodes with or without it (trust ~3.5/4, loss ~0, 0
+panics), and greedy stays load-bearing (~50% of transit) even with the inflated
+depth. The clean fix is a root-abdication guard, but landing it on cuckoo-only
+routing exposes persistent convergence-window holes on single-path topologies, and
+greedy does **not** unblock it (the first handshake bootstraps via cuckoo, before a
+destination's coordinate is known). So it stays tolerated pending a separate
+cuckoo-bootstrap-convergence effort. See `docs/transit-cuckoo-convergence-design.md`
+and `docs/transit-greedy-design.md`.
 
 ![Convergence — peer count per node](docs/cluster/convergence.svg)
 ![Per-peer latency over time](docs/cluster/latency.svg)

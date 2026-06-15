@@ -99,6 +99,39 @@ pub static CONTROL_BROADCASTS: std::sync::atomic::AtomicU64 =
 pub static CONTROL_SUPPRESSED: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
+/// Convergence instrumentation (B-step-3 §5). `TREE_PARENT_CHANGES` counts every
+/// actual parent-pointer switch in `fix_tree` — a *settled* topology should stop
+/// incrementing it; continued growth = parent flapping (the count-to-∞ window
+/// cause). `CUCKOO_NO_ROUTE` counts transit "no route" events. Surfaced as
+/// `norn_tree_parent_changes_total` / `norn_cuckoo_no_route_total`.
+pub static TREE_PARENT_CHANGES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub static CUCKOO_NO_ROUTE: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Transit forwarding path taken (Phase 1/2 validation): GREEDY = forwarded by
+/// hyperbolic distance toward a stamped dest_coord; CUCKOO = fell back to
+/// cuckoo-filter reachability (no coord, or greedy local minimum). The ratio
+/// shows how load-bearing greedy actually is. Surfaced as
+/// `norn_transit_greedy_total` / `norn_transit_cuckoo_total`.
+pub static TRANSIT_GREEDY: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub static TRANSIT_CUCKOO: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Snapshot of the transit-path counters `(greedy, cuckoo)`.
+pub fn transit_path_counts() -> (u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (TRANSIT_GREEDY.load(Relaxed), TRANSIT_CUCKOO.load(Relaxed))
+}
+
+/// Snapshot of the convergence counters `(parent_changes, no_route)` for the
+/// Prometheus exposition.
+pub fn convergence_counts() -> (u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (TREE_PARENT_CHANGES.load(Relaxed), CUCKOO_NO_ROUTE.load(Relaxed))
+}
+
 /// Snapshot of the control-broadcast counters `(sent, suppressed)` for
 /// the Prometheus exposition.
 pub fn control_broadcast_counts() -> (u64, u64) {

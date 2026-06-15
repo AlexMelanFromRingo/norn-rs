@@ -1139,7 +1139,7 @@
 
     fn make_coord_announce(sk: &SigningKey, tree_depth: u32, coord: HypCoord) -> CoordAnnounce {
         let unsigned = CoordAnnounce {
-            version: COORD_FORMAT_V4,
+            version: COORD_FORMAT_V5,
             coord: coord.encode(),
             tree_depth,
             onion_eph_pub: [0u8; 32],
@@ -1183,19 +1183,26 @@
     }
 
     #[test]
-    fn coord_announce_spoofed_theta_rejected() {
+    fn coord_announce_theta_is_advisory_in_v5() {
+        // v5 greedy embedding: θ is tree-position-derived (parent's θ + per-node
+        // offset), so a verifier can't recompute it without the announcer's
+        // parent context — θ is accepted as an advisory greedy hint. A peer that
+        // lies about θ to attract greedy traffic and then drops it is caught by
+        // the same trust-decay + active-probing defence as cuckoo poisoning. Only
+        // rho stays depth-bound (see coord_announce_spoofed_r_rejected). So a
+        // correct-rho coord with an arbitrary θ is ACCEPTED.
         let mut rs = make_router();
         let sk = SigningKey::generate(&mut OsRng);
         let pk = sk.verifying_key().to_bytes();
         add_dummy_peer(&mut rs, pk);
-        let spoof = HypCoord {
+        let coord = HypCoord {
             rho: 3.0,     // correct rho for depth=3 (RADIAL_STEP=1.0)
-            theta: 1.234, // arbitrary theta, NOT derived from pk
+            theta: 1.234, // arbitrary θ — advisory in v5
         };
-        let ann = make_coord_announce(&sk, 3, spoof);
+        let ann = make_coord_announce(&sk, 3, coord);
         rs.handle_coord_announce(pk, ann);
-        assert!(!rs.coord_table.contains_key(&pk),
-            "spoofed CoordAnnounce (theta ≠ angle_from_key) must be rejected");
+        assert!(rs.coord_table.contains_key(&pk),
+            "v5: a correct-rho coord with advisory θ must be accepted");
     }
 
     #[test]

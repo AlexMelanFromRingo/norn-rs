@@ -158,6 +158,31 @@ pub fn render(conn: &PacketConn, started: Instant) -> String {
     out.push_str("# TYPE norn_control_suppressed_total counter\n");
     out.push_str(&format!("norn_control_suppressed_total {ctrl_suppressed}\n"));
 
+    // Convergence instrumentation (B-step-3 §5). On a SETTLED topology
+    // parent-changes must stop climbing — continued growth = parent flapping.
+    let (parent_changes, no_route) = crate::router::convergence_counts();
+    out.push_str("# HELP norn_tree_parent_changes_total \
+                  Spanning-tree parent-pointer switches in fix_tree. Continued \
+                  growth on a settled topology indicates parent flapping.\n");
+    out.push_str("# TYPE norn_tree_parent_changes_total counter\n");
+    out.push_str(&format!("norn_tree_parent_changes_total {parent_changes}\n"));
+    out.push_str("# HELP norn_cuckoo_no_route_total \
+                  Transit packets with no route (cuckoo miss / transient hole).\n");
+    out.push_str("# TYPE norn_cuckoo_no_route_total counter\n");
+    out.push_str(&format!("norn_cuckoo_no_route_total {no_route}\n"));
+
+    // Phase 1/2: how load-bearing hyperbolic greedy actually is for transit —
+    // greedy (by stamped dest_coord) vs cuckoo fallback (no coord / local min).
+    let (transit_greedy, transit_cuckoo) = crate::router::transit_path_counts();
+    out.push_str("# HELP norn_transit_greedy_total \
+                  Transit packets forwarded by hyperbolic greedy (dest_coord).\n");
+    out.push_str("# TYPE norn_transit_greedy_total counter\n");
+    out.push_str(&format!("norn_transit_greedy_total {transit_greedy}\n"));
+    out.push_str("# HELP norn_transit_cuckoo_total \
+                  Transit packets forwarded by cuckoo fallback (no coord / local min).\n");
+    out.push_str("# TYPE norn_transit_cuckoo_total counter\n");
+    out.push_str(&format!("norn_transit_cuckoo_total {transit_cuckoo}\n"));
+
     // Per-message-type egress byte accounting — answers "where does the
     // gossip bandwidth go?" (cuckoo vs reputation vs pathfind vs coord …).
     out.push_str("# HELP norn_tx_bytes_by_type Bytes sent to peers, by frame type.\n");

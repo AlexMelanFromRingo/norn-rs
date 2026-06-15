@@ -159,3 +159,30 @@ PathNegative fix.
   stays bounded (loop-free); recovery after node failure; behaviour with
   `dest_coord = None` (cuckoo path unchanged).
 * Integration: the existing multi-node topology tests stay green.
+
+## Implementation outcome (Phase 1 + 2, branch feat/convergence-phase0)
+
+The "actual full fix" above was built and measured. Findings:
+
+**Phase 1 — tree-position greedy embedding (coord v5).** `HypCoord::from_tree_position`
+replaces the random key-hash θ with `θ = parent_θ + per-node-offset` in a
+depth-shrinking sector, so descendants cluster under their ancestor and greedy has
+a real gradient (unit-tested: a descendant is closer to its ancestor than to a
+foreign subtree). θ anti-spoof relaxed to advisory (ρ stays depth-bound); a
+θ-spoof sinkhole is caught by the existing trust-decay + active-probing.
+
+**Phase 2 — coord dissemination at session setup.** SessionInit/Ack carry the
+sender's coord (advisory, unsigned — formal sign_bytes untouched). On a completed
+handshake each side stores the peer's coord (`note_peer_coord` → coord_table), so
+the write path stamps a real `dest_coord` and transit routes greedily. New metrics
+`norn_transit_greedy_total` / `norn_transit_cuckoo_total` quantify the split.
+
+**Key correction to the coupling hypothesis.** Greedy becomes load-bearing for
+DATA and repeat-contact traffic (narrative ≈ reality for the data plane). But the
+**first handshake bootstrap still routes via cuckoo** — chicken-and-egg: the source
+learns the destination's coord *from* the session it is trying to establish. So
+greedy does **not** unblock the count-to-∞ abdication guard: the guard's blocker is
+the cuckoo *bootstrap* convergence hole on single-path topologies, which greedy
+cannot cover. count-to-∞ therefore remains tolerated/deferred; the realistic win is
+"greedy carries the bulk (data + repeat contacts), cuckoo bootstraps first contact
+and covers local minima."

@@ -20,7 +20,7 @@ pub const TYPE_COORD_ANNOUNCE: u8 = 10;
 /// in depth) on the hyperboloid model instead of the legacy Poincaré `r =
 /// tanh(depth/2)`, which saturated in f64 at depth ~24–38. Flag-day bump: a
 /// `CoordAnnounce` with any other version is rejected (no v3↔v4 negotiation).
-pub const COORD_FORMAT_V4: u8 = 4;
+pub const COORD_FORMAT_V5: u8 = 5;
 pub const TYPE_ONION: u8 = 11;
 pub const TYPE_ONION_KEY_ANNOUNCE: u8 = 12;
 pub const TYPE_REPUTATION_REPORT: u8 = 13;
@@ -899,14 +899,14 @@ impl ReputationReport {
 /// and signed by its long-term ed25519 key.
 ///
 /// Wire layout (v2):
-///   [version: 1 = COORD_FORMAT_V4][coord: 16][tree_depth: u32 LE][onion_eph_pub: 32][sig: 64]
+///   [version: 1 = COORD_FORMAT_V5][coord: 16][tree_depth: u32 LE][onion_eph_pub: 32][sig: 64]
 ///
 /// Signature covers: version || coord || tree_depth || onion_eph_pub. The receiver
 /// authenticates the announced ephemeral pub against the sender's identity
 /// before using it for onion DH.
 #[derive(Clone, Debug)]
 pub struct CoordAnnounce {
-    /// Coordinate wire-format version (`COORD_FORMAT_V4`). Authenticated (in
+    /// Coordinate wire-format version (`COORD_FORMAT_V5`). Authenticated (in
     /// `sign_bytes`) and checked on decode, so a v3 frame cannot be accepted.
     pub version: u8,
     pub coord: [u8; 16],
@@ -940,8 +940,8 @@ impl CoordAnnounce {
             bail!("CoordAnnounce too short: got {} (need {})", data.len(), need);
         }
         let version = data[0];
-        if version != COORD_FORMAT_V4 {
-            bail!("CoordAnnounce unsupported version {} (expected {})", version, COORD_FORMAT_V4);
+        if version != COORD_FORMAT_V5 {
+            bail!("CoordAnnounce unsupported version {} (expected {})", version, COORD_FORMAT_V5);
         }
         let mut coord = [0u8; 16];
         coord.copy_from_slice(&data[1..17]);
@@ -1576,7 +1576,7 @@ mod tests {
     #[test]
     fn coord_announce_roundtrip() {
         let ann = CoordAnnounce {
-            version: COORD_FORMAT_V4,
+            version: COORD_FORMAT_V5,
             coord: [0xABu8; 16],
             tree_depth: 42,
             onion_eph_pub: [0x77u8; 32],
@@ -1595,7 +1595,7 @@ mod tests {
     #[test]
     fn coord_announce_tree_depth_is_little_endian() {
         let ann = CoordAnnounce {
-            version: COORD_FORMAT_V4,
+            version: COORD_FORMAT_V5,
             coord: [0u8; 16],
             tree_depth: 0x01020304,
             onion_eph_pub: [0u8; 32],
@@ -1604,7 +1604,7 @@ mod tests {
         let mut buf = Vec::new();
         ann.encode_into(&mut buf);
         // byte 0 is the version; tree_depth occupies bytes 17..21 (after version+coord).
-        assert_eq!(buf[0], COORD_FORMAT_V4, "version byte");
+        assert_eq!(buf[0], COORD_FORMAT_V5, "version byte");
         assert_eq!(buf[17], 0x04, "LE byte 0");
         assert_eq!(buf[18], 0x03, "LE byte 1");
         assert_eq!(buf[19], 0x02, "LE byte 2");
@@ -1616,7 +1616,7 @@ mod tests {
     #[test]
     fn coord_announce_rejects_non_v4_version() {
         let ann = CoordAnnounce {
-            version: COORD_FORMAT_V4,
+            version: COORD_FORMAT_V5,
             coord: [1u8; 16],
             tree_depth: 3,
             onion_eph_pub: [2u8; 32],
@@ -1845,7 +1845,7 @@ mod tests {
         assert!(CoordAnnounce::decode(&[0u8; 0]).is_err(), "empty must fail");
         // Full length is necessary but not sufficient: the version byte must be v4.
         let mut ok = vec![0u8; need];
-        ok[0] = COORD_FORMAT_V4;
+        ok[0] = COORD_FORMAT_V5;
         assert!(CoordAnnounce::decode(&ok).is_ok(), "{need} bytes with the v4 version must succeed");
     }
 

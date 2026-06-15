@@ -1,8 +1,22 @@
 # norn-rs wire protocol
 
 This document is the normative reference for the `norn-rs` protocol as of
-version **0.10.x** (the current flag-day wire format). Implementations claiming
+version **0.11.x** (the current flag-day wire format). Implementations claiming
 compatibility MUST match this specification byte-for-byte.
+
+### 0.11 changes vs 0.10 (flag-day — wire-incompatible with 0.10.x)
+
+Makes hyperbolic greedy routing load-bearing (it was effectively a no-op before):
+
+* **Coordinate format v5 (tree-position embedding).** COORD_ANNOUNCE's `theta` is
+  now derived from the node's position in the tree (parent's θ + a depth-shrinking
+  per-node offset) instead of a random key-hash, so descendants cluster under their
+  ancestor and greedy has a real gradient. Same 117-byte layout as v4; only the
+  version byte (→5) and θ semantics change. ρ stays depth-derived.
+* **Coordinate dissemination at session setup.** SessionInit/SessionAck (§11) each
+  carry the sender's 16-byte coord (advisory, *not* in the signed payload), so a
+  source learns a multi-hop destination's coordinate and can stamp `dest_coord`
+  (§8) → transit routes greedily. O(active sessions), no flooding.
 
 ### 0.10 changes vs 0.5 (flag-day — wire-incompatible with 0.9.x)
 
@@ -268,23 +282,28 @@ layer hides it.
 
 ## 9. COORD_ANNOUNCE (0x0A)
 
-v4 layout (117 bytes):
+v5 layout (117 bytes):
 
 ```
-[version: u8 = 4]             — COORD_FORMAT_V4 (authenticated)
+[version: u8 = 5]             — COORD_FORMAT_V5 (authenticated)
 [coord: 16]                   — HypCoord (rho: f64 LE, theta: f64 LE) — hyperboloid
 [tree_depth: u32 LE]
 [onion_eph_pub: 32]           — sender's current onion ephemeral X25519 pub
 [sig: 64]                     — sender signs (version || coord || tree_depth || onion_eph_pub)
 ```
 
-`rho` is the radial hyperbolic distance (linear in tree depth, unsaturating),
-replacing the old Poincaré `r = tanh(depth·0.5)`. Distances are computed
-cancellation-free on the hyperboloid model.
+`rho` is the radial hyperbolic distance (linear in tree depth, unsaturating).
+`theta` (v5) is **tree-position-derived** — the parent's θ plus a depth-shrinking
+per-node offset — so descendants cluster under their ancestor and greedy has a
+gradient (v4 used a random key-hash θ with no tree relation). Distances are
+computed cancellation-free on the hyperboloid model.
 
 Receivers MUST:
-* reject any `version` byte other than `COORD_FORMAT_V4` (4);
+* reject any `version` byte other than `COORD_FORMAT_V5` (5);
 * verify the signature;
+* verify `rho` matches the depth-derived value; treat `theta` as ADVISORY (it is
+  tree-position-derived and cannot be recomputed without the announcer's parent
+  context — a θ-spoof sinkhole is caught by trust-decay + active probing);
 * reject coords containing NaN or Inf;
 * bound the coord table to 16 384 entries (evict a non-peer entry when full);
 * record `onion_eph_pub` against the announcing peer for later onion building.
@@ -347,7 +366,7 @@ and 0–49 ms jitter as TRAFFIC forwarding.
 Carried inside TRAFFIC packets with `pkt_type = 0x00`. Two messages, both
 sign-then-encapsulate.
 
-### 11.1 SessionInit (1353 bytes)
+### 11.1 SessionInit (1369 bytes)
 
 ```
 [magic: 1 = 0x74 't' (v3)]
@@ -357,10 +376,14 @@ sign-then-encapsulate.
 [timestamp_ms: u64 LE]
 [recipient_ed_pub: 32]             — intended responder's identity
 [ml_kem_pub: 1184]                 — sender's ML-KEM-768 encapsulation key
+[sender_coord: 16]                 — sender's HypCoord (v0.11; advisory, NOT signed)
 ```
 
-`signature` covers everything except the sig field itself:
+`signature` covers everything except the sig field **and the trailing
+sender_coord** (an advisory routing hint, not security-critical):
 `magic || ed_pub || x25519_pub || timestamp_ms || recipient_ed_pub || ml_kem_pub`.
+The recipient records `sender_coord` so it can stamp `dest_coord` on reverse
+traffic (greedy routing, §0.11 changes).
 
 Receivers MUST:
 * match `recipient_ed_pub` against their own pub_key;
@@ -370,13 +393,18 @@ Receivers MUST:
   resulting ciphertext goes into the Ack and the shared secret becomes
   `pq_shared` on the responder's side.
 
-### 11.2 SessionAck (1257 bytes)
+### 11.2 SessionAck (1273 bytes)
 
-Same layout but with `magic = 0x62` ('b') and the trailing field replaced:
+Same layout but with `magic = 0x62` ('b') and the `ml_kem_pub` field replaced
+(the trailing advisory `sender_coord: 16` is still present):
 
 ```
 [ml_kem_ct: 1088]                  — ciphertext from responder's encap
+[sender_coord: 16]                 — responder's HypCoord (v0.11; advisory, NOT signed)
 ```
+
+The anti-amplification invariant still holds: both messages grew by 16 B, so
+`SESSION_ACK_WIRE_BYTES (1273) ≤ SESSION_INIT_WIRE_BYTES (1369)`.
 
 Initiators MUST:
 * only accept an Ack for which a corresponding `initiate()` is pending —

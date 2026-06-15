@@ -33,7 +33,8 @@ use crate::onion::{build_onion, OnionPacket, PeeledOnion};
 use crate::packet::{self, routing_tag, *};
 use crate::session::{
     ed25519_priv_to_x25519, ed25519_pub_to_x25519,
-    SessionManager, SharedSessionManager, SESSION_INIT_MAGIC, SESSION_ACK_MAGIC,
+    SessionManager, SharedSessionManager, SessionInit, SessionAck,
+    SESSION_INIT_MAGIC, SESSION_ACK_MAGIC,
 };
 
 // ──────────────────────────────────────────────
@@ -58,6 +59,24 @@ const ANNOUNCE_EXPIRY: Duration = Duration::from_secs(30);
 /// neighbour's cached announce is always refreshed before it expires.
 const CONTROL_MIN_INTERVAL: u32 = 1;
 const CONTROL_MAX_INTERVAL: u32 = 8;
+
+/// While any nearby tree state changed within this many ticks, a node keeps
+/// announcing at MIN cadence (B-step-3 §2.3 "convergence-active freshness floor")
+/// and treats a transit "no route" as a transient hole (suppresses the
+/// PathNegative poison — §4.1) so a no-alternative-path topology rides out a
+/// transient aggregation hole. Collapses back to the adaptive back-off once the
+/// neighbourhood is quiet — bounded extra announces per convergence event only.
+const CONVERGENCE_GRACE_TICKS: u32 = 8;
+
+/// Parent-switch hysteresis (microseconds). `fix_tree` switches to a new parent
+/// advertising the SAME root only if it is cheaper by more than this margin.
+/// `effective_cost` is in µs; on near-zero-latency links (incl. the in-memory
+/// `tokio::io::duplex` pipes the integration tests use) the cost is dominated by
+/// scheduling jitter, so without a margin two equal-length paths oscillate the
+/// parent pointer every few ticks — the count-to-∞ convergence-window flake
+/// (B-step-3 §1.2.1 / §3). 1 ms swamps that jitter yet is negligible against real
+/// WAN cost (≈50 ms), so a genuinely-closer root is still adopted promptly.
+const PARENT_SWITCH_MARGIN_US: u64 = 1_000;
 /// Keep-alive interval: send ping every 5 maintenance ticks (5 seconds)
 const KEEPALIVE_TICKS: u32 = 5;
 /// Peer timeout
@@ -414,6 +433,11 @@ struct RouterState {
     last_control_digest: Option<ControlDigest>,
     last_control_tick: u32,
     control_interval: u32,
+    /// Tick of the most recent tree-state change anywhere in the neighbourhood
+    /// (our own parent/root/depth, or an inbound Announce that changed a peer's
+    /// tree entry). Drives the convergence-active freshness floor + transient-
+    /// hole poison-suppression (see `CONVERGENCE_GRACE_TICKS`).
+    last_topology_change_tick: u32,
 }
 
 /// One observation in `reputation`.
@@ -484,6 +508,7 @@ impl RouterState {
             last_control_digest: None,
             last_control_tick: 0,
             control_interval: CONTROL_MIN_INTERVAL,
+            last_topology_change_tick: 0,
         }
     }
 
@@ -600,6 +625,10 @@ impl RouterState {
         let mut best_root_metric: Option<[u8; 32]> = None;
         let mut best_cost: u64 = u64::MAX;
         let mut best_parent: Option<PeerId> = None;
+        // Hysteresis: remember the incumbent parent's current standing so we can
+        // resist switching away from it on sub-margin cost noise (B-step-3 §3).
+        let prev_parent = self.trees[tree_id].parent;
+        let mut incumbent: Option<([u8; 32], u64)> = None; // (root_metric, total_cost)
 
         let now = Instant::now();
 
@@ -609,9 +638,21 @@ impl RouterState {
                 if now.duration_since(ann.received_at) > ANNOUNCE_EXPIRY {
                     continue;
                 }
+                // NOTE: the count-to-∞ *abdication guard* (skip a peer
+                // announcing `ann.root == self.pub_key` — our own identity echoed
+                // back) is DEFERRED. Measured: landing it on cuckoo-only routing
+                // exposes persistent convergence-window holes on single-path
+                // topologies (chain ~10–13/20, and a 30 s session window does NOT
+                // help → the hole is persistent, not slow). Greedy must be the
+                // geometric backstop first; the guard lands with the embedding
+                // (Phases 1–2). See docs/transit-cuckoo-convergence-design.md.
                 let root_metric = tree_metric_at(&ann.root, &TREE_SEEDS[tree_id], epoch);
                 let peer_cost = peer.effective_cost();
                 let total_cost = ann.path_cost.saturating_add(peer_cost);
+
+                if Some(*peer_key) == prev_parent {
+                    incumbent = Some((root_metric, total_cost));
+                }
 
                 let better = match &best_root_metric {
                     None => true,
@@ -636,13 +677,26 @@ impl RouterState {
             }
         }
 
+        // Hysteresis: if the incumbent parent still advertises the SAME (winning)
+        // root and is within PARENT_SWITCH_MARGIN_US of the new best, keep it.
+        // Only same-root cost ties are damped — we never stick to a worse ROOT,
+        // so this cannot hurt root convergence, only stop cost-jitter flapping.
+        if let (Some(best_rm), Some((inc_rm, inc_cost))) = (best_root_metric, incumbent)
+            && inc_rm == best_rm
+            && best_parent != prev_parent
+            && best_cost.saturating_add(PARENT_SWITCH_MARGIN_US) >= inc_cost
+        {
+            best_parent = prev_parent;
+            best_cost = inc_cost;
+        }
+
         // Check if we should be our own root (if our metric beats all candidates)
         let use_self = match &best_root_metric {
             None => true,
             Some(br) => metric_less(&my_metric, br),
         };
 
-        if use_self {
+        let new_parent = if use_self {
             self.trees[tree_id].parent = None;
             self.trees[tree_id].root = self.pub_key;
             self.trees[tree_id].parent_cost = 0;
@@ -650,6 +704,7 @@ impl RouterState {
             if tree_id == 0 {
                 self.own_depth = 0;
             }
+            None
         } else {
             self.trees[tree_id].parent = best_parent;
             self.trees[tree_id].root = best_root.unwrap();
@@ -661,6 +716,15 @@ impl RouterState {
                         self.own_depth = ann.depth + 1;
                     }
             }
+            best_parent
+        };
+
+        // Instrumentation + convergence tracking: count only a genuine parent
+        // switch, and treat it as a topology change so the freshness floor keeps
+        // us announcing while the neighbourhood re-settles.
+        if new_parent != prev_parent {
+            TREE_PARENT_CHANGES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.last_topology_change_tick = self.tick;
         }
     }
 
@@ -709,6 +773,14 @@ impl RouterState {
         }
     }
 
+    /// True while the neighbourhood is still settling — i.e. some tree state
+    /// (ours or a peer's) changed within the last `CONVERGENCE_GRACE_TICKS`.
+    /// Drives the freshness floor (keep announcing at MIN) and the transient-
+    /// hole poison suppression (B-step-3 §2/§4.1).
+    fn convergence_active(&self) -> bool {
+        self.tick.wrapping_sub(self.last_topology_change_tick) < CONVERGENCE_GRACE_TICKS
+    }
+
     /// Roadmap #9: adaptive control-plane cadence.
     ///
     /// `send_announces` (×K) and `broadcast_coord` otherwise re-flood
@@ -719,15 +791,26 @@ impl RouterState {
     /// change snap back to `CONTROL_MIN_INTERVAL` and broadcast at once.
     /// Keepalives (independent, every `KEEPALIVE_TICKS`) still keep the
     /// links themselves from being declared dead.
+    ///
+    /// Convergence-active freshness floor (B-step-3 §2.3): while *anything
+    /// nearby* is still moving, clamp to MIN so a still-converging neighbour
+    /// gets our state promptly even if our own digest is unchanged — this is the
+    /// gap that let a chain's downstream node wait up to 8 s for an update.
     fn maybe_broadcast_control(&mut self) {
         let digest = self.control_digest();
         let changed = self.last_control_digest != Some(digest);
-        self.control_interval = if changed {
+        if changed {
+            // Our own tree position moved — a topology change.
+            self.last_topology_change_tick = self.tick;
+        }
+        let convergence_active = self.convergence_active();
+        self.control_interval = if changed || convergence_active {
             CONTROL_MIN_INTERVAL
         } else {
             (self.control_interval + 1).min(CONTROL_MAX_INTERVAL)
         };
         let due = changed
+            || convergence_active
             || self.tick.wrapping_sub(self.last_control_tick) >= self.control_interval;
         if !due {
             CONTROL_SUPPRESSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);

@@ -1,6 +1,6 @@
 [package]
 name = "norn-rs"
-version = "0.10.2"
+version = "0.11.0"
 edition = "2024"
 description = "Next-generation mesh routing protocol — hyperbolic routing, K=3 spanning trees, ChaCha20-Poly1305 sessions"
 license = "MIT"

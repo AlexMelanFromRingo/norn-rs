@@ -12,16 +12,6 @@ pub fn effective_cost(lag: Duration, loss_rate: f32) -> u64 {
     effective as u64
 }
 
-/// Approximate equality for two HypCoord values, accounting for f64 rounding
-/// during encode/decode (LE byte roundtrip is exact, but cross-system the
-/// angle evaluation may differ in the last bit). Used by handle_coord_announce
-/// to validate that a peer's claimed coord matches the deterministic formula.
-pub(crate) fn coords_approx_equal(a: &HypCoord, b: &HypCoord) -> bool {
-    let dr = (a.rho - b.rho).abs();
-    let dt = (a.theta - b.theta).abs();
-    dr < 1e-9 && dt < 1e-9
-}
-
 /// Constant-time equality on routing tags. The leak is minor (an attacker
 /// would have to time forwarding decisions under 50ms jitter) but the cost
 /// is zero, so this is defence in depth.

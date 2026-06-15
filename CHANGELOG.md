@@ -4,6 +4,47 @@ All notable changes to norn-rs are documented here. Versions follow Cargo's
 0.x semver: the **minor** number is bumped for breaking (wire/protocol) changes,
 the **patch** number for backward-compatible fixes.
 
+## v0.11.0
+
+> ⚠️ **Breaking, flag-day release.** The on-the-wire protocol changed
+> incompatibly — **all nodes must upgrade together**. A v0.11 node and a v0.10
+> node cannot interoperate (coord format v5; handshake +16 B). Mismatched peers
+> fail loudly at parse time.
+
+Makes hyperbolic greedy routing **load-bearing** — it was effectively a no-op
+before (random key-hash angle + one-hop coordinates → greedy had no gradient and
+never knew a multi-hop destination's coord). Cluster-measured: transit forwarded
+via greedy went from **~0% → ~49.5%** (100-node WAN, rest via cuckoo fallback),
+with no health regression (trust ~3.5/4, 0 panics).
+
+### Breaking — wire format
+- **Coordinate format v5 (tree-position embedding).** `CoordAnnounce.theta` is now
+  derived from the node's tree position (parent's θ + a depth-shrinking per-node
+  offset) instead of a random key-hash, so descendants cluster under their ancestor
+  and greedy has a gradient toward a destination's subtree. Same 117-byte layout;
+  version byte → 5; ρ stays depth-derived. θ anti-spoof relaxed to advisory (ρ still
+  verified) — a θ-spoof sinkhole is caught by the existing trust-decay + active
+  probing (same defence as cuckoo poisoning).
+- **Coordinate dissemination at session setup.** `SessionInit`/`SessionAck` each
+  carry the sender's 16-byte coord (advisory, **not** in the signed payload — the
+  formally-verified handshake sign-bytes are unchanged), so a source learns a
+  multi-hop destination's coord and stamps `dest_coord` → transit routes greedily.
+  O(active sessions), no flooding. Anti-amplification invariant preserved.
+
+### Added
+- Convergence robustness + observability (groundwork): parent-switch hysteresis,
+  a convergence-active control-cadence freshness floor, transient-hole poison
+  suppression, and metrics `norn_tree_parent_changes_total`,
+  `norn_cuckoo_no_route_total`, `norn_transit_greedy_total`,
+  `norn_transit_cuckoo_total`.
+
+### Known / unchanged
+- **count-to-infinity stays tolerated.** The root-abdication guard is *not* landed:
+  greedy does not unblock it (the first handshake bootstraps via cuckoo, before a
+  destination's coord is known), and forcing it breaks single-path topologies. It is
+  harmless on real clusters and greedy now carries ~50% of transit despite the
+  inflated tree. See `docs/transit-greedy-design.md` / `docs/transit-cuckoo-convergence-design.md`.
+
 ## v0.10.2
 
 > Backward-compatible patch. Wire protocol unchanged from v0.10.0/v0.10.1.

@@ -30,6 +30,15 @@ const RADIAL_STEP: f64 = 1.0;
 /// (~24). Beyond this depth distances saturate gracefully (monotone, finite).
 const RHO_MAX: f64 = 350.0;
 
+/// Angular-sector shrink factor per tree-depth level for the greedy embedding
+/// ([`HypCoord::from_tree_position`]). A node's children occupy an arc of width
+/// `2π / ANGULAR_SPREAD^(depth-1)` centred on the parent's angle; deeper subtrees
+/// occupy progressively narrower arcs, so distinct subtrees separate angularly
+/// and greedy gets a gradient toward a destination's subtree. ~8 models a
+/// generous branching factor — large enough that sibling subtrees rarely overlap,
+/// small enough that the arc doesn't underflow within realistic depths.
+const ANGULAR_SPREAD: f64 = 8.0;
+
 /// A point on the hyperbolic plane in radial form. `rho ≥ 0`, `theta ∈ [0, 2π)`.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct HypCoord {
@@ -93,19 +102,53 @@ impl HypCoord {
         Self { rho, theta }
     }
 
-    /// Derive a deterministic θ from an ed25519 public key.
-    pub fn angle_from_key(pub_key: &[u8; 32]) -> f64 {
+    /// Deterministic value in `[0, 1]` from an ed25519 public key (first 8 bytes
+    /// of BLAKE2b). The per-node angular jitter source for the embedding.
+    pub fn hash01(pub_key: &[u8; 32]) -> f64 {
         let hash = Blake2b512::digest(pub_key);
         let val = u64::from_le_bytes(hash[..8].try_into().unwrap());
-        (val as f64 / u64::MAX as f64) * 2.0 * PI
+        val as f64 / u64::MAX as f64
     }
 
-    /// Compute coordinate for a node given its tree depth and pub key.
-    /// Sarkar-style embedding: `rho` from depth (linear, clamped to `RHO_MAX`),
-    /// `theta` from the key hash. Root (depth 0) sits at the origin.
+    /// Derive a deterministic θ from an ed25519 public key (legacy v4 embedding).
+    pub fn angle_from_key(pub_key: &[u8; 32]) -> f64 {
+        Self::hash01(pub_key) * 2.0 * PI
+    }
+
+    /// LEGACY (v4) coordinate: `rho` from depth, `theta` a random key-hash angle.
+    /// Kept for reference/tests. The random θ has **no relation to tree
+    /// position**, so two nodes in the same subtree get unrelated angles —
+    /// greedy hyperbolic routing has no gradient and is effectively source-only.
+    /// Superseded by [`from_tree_position`].
     pub fn from_tree_depth(depth: u32, pub_key: &[u8; 32]) -> Self {
         let rho = (depth as f64 * RADIAL_STEP).min(RHO_MAX);
         let theta = Self::angle_from_key(pub_key);
+        Self { rho, theta }
+    }
+
+    /// GREEDY (v5) tree-position embedding. `rho` from depth (as before); `theta`
+    /// is the **parent's** θ plus a per-node offset within a depth-shrinking
+    /// sector, so a node's descendants cluster in its angular sector. This is
+    /// what gives greedy a real gradient: a neighbour geometrically closer to the
+    /// destination's coord is closer in tree-position to the destination's
+    /// subtree (vs the legacy random angle, which had no such relation).
+    ///
+    /// - depth 0 (root): the origin (θ irrelevant there).
+    /// - depth 1: sector = 2π (the root's children spread around the full circle).
+    /// - depth d>1: sector = 2π / `ANGULAR_SPREAD`^(d-1), centred on the parent's θ.
+    ///
+    /// `parent_theta` is the parent's advertised θ (from its CoordAnnounce); like
+    /// `depth`, θ converges as CoordAnnounces propagate down the tree.
+    pub fn from_tree_position(depth: u32, parent_theta: f64, pub_key: &[u8; 32]) -> Self {
+        if depth == 0 {
+            return Self::origin();
+        }
+        let rho = (depth as f64 * RADIAL_STEP).min(RHO_MAX);
+        // Sector width: full circle at depth 1, shrinking by ANGULAR_SPREAD each
+        // level deeper. The per-node offset is centred in [-0.5, 0.5]·sector.
+        let sector = 2.0 * PI / ANGULAR_SPREAD.powi(depth as i32 - 1);
+        let offset = (Self::hash01(pub_key) - 0.5) * sector;
+        let theta = (parent_theta + offset).rem_euclid(2.0 * PI);
         Self { rho, theta }
     }
 }
@@ -249,6 +292,39 @@ mod tests {
         let key = [0u8; 32];
         assert!((HypCoord::from_tree_depth(1, &key).rho - 1.0).abs() < 1e-12);
         assert!((HypCoord::from_tree_depth(7, &key).rho - 7.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn from_tree_position_root_is_origin_and_rho_tracks_depth() {
+        let k = [9u8; 32];
+        assert_eq!(HypCoord::from_tree_position(0, 1.0, &k), HypCoord::origin());
+        assert!((HypCoord::from_tree_position(4, 0.3, &k).rho - 4.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn from_tree_position_clusters_descendants_under_ancestor() {
+        // The whole point of the v5 embedding: a descendant clusters in its
+        // ancestor's angular sector, so greedy gets a gradient toward a subtree —
+        // unlike the legacy random-θ embedding. Build root → A (depth 1) → A1
+        // (depth 2) and check A1 is angularly within sector/2 of A, and is closer
+        // (hyperbolic distance) to A than to a node on the opposite side.
+        let a = [1u8; 32];
+        let a1 = [3u8; 32];
+        let c_a = HypCoord::from_tree_position(1, 0.0, &a); // root θ = 0
+        let c_a1 = HypCoord::from_tree_position(2, c_a.theta, &a1);
+
+        // Clustering: depth-2 sector = 2π/8 = π/4, so the offset is within ±π/8.
+        let mut dtheta = (c_a1.theta - c_a.theta).rem_euclid(2.0 * PI);
+        if dtheta > PI {
+            dtheta = 2.0 * PI - dtheta;
+        }
+        assert!(dtheta <= PI / 8.0 + 1e-9,
+            "depth-2 node must cluster within sector/2 (π/8) of its parent, got {dtheta}");
+
+        // Gradient: A1 is closer to its parent A than to a node π away at depth 1.
+        let c_far = HypCoord { rho: 1.0, theta: (c_a.theta + PI).rem_euclid(2.0 * PI) };
+        assert!(c_a1.distance(c_a) < c_a1.distance(c_far),
+            "descendant must be closer to its ancestor than to a foreign subtree");
     }
 
     #[test]

@@ -100,14 +100,29 @@ impl RouterState {
             return;
         }
 
+        let mut structural_change = false;
         if let Some(peer) = self.peers.get_mut(&from) {
             peer.last_rx_time = Instant::now();
+            // Detect a STRUCTURAL change (root or depth) — not path_cost, which
+            // jitters every announce on real links and would pin us at MIN
+            // cadence forever. Cost-jitter parent flapping is handled by the
+            // fix_tree hysteresis; here we only want genuine tree churn to keep
+            // the convergence freshness floor engaged (B-step-3 §2.3).
+            structural_change = match &peer.trees[tree_id] {
+                Some(prev) => prev.root != ann.root || prev.depth != ann.depth,
+                None => true,
+            };
             peer.trees[tree_id] = Some(TreeAnnounce {
                 root: ann.root,
                 path_cost: ann.path_cost,
                 received_at: Instant::now(),
                 depth: ann.depth,
             });
+        }
+        if structural_change {
+            // A neighbour's tree state moved — keep announcing at MIN so it gets
+            // our state promptly while it converges.
+            self.last_topology_change_tick = self.tick;
         }
         self.update_landmarks();
     }
@@ -277,14 +292,24 @@ impl RouterState {
                     };
                     if raw.first().copied() == Some(SESSION_INIT_MAGIC) {
                         let ack_opt = self.sessions.write_or_recover().handle_init(&raw).ok();
-                        if let Some(ack_bytes) = ack_opt
-                            && raw.len() >= 33 {
+                        if let Some(ack_bytes) = ack_opt {
+                            // Learn the initiator's coord (Phase 2): now we can
+                            // stamp dest_coord on reverse traffic to it.
+                            if let Ok(init) = SessionInit::decode(&raw) {
+                                self.note_peer_coord(init.ed_pub, init.sender_coord);
+                            }
+                            if raw.len() >= 33 {
                                 let mut sender = [0u8; 32];
                                 sender.copy_from_slice(&raw[1..33]);
                                 self.send_traffic_to(&sender, ack_bytes);
                             }
-                    } else if raw.first().copied() == Some(SESSION_ACK_MAGIC) {
-                        let _ = self.sessions.write_or_recover().handle_ack(&raw);
+                        }
+                    } else if raw.first().copied() == Some(SESSION_ACK_MAGIC)
+                        && self.sessions.write_or_recover().handle_ack(&raw).is_ok()
+                        && let Ok(ack) = SessionAck::decode(&raw)
+                    {
+                        // Learn the responder's coord (Phase 2).
+                        self.note_peer_coord(ack.ed_pub, ack.sender_coord);
                     }
                 }
                 packet::PKT_DATA => {
@@ -362,10 +387,22 @@ impl RouterState {
             // FALLBACK: cuckoo reachability on routing_tag (local minimum, or
             // the source didn't stamp a coord). Excluding `from` avoids the
             // trivial 2-cycle that bidirectional cuckoo gossip routinely makes.
-            let next_hop = traffic.dest_coord
+            let greedy_hop = traffic.dest_coord
                 .map(|c| HypCoord::decode(&c))
-                .and_then(|dc| self.greedy_next_hop(dc, Some(from)))
-                .or_else(|| self.lookup_by_tag_excluding(&traffic.routing_tag, Some(from)));
+                .and_then(|dc| self.greedy_next_hop(dc, Some(from)));
+            let next_hop = match greedy_hop {
+                Some(h) => {
+                    TRANSIT_GREEDY.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    Some(h)
+                }
+                None => {
+                    let h = self.lookup_by_tag_excluding(&traffic.routing_tag, Some(from));
+                    if h.is_some() {
+                        TRANSIT_CUCKOO.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    h
+                }
+            };
 
             if let Some(next_hop) = next_hop {
                 let mut fwd = traffic;
@@ -380,11 +417,21 @@ impl RouterState {
                 self.send_to_peer(&next_hop, encoded);
             } else {
                 debug!("no route for routing_tag {:?}", &traffic.routing_tag[..4]);
-                // Backtrack: tell upstream we have no neighbour for this tag
-                // (cuckoo false positive somewhere in their view, or genuine
-                // unreachability). They cache (us, tag) and try elsewhere.
-                let tag = traffic.routing_tag;
-                self.send_path_negative(from, tag, PATH_NEG_INITIAL_TTL);
+                CUCKOO_NO_ROUTE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                // Backtrack: normally tell upstream we have no neighbour for this
+                // tag so it caches (us, tag) and tries elsewhere. BUT during the
+                // convergence grace window a "no route" is almost always a
+                // transient aggregation hole while the tree re-settles, not a
+                // genuine dead-end (B-step-3 §4.1). Poisoning it adds churn and,
+                // on a no-alternative-path topology (chain/star), black-holes the
+                // tag for PATH_NEG_TTL. So suppress the poison while convergence
+                // is active and rely on the sender's natural retry (every 100 ms)
+                // to catch the route once cuckoo fills in; after the window a
+                // "no route" is treated as a real dead-end and poisoned as before.
+                if !self.convergence_active() {
+                    let tag = traffic.routing_tag;
+                    self.send_path_negative(from, tag, PATH_NEG_INITIAL_TTL);
+                }
             }
         }
     }
