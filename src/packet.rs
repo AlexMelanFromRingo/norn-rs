@@ -548,6 +548,15 @@ pub struct Traffic {
     /// (planned for `feature/onion-routing`) will wrap the entire Traffic packet in
     /// additional encryption layers, hiding pkt_type from relays.
     pub pkt_type: u8,
+    /// Destination's hyperbolic coordinate, stamped by the source when known.
+    /// Lets TRANSIT nodes route greedily toward the destination instead of
+    /// relying solely on cuckoo-filter reachability of `routing_tag`. `None`
+    /// ⇒ legacy cuckoo-only transit (also the opt-out for a sender that does
+    /// not know the coord or wants to leak nothing geometric). Wire: 1
+    /// presence byte, then 16 bytes (`HypCoord::encode`) when present. Stored
+    /// raw (like `CoordAnnounce.coord`) so packet.rs stays free of the
+    /// hyperbolic module; the router decodes it via `HypCoord::decode`.
+    pub dest_coord: Option<[u8; 16]>,
     /// Sequence watermark for replay protection
     pub watermark: u64,
     /// Payload:
@@ -569,6 +578,13 @@ impl Traffic {
         buf.extend_from_slice(&self.enc_header);
         buf.extend_from_slice(&self.routing_tag);
         buf.push(self.pkt_type);
+        match self.dest_coord {
+            Some(c) => {
+                buf.push(1);
+                buf.extend_from_slice(&c);
+            }
+            None => buf.push(0),
+        }
         encode_uvarint(self.watermark, &mut buf);
         encode_uvarint(self.payload.len() as u64, &mut buf);
         buf.extend_from_slice(&self.payload);
@@ -594,6 +610,23 @@ impl Traffic {
         pos += 16;
         let pkt_type = data[pos];
         pos += 1;
+        // dest_coord: 1 presence byte, then 16 bytes when present.
+        if pos >= data.len() {
+            bail!("Traffic missing dest_coord presence byte");
+        }
+        let coord_present = data[pos];
+        pos += 1;
+        let dest_coord = if coord_present != 0 {
+            if data.len() < pos + 16 {
+                bail!("Traffic dest_coord truncated: need 16, got {}", data.len() - pos);
+            }
+            let arr: [u8; 16] = data[pos..pos + 16].try_into()
+                .map_err(|_| anyhow::anyhow!("Traffic dest_coord slice error"))?;
+            pos += 16;
+            Some(arr)
+        } else {
+            None
+        };
         let (watermark, n) = decode_uvarint(&data[pos..])?;
         pos += n;
         let (payload_len, n) = decode_uvarint(&data[pos..])?;
@@ -606,7 +639,7 @@ impl Traffic {
             bail!("Traffic payload truncated: need {}, got {}", payload_len_usize, data.len() - pos);
         }
         let payload = data[pos..payload_end].to_vec();
-        Ok(Traffic { path, from, enc_header, routing_tag, pkt_type, watermark, payload })
+        Ok(Traffic { path, from, enc_header, routing_tag, pkt_type, dest_coord, watermark, payload })
     }
 }
 
@@ -1083,24 +1116,49 @@ mod tests {
 
     #[test]
     fn traffic_roundtrip() {
+        for dest_coord in [None, Some([0x77u8; 16])] {
+            let traffic = Traffic {
+                path: vec![1, 2, 3],
+                from: [0xABu8; 32],
+                enc_header: [0x11u8; 128],
+                routing_tag: [0x22u8; 16],
+                pkt_type: PKT_DATA,
+                dest_coord,
+                watermark: 999,
+                payload: vec![1, 2, 3, 4, 5],
+            };
+            let enc = traffic.encode();
+            let dec = Traffic::decode(&enc[1..]).unwrap();
+            assert_eq!(dec.path, vec![1, 2, 3]);
+            assert_eq!(dec.from, [0xABu8; 32]);
+            assert_eq!(dec.enc_header, [0x11u8; 128]);
+            assert_eq!(dec.routing_tag, [0x22u8; 16]);
+            assert_eq!(dec.pkt_type, PKT_DATA);
+            assert_eq!(dec.dest_coord, dest_coord, "dest_coord must round-trip");
+            assert_eq!(dec.watermark, 999);
+            assert_eq!(dec.payload, vec![1, 2, 3, 4, 5]);
+        }
+    }
+
+    #[test]
+    fn traffic_decode_rejects_truncated_dest_coord() {
+        // Presence byte = 1 but fewer than 16 coord bytes follow.
         let traffic = Traffic {
-            path: vec![1, 2, 3],
-            from: [0xABu8; 32],
-            enc_header: [0x11u8; 128],
-            routing_tag: [0x22u8; 16],
+            path: vec![],
+            from: [0u8; 32],
+            enc_header: [0u8; 128],
+            routing_tag: [0u8; 16],
             pkt_type: PKT_DATA,
-            watermark: 999,
-            payload: vec![1, 2, 3, 4, 5],
+            dest_coord: Some([0x55u8; 16]),
+            watermark: 0,
+            payload: vec![],
         };
         let enc = traffic.encode();
-        let dec = Traffic::decode(&enc[1..]).unwrap();
-        assert_eq!(dec.path, vec![1, 2, 3]);
-        assert_eq!(dec.from, [0xABu8; 32]);
-        assert_eq!(dec.enc_header, [0x11u8; 128]);
-        assert_eq!(dec.routing_tag, [0x22u8; 16]);
-        assert_eq!(dec.pkt_type, PKT_DATA);
-        assert_eq!(dec.watermark, 999);
-        assert_eq!(dec.payload, vec![1, 2, 3, 4, 5]);
+        // Drop the TRAFFIC type byte and chop the last 12 bytes so the coord
+        // (and everything after) is truncated.
+        let truncated = &enc[1..enc.len() - 12];
+        assert!(Traffic::decode(truncated).is_err(),
+            "a truncated dest_coord must be rejected, not read out of bounds");
     }
 
     #[test]
@@ -1457,13 +1515,13 @@ mod tests {
         data.extend_from_slice(&[0u8; 128]); // enc_header
         data.extend_from_slice(&[0u8; 16]);  // routing_tag
         data.push(0u8);                       // pkt_type = 0
+        data.push(0u8);                       // dest_coord absent (presence = 0)
         data.push(0u8);                       // watermark = 0 (uvarint)
         data.push(3u8);                       // payload_len = 3 (uvarint)
         data.extend_from_slice(&[1u8, 2, 3]); // payload (3 bytes)
         data.extend_from_slice(&[0u8; 10]);   // 10 extra trailing bytes
-        // data.len() = 193, pos after decoding headers = 180, payload_len = 3
-        // 193 > 180 + 3 = 183 → original: 193 < 183 = false → OK
-        //                        mutation: 193 > 183 = true → bail "truncated" (CAUGHT)
+        // With the dest_coord presence byte, pos after headers = 181;
+        // payload_len = 3, data.len() = 194 > 181 + 3 = 184 is false → OK.
         let result = Traffic::decode(&data);
         assert!(result.is_ok(), "Traffic with trailing bytes must decode OK: {:?}", result.err());
         assert_eq!(result.unwrap().payload, vec![1u8, 2, 3]);
@@ -1808,6 +1866,7 @@ mod tests {
         data.extend_from_slice(&[0u8; 128]); // enc_header
         data.extend_from_slice(&[0u8; 16]);  // routing_tag
         data.push(0u8);                       // pkt_type
+        data.push(0u8);                       // dest_coord absent (presence = 0)
         data.push(0u8);                       // watermark (uvarint 0)
         data.push(0u8);                       // payload_len (uvarint 0)
         let result = Traffic::decode(&data);

@@ -1466,19 +1466,24 @@ fn encrypt_and_dispatch(
     };
 
     let (enc_header, tag) = encrypt_header(pub_key, dst);
+    // One short lock: read the destination's coord (to stamp into the header
+    // so transit nodes can route greedily) and pick our own next hop. The
+    // guard drops at the `}` before send_to_peer relocks.
+    let (dest_coord, next_hop) = {
+        let state = inner.lock_or_recover();
+        (state.coord_table.get(dst).map(|c| c.encode()), state.lookup(dst))
+    };
     let traffic = Traffic {
         path: vec![],
         from: *pub_key,
         enc_header,
         routing_tag: tag,
         pkt_type: packet::PKT_DATA,
+        dest_coord,
         watermark: 0,
         payload: ciphertext,
     };
     let encoded = traffic.encode();
-    // next_hop into a variable so the MutexGuard drops at the `;`
-    // before send_to_peer relocks.
-    let next_hop = inner.lock_or_recover().lookup(dst);
     match next_hop {
         Some(next_hop) => {
             inner.lock_or_recover().send_to_peer(&next_hop, encoded);

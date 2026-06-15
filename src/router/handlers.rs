@@ -338,8 +338,9 @@ impl RouterState {
                 }
             }
         } else {
-            // Forward using cuckoo-filter lookup on routing_tag.
-            // enc_header is completely opaque to intermediate nodes.
+            // Transit forwarding. enc_header is opaque to us, but the source
+            // may have stamped the destination's coordinate so we can route by
+            // geometry instead of leaning entirely on cuckoo reachability.
 
             // TTL: use the previously-unused `watermark` field as a per-packet
             // hop counter. Senders MUST initialise it to 0. Each forwarder
@@ -354,10 +355,19 @@ impl RouterState {
                 return;
             }
 
-            // Exclude `from` from the lookup so we never forward straight back
-            // to the peer the packet came in on (trivial 2-cycle, caused
-            // routinely by bidirectional cuckoo gossip).
-            if let Some(next_hop) = self.lookup_by_tag_excluding(&traffic.routing_tag, Some(from)) {
+            // PRIMARY: greedy hyperbolic toward the stamped dest_coord —
+            // loop-free (strictly decreasing distance), so it can't trigger the
+            // micro-loop → TTL → PathNegative-poison cycle that cuckoo-only
+            // transit suffered on a quiescent tree.
+            // FALLBACK: cuckoo reachability on routing_tag (local minimum, or
+            // the source didn't stamp a coord). Excluding `from` avoids the
+            // trivial 2-cycle that bidirectional cuckoo gossip routinely makes.
+            let next_hop = traffic.dest_coord
+                .map(|c| HypCoord::decode(&c))
+                .and_then(|dc| self.greedy_next_hop(dc, Some(from)))
+                .or_else(|| self.lookup_by_tag_excluding(&traffic.routing_tag, Some(from)));
+
+            if let Some(next_hop) = next_hop {
                 let mut fwd = traffic;
                 fwd.watermark = fwd.watermark.saturating_add(1);
                 // Re-stamp the immediate-sender field so downstream peers see
@@ -394,6 +404,7 @@ impl RouterState {
             enc_header,
             routing_tag: tag,
             pkt_type: packet::PKT_CONTROL,
+            dest_coord: self.coord_table.get(dst).map(|c| c.encode()),
             watermark: 0,
             payload: padded,
         };
@@ -403,32 +414,44 @@ impl RouterState {
         }
     }
 
+    /// Greedy hyperbolic next-hop toward `dst_coord`: the neighbour strictly
+    /// closer to it than we are, excluding `exclude` (the inbound peer, so we
+    /// never bounce a packet straight back). `None` at a local minimum — no
+    /// neighbour improves — so the caller can fall back to cuckoo reachability.
+    ///
+    /// Loop-free by construction: every hop it chooses strictly decreases the
+    /// distance to `dst_coord`, so a packet cannot cycle through greedy hops.
+    /// This is what lets TRANSIT nodes route by geometry (see `handle_traffic`)
+    /// instead of leaning entirely on cuckoo freshness.
+    pub(crate) fn greedy_next_hop(&self, dst_coord: HypCoord, exclude: Option<PeerId>) -> Option<PeerId> {
+        let mut best_peer: Option<PeerId> = None;
+        let mut best_dist = self.own_coord.distance(dst_coord); // must strictly improve
+        for (peer_key, peer) in &self.peers {
+            if exclude == Some(*peer_key) {
+                continue;
+            }
+            if let Some(&peer_coord) = self.coord_table.get(&peer.pub_key) {
+                let d = peer_coord.distance(dst_coord);
+                if d < best_dist {
+                    best_dist = d;
+                    best_peer = Some(*peer_key);
+                }
+            }
+        }
+        best_peer
+    }
+
     /// Greedy routing: find best next-hop for destination across all K trees.
     /// Hyperbolic greedy routing is tried first; falls back to cuckoo/XOR.
     pub fn lookup(&self, dst: &PeerId) -> Option<PeerId> {
         // ── Hyperbolic greedy routing (primary) ────────────────────────────
-        if let Some(&dst_coord) = self.coord_table.get(dst) {
-            let own_dist = self.own_coord.distance(dst_coord);
-            let mut best_peer: Option<PeerId> = None;
-            let mut best_dist = own_dist; // must strictly improve
-
-            for (peer_key, peer) in &self.peers {
-                if let Some(&peer_coord) = self.coord_table.get(&peer.pub_key) {
-                    let d = peer_coord.distance(dst_coord);
-                    if d < best_dist {
-                        best_dist = d;
-                        best_peer = Some(*peer_key);
-                    }
-                }
-            }
-
-            if let Some(p) = best_peer {
-                return Some(p);
-            }
-            // No closer neighbour — either we ARE the destination or
-            // hyperbolic lookup is vacuous with 1 peer (same-coord case).
-            // Let fallback decide.
+        // We know `dst`'s pub key, so we can read its coord directly.
+        if let Some(&dst_coord) = self.coord_table.get(dst)
+            && let Some(p) = self.greedy_next_hop(dst_coord, None) {
+            return Some(p);
         }
+        // No closer neighbour (local minimum / we ARE the destination / single
+        // same-coord peer) — let the cuckoo fallback decide.
 
         // ── Cuckoo-filter lookup (fallback) ────────────────────────────────
         // Filters store routing_tags, not raw pub keys.
