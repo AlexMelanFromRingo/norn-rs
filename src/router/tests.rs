@@ -946,6 +946,41 @@
         assert_eq!(result, Some(peer_key), "cuckoo filter hit must route to matching peer");
     }
 
+    // ── PathNegative is last-resort deprioritisation, NOT a hard blackhole ────
+
+    #[test]
+    fn lookup_by_tag_path_negative_is_last_resort_not_blackhole() {
+        // The sole claimer of a tag is under a PathNegative (e.g. a linear
+        // chain's only upstream after a transient convergence gap). It must
+        // still be returned — hard exclusion would black-hole the destination
+        // for the full PATH_NEG_TTL with no alternate path.
+        let mut rs = make_router();
+        let tag = routing_tag(&[0x42u8; 32]);
+        let only = [0x10u8; 32];
+        add_dummy_peer(&mut rs, only);
+        rs.peers.get_mut(&only).unwrap().cuckoo[0].add(&tag);
+        rs.record_path_negative(only, tag);
+        assert_eq!(rs.lookup_by_tag(&tag), Some(only),
+            "sole claimer must be used as last resort even under PathNegative");
+    }
+
+    #[test]
+    fn lookup_by_tag_prefers_non_negative_alternate() {
+        // With an alternative, route AROUND the poisoned peer (poison defence
+        // preserved): a non-negative claimer beats a path-negative one.
+        let mut rs = make_router();
+        let tag = routing_tag(&[0x42u8; 32]);
+        let poisoned = [0x10u8; 32];
+        let clean = [0x20u8; 32];
+        add_dummy_peer(&mut rs, poisoned);
+        add_dummy_peer(&mut rs, clean);
+        rs.peers.get_mut(&poisoned).unwrap().cuckoo[0].add(&tag);
+        rs.peers.get_mut(&clean).unwrap().cuckoo[0].add(&tag);
+        rs.record_path_negative(poisoned, tag);
+        assert_eq!(rs.lookup_by_tag(&tag), Some(clean),
+            "a non-negative claimer must be preferred over a poisoned one");
+    }
+
     // ── encrypt_header / decrypt_source round-trip ───────────────────────────
 
     // ── fix_tree: root_seq and own_depth ─────────────────────────────────────

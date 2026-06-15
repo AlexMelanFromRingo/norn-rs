@@ -85,6 +85,70 @@ decoupling would need faster/seeded coord convergence or a brief startup warmup
 that keeps reachability fresh until the embedding settles — a separate,
 larger piece, out of scope here.
 
+## Cluster validation + the deeper finding (100-node Docker harness)
+
+Two full runs of `tests/cluster/run.sh` (100 nodes, 120 s, mid-run SIGKILL of
+~10% + restore), one on master and one with the abdication guard:
+
+| signal | master (count-to-∞) | + abdication guard |
+|---|---|---|
+| tree-0 depth (min/med/max) | 120 / 121 / 122 | **0 / 3 / 5** |
+| panics (`mutex_poison`) | 0 | 0 |
+| peer trust (probe success) | 2.88 / 4 | 2.88 / 4 |
+| peer loss (med/max) | 0.000 / 0.261 | 0.000 / 0.261 |
+| per-node memory | 2.84 MiB | 2.84 MiB |
+
+So count-to-infinity is **real but genuinely tolerated** — routing is healthy at
+100 nodes *either way* — and the abdication guard fixes it cleanly at scale with
+**zero routing-health regression**. The flakiness is exclusively a property of
+the tiny (4–5 node) integration topologies, not the real mesh.
+
+**The deeper finding that reframes all of the above:** `CoordAnnounce` is
+**one-hop only** (`handle_coord_announce` inserts `coord_table[from_key] =
+coord`; nothing re-floods it). So `coord_table` only ever holds *self + direct
+neighbours*. For any **multi-hop** destination the source does not know the
+destination's coord, so:
+
+* `lookup(dst)`'s hyperbolic-greedy branch is skipped (no `coord_table` entry)
+  and falls through to cuckoo/XOR — i.e. **greedy is effectively source-only for
+  *direct neighbours*; all real multi-hop routing is cuckoo (tree-aggregated
+  reachability)**.
+* **Path A is therefore mostly a no-op in production**: the source can only
+  stamp `dest_coord` for a direct neighbour (which needs no multi-hop routing).
+  Its mechanism is correct and harmless (and unit-tested), but for the common
+  multi-hop case `dest_coord` is `None` → cuckoo, unchanged. The chain/star
+  flake instrumentation confirmed it: failures are pure cuckoo "no route" +
+  PathNegative during convergence, with `dest_coord` absent.
+
+This means the count-to-infinity churn was **load-bearing for cuckoo freshness**:
+it kept reachability perpetually re-gossiped, masking convergence-window gaps.
+Removing it (abdication) exposes those gaps, and because greedy is vacuous there
+is no geometric backstop. Surgical patches tried and measured:
+
+* PathNegative as last-resort (deprioritise, never hard-exclude) — **kept**
+  (eliminates a real 60 s single-path black-hole footgun), but did not fix the
+  flake (chain 10/15).
+* up-to-root transit fallback (forward toward a root when greedy+cuckoo miss) —
+  marginal (chain 12/15), **reverted** (needs the abdication guard's acyclic
+  parents, and abdication itself is what we're trying to make safe).
+
+## Conclusion / the actual "full fix"
+
+Robust multi-hop routing that does **not** depend on count-to-infinity churn
+requires making **greedy actually work multi-hop**, which means the source must
+learn the destination's coord. The lightweight way (NOT network-wide O(N) coord
+flooding — that's the rejected DHT-like path) is to **exchange coords at session
+setup** (O(active sessions), refreshed via the session), so Path A can stamp a
+real `dest_coord`. Greedy then becomes the loop-free primary, cuckoo the
+fallback, and the abdication guard becomes safe to land (verified harmless at
+cluster scale). That is a design-first, multi-cycle change with a real
+privacy/robustness/lightweight trade-off — an architectural decision, not a
+surgical patch.
+
+Until then: **count-to-infinity stays tolerated** (harmless per cluster data),
+and the only change that ships from this investigation is the last-resort
+PathNegative fix.
+
 ## Testing
 
 * `packet.rs`: `Traffic` round-trip with `dest_coord` present and absent; a

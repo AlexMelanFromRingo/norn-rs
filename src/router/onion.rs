@@ -138,34 +138,45 @@ impl RouterState {
     /// queue. This mitigates cuckoo poisoning — a peer that lies about
     /// reachable tags will see its trust decay and stop being chosen.
     pub(crate) fn lookup_by_tag_excluding(&self, tag: &[u8; 16], exclude: Option<PeerId>) -> Option<PeerId> {
+        // Two candidate classes, both ranked by trust-adjusted cost:
+        //   `best`     — peers that have NOT recently sent a PathNegative;
+        //   `best_neg` — peers under a PathNegative (a *known recent* "can't
+        //                reach this tag" — usually a cuckoo false positive, but
+        //                during tree convergence it can be a transient gap).
+        //
+        // A PathNegative DEPRIORITISES a peer; it must not hard-exclude it.
+        // Hard exclusion blackholes the only path in any topology without an
+        // alternate (e.g. a linear chain: the upstream peer is the sole route
+        // to everything beyond it), so one transient convergence gap could
+        // wedge a destination for the full PATH_NEG_TTL. Preferring a
+        // non-negative claimer keeps the cuckoo-poisoning defence (route around
+        // a lying peer whenever an alternative exists); falling back to the
+        // cheapest negative one only when there is NO alternative trades a
+        // possibly-stale retry (self-heals, and trust-decay still punishes a
+        // genuine liar) for never black-holing.
         let mut best: Option<(PeerId, u64)> = None;
+        let mut best_neg: Option<(PeerId, u64)> = None;
         for (peer_key, peer) in &self.peers {
             if exclude == Some(*peer_key) {
                 continue;
             }
-            // Skip peers that recently sent us a PathNegative for this tag —
-            // their cuckoo claim is a known false positive.
-            if self.is_path_negative(peer_key, tag) {
+            let claims = (0..K).any(|t| peer.cuckoo[t].contains(tag));
+            if !claims {
                 continue;
             }
-            for tree_id in 0..K {
-                if peer.cuckoo[tree_id].contains(tag) {
-                    // Combine local trust with network-consensus trust if
-                    // available; consensus = NULL → use local trust alone.
-                    let local = peer.trust;
-                    let combined = match self.consensus_trust(peer_key) {
-                        Some(c) => (local + c) * 0.5,
-                        None    => local,
-                    };
-                    let cost = peer.trust_adjusted_cost_with(combined);
-                    let better = best.is_none_or(|(_, bc)| cost < bc);
-                    if better {
-                        best = Some((*peer_key, cost));
-                    }
-                    break;
-                }
+            // Combine local trust with network-consensus trust if available;
+            // consensus = NULL → use local trust alone.
+            let local = peer.trust;
+            let combined = match self.consensus_trust(peer_key) {
+                Some(c) => (local + c) * 0.5,
+                None    => local,
+            };
+            let cost = peer.trust_adjusted_cost_with(combined);
+            let slot = if self.is_path_negative(peer_key, tag) { &mut best_neg } else { &mut best };
+            if slot.is_none_or(|(_, bc)| cost < bc) {
+                *slot = Some((*peer_key, cost));
             }
         }
-        best.map(|(k, _)| k)
+        best.or(best_neg).map(|(k, _)| k)
     }
 }
