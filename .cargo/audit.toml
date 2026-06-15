@@ -6,11 +6,8 @@
 # why we accept it.
 
 [advisories]
-ignore = [
-    # rand 0.8 is unsound IF you install a custom logger that calls
-    # `rand::rng()` from within `log::log!`. We have no `log` integration
-    # and our entire crate uses `OsRng` directly, never the global
-    # thread-local rng — we are not affected. Migrating to rand 0.9 is
-    # a multi-call-site API change planned for a future minor.
-    "RUSTSEC-2026-0097",
-]
+# No active ignores. RUSTSEC-2026-0097 (rand 0.8 unsoundness) was RESOLVED, not
+# ignored: rand was bumped 0.8.5 → 0.8.6, the advisory's own backported patch
+# fix (`Solution: Upgrade to ... >=0.8.6`). `cargo deny check advisories`
+# reports clean with no ignore entry.
+ignore = []
