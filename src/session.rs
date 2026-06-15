@@ -51,18 +51,19 @@ pub const ML_KEM_KEY_ROTATION_MS: u64 = 24 * 60 * 60 * 1000; // 24h
 /// already in flight against the just-replaced pub.
 pub const ML_KEM_KEY_OVERLAP_MS: u64 = 60_000; // 60s
 
-/// Retransmit interval for a not-yet-established `SessionInit`. The handshake is
-/// re-sent at most this often (driven by the maintenance tick) until the session
-/// establishes, so a single `SessionInit` lost to a transient routing hole
-/// during setup self-heals instead of wedging the session for the caller's whole
-/// retry window.
+/// Handshake-retransmit backoff for a not-yet-established `SessionInit`. The
+/// per-session interval starts at `BASE` and DOUBLES each retransmit, capped at
+/// `MAX`: ~1s, 2s, 4s, 8s, 16s, then 30s forever. A `SessionInit` lost to a
+/// *transient* routing hole self-heals within a second or two, while a session
+/// to a genuinely hard-to-reach destination decays to one probe per 30s instead
+/// of hammering at a flat rate — bounding the egress that flat-rate retransmits
+/// would generate (measured: handshake TRAFFIC was ~44% of cluster egress).
 ///
-/// MUST stay above `INIT_RATE_WINDOW / MAX_INITS_PER_WINDOW` (= 2.5s) so a
-/// node's own legitimate handshake retransmits never trip the *receiver's*
-/// per-source init rate limit. 3s ⇒ Inits at ~t, t+3, t+6, t+9 = 4 within any
-/// 10s window = exactly the cap, so a retransmit that lands after a transient
-/// hole closes still gets through instead of being throttled.
-pub const HANDSHAKE_RETX_INTERVAL_MS: u64 = 3000; // 3s (> INIT_RATE_WINDOW/MAX_INITS_PER_WINDOW)
+/// The doubling also keeps a node's own retransmits under the *receiver's*
+/// per-source init rate limit (`MAX_INITS_PER_WINDOW`/`INIT_RATE_WINDOW`): the
+/// fast head is only ~3 inits in any 10s window.
+pub const HANDSHAKE_RETX_BASE_MS: u64 = 1000;  // first retransmit ~1s after init
+pub const HANDSHAKE_RETX_MAX_MS: u64 = 30_000; // backoff ceiling
 
 /// Active rotation interval — accounts for the `NORN_ACCELERATE_ROTATIONS_SECS`
 /// test knob. In production this equals `ML_KEM_KEY_ROTATION_MS`. In a
@@ -310,6 +311,10 @@ pub struct SessionInfo {
     // session. Drives handshake retransmission so a single SessionInit lost
     // to a transient routing hole during setup doesn't wedge the session.
     last_init_sent: Instant,
+    // Number of SessionInit retransmits so far; doubles the backoff interval
+    // (see HANDSHAKE_RETX_BASE_MS) so a hard-to-reach dst decays to a 30s probe
+    // instead of hammering. Reset implicitly when the session is recreated.
+    init_retx_count: u32,
 
     /// Post-quantum shared secret derived during handshake. Once set, every
     /// per-packet AEAD key is HKDF-Extract(salt=pq_shared, ikm=x25519_shared)
@@ -348,6 +353,7 @@ impl SessionInfo {
             established: false,
             last_used: Instant::now(),
             last_init_sent: Instant::now(),
+            init_retx_count: 0,
             pq_shared: None,
             pq_shared_fallback: None,
             cached_dh: None,
@@ -1135,12 +1141,14 @@ impl SessionManager {
             if info.established {
                 continue;
             }
-            if (now.duration_since(info.last_init_sent).as_millis() as u64)
-                < HANDSHAKE_RETX_INTERVAL_MS
-            {
+            // Exponential backoff: interval = BASE << retx_count, capped at MAX.
+            let interval = (HANDSHAKE_RETX_BASE_MS << info.init_retx_count.min(5))
+                .min(HANDSHAKE_RETX_MAX_MS);
+            if (now.duration_since(info.last_init_sent).as_millis() as u64) < interval {
                 continue;
             }
             info.last_init_sent = now;
+            info.init_retx_count = info.init_retx_count.saturating_add(1);
             let local_pub = info.local_x25519_pub;
             drop(info);
             let init = SessionInit::create(
@@ -1989,33 +1997,36 @@ mod tests {
     // ── handshake retransmission ─────────────────────────────────────────────
 
     #[test]
-    fn pending_handshake_inits_retransmits_until_established() {
-        // The first SessionInit is sent once by get_or_initiate_bytes; the
-        // maintenance tick re-sends via pending_handshake_inits until the
-        // session establishes, so a single lost Init self-heals.
+    fn pending_handshake_inits_retransmits_with_exponential_backoff() {
+        // get_or_initiate_bytes sends the first SessionInit once; the maintenance
+        // tick re-sends via pending_handshake_inits with an exponential backoff
+        // (BASE, 2×BASE, …, capped at MAX) until the session establishes.
         let sk = SigningKey::generate(&mut OsRng);
         let mut mgr = SessionManager::new(sk);
         let dst = [0xDD_u8; 32];
-        let _ = mgr.initiate(&dst); // pending session; last_init_sent ≈ now
+        let _ = mgr.initiate(&dst); // pending; last_init_sent ≈ now, retx_count=0
         let t0 = std::time::Instant::now();
+        let ms = std::time::Duration::from_millis;
 
-        // Not due before the interval elapses.
-        assert!(mgr.pending_handshake_inits(t0).is_empty(),
-            "no retransmit before HANDSHAKE_RETX_INTERVAL_MS");
+        // Not due before BASE.
+        assert!(mgr.pending_handshake_inits(t0).is_empty(), "no retransmit before BASE");
 
-        // Due after the interval — exactly one Init, for the pending dst.
-        let later = t0 + std::time::Duration::from_millis(HANDSHAKE_RETX_INTERVAL_MS + 50);
-        let inits = mgr.pending_handshake_inits(later);
-        assert_eq!(inits.len(), 1, "pending session retransmits after the interval");
-        assert_eq!(inits[0].0, dst, "retransmit targets the pending dst");
+        // First retransmit at ~BASE — exactly one, for the pending dst.
+        let t1 = t0 + ms(HANDSHAKE_RETX_BASE_MS + 50);
+        let r1 = mgr.pending_handshake_inits(t1);
+        assert_eq!(r1.len(), 1, "first retransmit after BASE");
+        assert_eq!(r1[0].0, dst, "retransmit targets the pending dst");
 
-        // Rate-gated: not re-sent again within the same interval.
-        assert!(mgr.pending_handshake_inits(later).is_empty(),
-            "retransmit is rate-gated to HANDSHAKE_RETX_INTERVAL_MS");
+        // Backoff: the next interval is 2×BASE, so one BASE later is NOT yet due.
+        assert!(mgr.pending_handshake_inits(t1 + ms(HANDSHAKE_RETX_BASE_MS + 50)).is_empty(),
+            "interval doubled — not due one BASE after the first retransmit");
+        // …but due after 2×BASE.
+        let r2 = mgr.pending_handshake_inits(t1 + ms(2 * HANDSHAKE_RETX_BASE_MS + 50));
+        assert_eq!(r2.len(), 1, "second retransmit after 2×BASE (exponential backoff)");
 
         // Established → never retransmits, however much time passes.
         mgr.get_session(&dst).unwrap().lock().unwrap().established = true;
-        let much_later = later + std::time::Duration::from_secs(10);
+        let much_later = t1 + ms(10 * HANDSHAKE_RETX_MAX_MS);
         assert!(mgr.pending_handshake_inits(much_later).is_empty(),
             "an established session must not retransmit");
     }
