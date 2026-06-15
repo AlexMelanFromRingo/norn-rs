@@ -61,18 +61,29 @@ opt-in **Sphinx onion** layer wraps the entire `Traffic` (including
 `dest_coord`) for senders who need unlinkability. Path A's leak applies only to
 base (non-onion) traffic, which already exposes `routing_tag` + `pkt_type`.
 
-## Companion: tree convergence
+## Companion: tree convergence — TRIED, still shelved
 
 Greedy is only as good as the embedding. The coordinates derive from the
 spanning tree (`from_tree_depth`); the long-known **root-abdication**
-count-to-infinity inflates depths and distorts coords. The abdication guard
-(`fix_tree` ignores an announce whose root is our own identity echoed back)
-was previously shelved because, on a correct/quiescent tree, cuckoo-only
-transit went cold. **Path A removes that coupling** (transit now has geometry),
-so the abdication fix becomes safe to land alongside — and is what makes the
-greedy embedding accurate. Land Path A first, validate, then re-introduce the
-abdication guard and re-validate that routing is robust *without* relying on
-cuckoo churn.
+count-to-infinity inflates depths and distorts coords. The hypothesis was that
+Path A (transit no longer leaning on cuckoo) would finally make the abdication
+guard (`fix_tree` ignores an announce whose root is our own identity echoed
+back) safe to land.
+
+**Result: it does not — tested and reverted.** With the guard *and* Path A, the
+`four_node_linear_chain` integration test regressed and `five_node_star` went
+to 8/10, whereas Path A alone is 12/12 and 20/20 under stress. Diagnosis: the
+flakiness is a **convergence-window** gap, not a steady-state one. At cold
+start the spanning tree (and thus the coordinates) has not converged yet, so
+greedy has no good embedding to use *and* cuckoo is cold — the count-to-infinity
+churn was what kept cuckoo warm through that window. Path A fixes steady-state
+transit but not the startup window.
+
+So Path A ships alone. count-to-infinity remains a tolerated, cosmetic
+depth-inflation that the system actually relies on during convergence. A real
+decoupling would need faster/seeded coord convergence or a brief startup warmup
+that keeps reachability fresh until the embedding settles — a separate,
+larger piece, out of scope here.
 
 ## Testing
 
