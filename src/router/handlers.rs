@@ -100,14 +100,29 @@ impl RouterState {
             return;
         }
 
+        let mut structural_change = false;
         if let Some(peer) = self.peers.get_mut(&from) {
             peer.last_rx_time = Instant::now();
+            // Detect a STRUCTURAL change (root or depth) — not path_cost, which
+            // jitters every announce on real links and would pin us at MIN
+            // cadence forever. Cost-jitter parent flapping is handled by the
+            // fix_tree hysteresis; here we only want genuine tree churn to keep
+            // the convergence freshness floor engaged (B-step-3 §2.3).
+            structural_change = match &peer.trees[tree_id] {
+                Some(prev) => prev.root != ann.root || prev.depth != ann.depth,
+                None => true,
+            };
             peer.trees[tree_id] = Some(TreeAnnounce {
                 root: ann.root,
                 path_cost: ann.path_cost,
                 received_at: Instant::now(),
                 depth: ann.depth,
             });
+        }
+        if structural_change {
+            // A neighbour's tree state moved — keep announcing at MIN so it gets
+            // our state promptly while it converges.
+            self.last_topology_change_tick = self.tick;
         }
         self.update_landmarks();
     }
@@ -380,11 +395,21 @@ impl RouterState {
                 self.send_to_peer(&next_hop, encoded);
             } else {
                 debug!("no route for routing_tag {:?}", &traffic.routing_tag[..4]);
-                // Backtrack: tell upstream we have no neighbour for this tag
-                // (cuckoo false positive somewhere in their view, or genuine
-                // unreachability). They cache (us, tag) and try elsewhere.
-                let tag = traffic.routing_tag;
-                self.send_path_negative(from, tag, PATH_NEG_INITIAL_TTL);
+                CUCKOO_NO_ROUTE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                // Backtrack: normally tell upstream we have no neighbour for this
+                // tag so it caches (us, tag) and tries elsewhere. BUT during the
+                // convergence grace window a "no route" is almost always a
+                // transient aggregation hole while the tree re-settles, not a
+                // genuine dead-end (B-step-3 §4.1). Poisoning it adds churn and,
+                // on a no-alternative-path topology (chain/star), black-holes the
+                // tag for PATH_NEG_TTL. So suppress the poison while convergence
+                // is active and rely on the sender's natural retry (every 100 ms)
+                // to catch the route once cuckoo fills in; after the window a
+                // "no route" is treated as a real dead-end and poisoned as before.
+                if !self.convergence_active() {
+                    let tag = traffic.routing_tag;
+                    self.send_path_negative(from, tag, PATH_NEG_INITIAL_TTL);
+                }
             }
         }
     }

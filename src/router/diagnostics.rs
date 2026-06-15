@@ -99,6 +99,23 @@ pub static CONTROL_BROADCASTS: std::sync::atomic::AtomicU64 =
 pub static CONTROL_SUPPRESSED: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
+/// Convergence instrumentation (B-step-3 §5). `TREE_PARENT_CHANGES` counts every
+/// actual parent-pointer switch in `fix_tree` — a *settled* topology should stop
+/// incrementing it; continued growth = parent flapping (the count-to-∞ window
+/// cause). `CUCKOO_NO_ROUTE` counts transit "no route" events. Surfaced as
+/// `norn_tree_parent_changes_total` / `norn_cuckoo_no_route_total`.
+pub static TREE_PARENT_CHANGES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub static CUCKOO_NO_ROUTE: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Snapshot of the convergence counters `(parent_changes, no_route)` for the
+/// Prometheus exposition.
+pub fn convergence_counts() -> (u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (TREE_PARENT_CHANGES.load(Relaxed), CUCKOO_NO_ROUTE.load(Relaxed))
+}
+
 /// Snapshot of the control-broadcast counters `(sent, suppressed)` for
 /// the Prometheus exposition.
 pub fn control_broadcast_counts() -> (u64, u64) {

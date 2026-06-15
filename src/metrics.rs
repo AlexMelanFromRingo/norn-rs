@@ -158,6 +158,19 @@ pub fn render(conn: &PacketConn, started: Instant) -> String {
     out.push_str("# TYPE norn_control_suppressed_total counter\n");
     out.push_str(&format!("norn_control_suppressed_total {ctrl_suppressed}\n"));
 
+    // Convergence instrumentation (B-step-3 §5). On a SETTLED topology
+    // parent-changes must stop climbing — continued growth = parent flapping.
+    let (parent_changes, no_route) = crate::router::convergence_counts();
+    out.push_str("# HELP norn_tree_parent_changes_total \
+                  Spanning-tree parent-pointer switches in fix_tree. Continued \
+                  growth on a settled topology indicates parent flapping.\n");
+    out.push_str("# TYPE norn_tree_parent_changes_total counter\n");
+    out.push_str(&format!("norn_tree_parent_changes_total {parent_changes}\n"));
+    out.push_str("# HELP norn_cuckoo_no_route_total \
+                  Transit packets with no route (cuckoo miss / transient hole).\n");
+    out.push_str("# TYPE norn_cuckoo_no_route_total counter\n");
+    out.push_str(&format!("norn_cuckoo_no_route_total {no_route}\n"));
+
     // Per-message-type egress byte accounting — answers "where does the
     // gossip bandwidth go?" (cuckoo vs reputation vs pathfind vs coord …).
     out.push_str("# HELP norn_tx_bytes_by_type Bytes sent to peers, by frame type.\n");
