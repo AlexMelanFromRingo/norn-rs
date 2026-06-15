@@ -7,7 +7,17 @@ impl RouterState {
     // a multi-hop test to verify greedy forwarding is affected.
     #[mutants::skip]
     pub(crate) fn update_own_coord(&mut self) {
-        self.own_coord = HypCoord::from_tree_depth(self.own_depth, &self.pub_key);
+        // v5 greedy embedding: θ derives from our PARENT's θ (a one-hop
+        // neighbour, so its coord is in coord_table) — descendants cluster under
+        // their ancestor, giving greedy a gradient. Root / not-yet-known parent
+        // → parent_theta = 0 (and depth 0 → origin); θ converges as the parent's
+        // CoordAnnounce arrives, exactly like depth converges.
+        let parent_theta = self.trees[0].parent
+            .and_then(|p| self.coord_table.get(&p))
+            .map(|c| c.theta)
+            .unwrap_or(0.0);
+        self.own_coord =
+            HypCoord::from_tree_position(self.own_depth, parent_theta, &self.pub_key);
         self.coord_table.insert(self.pub_key, self.own_coord);
     }
 
@@ -17,7 +27,7 @@ impl RouterState {
         let coord_bytes = self.own_coord.encode();
         let onion_eph_pub = *self.onion_keys.pub_key().as_bytes();
         let unsigned = CoordAnnounce {
-            version: COORD_FORMAT_V4,
+            version: COORD_FORMAT_V5,
             coord: coord_bytes,
             tree_depth: self.own_depth,
             onion_eph_pub,
@@ -51,18 +61,22 @@ impl RouterState {
             return;
         }
 
-        // ── Consistency check #1: coord MUST equal from_tree_depth(depth, pub_key).
+        // ── Consistency check #1: rho MUST match the depth-derived value.
         //
-        // Coords are a deterministic function of (tree_depth, pub_key), so the
-        // sender cannot legitimately pick a coord independent of those two
-        // inputs. Allowing arbitrary self-reported coords lets a malicious peer
-        // place itself near any target, biasing greedy routing toward
-        // themselves (sinkhole). We reject any mismatch.
-        let expected = HypCoord::from_tree_depth(ann.tree_depth, &from_key);
-        if !coords_approx_equal(&coord, &expected) {
+        // In the v5 greedy embedding θ is tree-position-derived (parent's θ + a
+        // per-node offset), so a verifier cannot recompute the announcer's θ
+        // without its parent context — θ is therefore accepted as advisory (a
+        // greedy hint). rho stays strictly depth-bound and is verified here:
+        // cheap, and it stops a peer claiming an artificially shallow/deep radial
+        // position. A peer that lies about θ to attract greedy traffic and then
+        // drops it is caught by the SAME per-peer trust-decay + active-probing
+        // machinery that already defeats cuckoo-filter poisoning (measured ~30×
+        // effective-cost increase against a planted attacker; see README).
+        let expected_rho = HypCoord::from_tree_position(ann.tree_depth, 0.0, &from_key).rho;
+        if (coord.rho - expected_rho).abs() > 1e-9 {
             warn!(
-                "coord announce from {:?} inconsistent with from_tree_depth(depth={}); rejecting",
-                &from_key[..4], ann.tree_depth
+                "coord announce from {:?} rho {} inconsistent with depth {} (expected {}); rejecting",
+                &from_key[..4], coord.rho, ann.tree_depth, expected_rho
             );
             // Treat as a soft-fail trust signal too.
             if let Some(peer) = self.peers.get_mut(&from_key) {
