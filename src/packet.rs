@@ -729,12 +729,21 @@ pub struct HolePunch {
 
 impl HolePunch {
     pub fn sign_bytes(&self) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(32 + 32 + 8 + 1 + self.endpoint.len());
+        // Must serialize the endpoint EXACTLY as `encode()` puts it on the
+        // wire (length clamped to u8::MAX, payload truncated to match) so the
+        // signature covers precisely the transmitted bytes. Without the clamp,
+        // an endpoint > 255 bytes signs `[(len mod 256)][full endpoint]` while
+        // the wire carries `[255][endpoint[..255]]`, and the receiver — which
+        // verifies against the decoded, clamped endpoint — could never validate
+        // it. (Real endpoints are short, so this is latent, but the two
+        // serializers must not be able to disagree.)
+        let len = self.endpoint.len().min(u8::MAX as usize);
+        let mut buf = Vec::with_capacity(32 + 32 + 8 + 1 + len);
         buf.extend_from_slice(&self.initiator);
         buf.extend_from_slice(&self.target);
         buf.extend_from_slice(&self.valid_from_ms.to_le_bytes());
-        buf.push(self.endpoint.len() as u8);
-        buf.extend_from_slice(self.endpoint.as_bytes());
+        buf.push(len as u8);
+        buf.extend_from_slice(&self.endpoint.as_bytes()[..len]);
         buf
     }
 
@@ -1645,6 +1654,34 @@ mod tests {
         data.extend_from_slice(&[0u8; 64]);  // sig
         assert!(HolePunch::decode(&data).is_err(),
             "truncated endpoint must be rejected");
+    }
+
+    #[test]
+    fn hole_punch_sign_bytes_matches_wire() {
+        // The signature MUST cover exactly the bytes that go on the wire.
+        // `encode()` clamps the endpoint length to u8::MAX; `sign_bytes()`
+        // must serialize the (same, clamped) length-prefixed endpoint
+        // identically — otherwise a receiver, which verifies against the
+        // decoded (clamped) endpoint, can never validate an over-long one,
+        // and the frame is silently un-verifiable. Regression for a
+        // sign-vs-wire desync on endpoints > 255 bytes.
+        for ep_len in [0usize, 16, 255, 300] {
+            let hp = HolePunch {
+                initiator: [0x11u8; 32],
+                target: [0x22u8; 32],
+                valid_from_ms: 1,
+                endpoint: "x".repeat(ep_len),
+                sig: [0u8; 64],
+            };
+            let sb = hp.sign_bytes();
+            let enc = hp.encode();
+            // sign_bytes: initiator(32)|target(32)|ts(8)|len(1)|endpoint
+            // encode: type(1)|initiator(32)|target(32)|ts(8)|len(1)|endpoint|sig(64)
+            let sb_tail = &sb[72..];
+            let enc_tail = &enc[73..enc.len() - 64];
+            assert_eq!(sb_tail, enc_tail,
+                "sign_bytes must serialize len-prefixed endpoint exactly as encode (ep_len={ep_len})");
+        }
     }
 
     // ── ReputationReport ────────────────────────────────────────────────────

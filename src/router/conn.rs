@@ -813,6 +813,14 @@ impl PacketConn {
     /// STUN-like query or operator knowledge).
     #[mutants::skip]
     pub fn send_hole_punch(&self, rendezvous: &[u8; 32], target: [u8; 32], endpoint: String) {
+        // The wire format length-prefixes the endpoint with a single byte, so
+        // anything over 255 bytes would be silently truncated on encode (and a
+        // truncated address is a wrong dial target). Refuse at the source — a
+        // real socket address is never this long.
+        if endpoint.len() > u8::MAX as usize {
+            warn!("send_hole_punch: endpoint too long ({} bytes), refusing to send", endpoint.len());
+            return;
+        }
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64).unwrap_or(0);
