@@ -944,6 +944,19 @@ impl RouterState {
         self.rotate_session_keys();
         self.rotate_onion_keys_if_due();
         self.rotate_pq_keys_if_due();
+        // Handshake retransmission: re-send SessionInit for sessions still in
+        // the handshake. `get_or_initiate_bytes` sends the first Init exactly
+        // once, so without this a single Init lost to a transient routing gap
+        // (a peer rebooting, a brief link blip, a forwarding hiccup) wedges the
+        // session for the caller's whole retry window. Bounded by the per-peer
+        // pending set and rate-limited by HANDSHAKE_RETX_INTERVAL_MS.
+        let pending_inits = {
+            let sm = self.sessions.read_or_recover();
+            sm.pending_handshake_inits(Instant::now())
+        };
+        for (dst, init) in pending_inits {
+            self.send_traffic_to(&dst, init);
+        }
         // Periodically re-announce our onion ephemeral pub so the network-wide
         // table heals after splits/peer churn. Multiple-of check fires on the
         // first tick too — that's the deliberate cold-start announce.

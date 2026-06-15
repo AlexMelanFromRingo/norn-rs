@@ -51,6 +51,19 @@ pub const ML_KEM_KEY_ROTATION_MS: u64 = 24 * 60 * 60 * 1000; // 24h
 /// already in flight against the just-replaced pub.
 pub const ML_KEM_KEY_OVERLAP_MS: u64 = 60_000; // 60s
 
+/// Retransmit interval for a not-yet-established `SessionInit`. The handshake is
+/// re-sent at most this often (driven by the maintenance tick) until the session
+/// establishes, so a single `SessionInit` lost to a transient routing hole
+/// during setup self-heals instead of wedging the session for the caller's whole
+/// retry window.
+///
+/// MUST stay above `INIT_RATE_WINDOW / MAX_INITS_PER_WINDOW` (= 2.5s) so a
+/// node's own legitimate handshake retransmits never trip the *receiver's*
+/// per-source init rate limit. 3s ⇒ Inits at ~t, t+3, t+6, t+9 = 4 within any
+/// 10s window = exactly the cap, so a retransmit that lands after a transient
+/// hole closes still gets through instead of being throttled.
+pub const HANDSHAKE_RETX_INTERVAL_MS: u64 = 3000; // 3s (> INIT_RATE_WINDOW/MAX_INITS_PER_WINDOW)
+
 /// Active rotation interval — accounts for the `NORN_ACCELERATE_ROTATIONS_SECS`
 /// test knob. In production this equals `ML_KEM_KEY_ROTATION_MS`. In a
 /// test cluster (see tests/cluster/) it can be cranked down to seconds so
@@ -293,6 +306,10 @@ pub struct SessionInfo {
     pub established: bool,
     // Last time this session was used for encrypt or decrypt
     pub last_used: Instant,
+    // Last time we (re)sent the SessionInit for this not-yet-established
+    // session. Drives handshake retransmission so a single SessionInit lost
+    // to a transient routing hole during setup doesn't wedge the session.
+    last_init_sent: Instant,
 
     /// Post-quantum shared secret derived during handshake. Once set, every
     /// per-packet AEAD key is HKDF-Extract(salt=pq_shared, ikm=x25519_shared)
@@ -330,6 +347,7 @@ impl SessionInfo {
             remote_seq_window: 0,
             established: false,
             last_used: Instant::now(),
+            last_init_sent: Instant::now(),
             pq_shared: None,
             pq_shared_fallback: None,
             cached_dh: None,
@@ -1097,6 +1115,41 @@ impl SessionManager {
             return None; // already established or handshake in-flight — don't overwrite
         }
         Some(self.initiate(remote_ed_pub))
+    }
+
+    /// Re-emit `SessionInit` for every session still in the handshake (created
+    /// but not yet established) that is due for a retransmit, returning
+    /// `(remote_ed_pub, init_bytes)` per due session for the caller to route via
+    /// `send_traffic_to`. Driven by the maintenance tick.
+    ///
+    /// This is the handshake's tolerance to a transient routing hole during
+    /// setup: `get_or_initiate_bytes` sends the first `SessionInit` exactly once,
+    /// so without this a single lost Init would wedge the session for the whole
+    /// caller retry window (the bug behind the converged-tree session-setup
+    /// flake). The stored local x25519 ephemeral is reused so a retransmit is a
+    /// faithful resend, not a fresh handshake.
+    pub fn pending_handshake_inits(&self, now: Instant) -> Vec<([u8; 32], Vec<u8>)> {
+        let mut out = Vec::new();
+        for (ed_pub, info_arc) in &self.sessions {
+            let mut info = info_arc.lock().unwrap();
+            if info.established {
+                continue;
+            }
+            if (now.duration_since(info.last_init_sent).as_millis() as u64)
+                < HANDSHAKE_RETX_INTERVAL_MS
+            {
+                continue;
+            }
+            info.last_init_sent = now;
+            let local_pub = info.local_x25519_pub;
+            drop(info);
+            let init = SessionInit::create(
+                &self.our_signing_key, &local_pub, ed_pub, self.pq_keys.pub_bytes(),
+            )
+            .encode();
+            out.push((*ed_pub, init));
+        }
+        out
     }
 }
 
@@ -1931,6 +1984,40 @@ mod tests {
         mgr.init_rate_log.insert(src, vec![old; MAX_INITS_PER_WINDOW]);
         assert!(!mgr.rate_limited(&src),
             "old timestamps (>WINDOW) must be evicted, freeing the source's quota");
+    }
+
+    // ── handshake retransmission ─────────────────────────────────────────────
+
+    #[test]
+    fn pending_handshake_inits_retransmits_until_established() {
+        // The first SessionInit is sent once by get_or_initiate_bytes; the
+        // maintenance tick re-sends via pending_handshake_inits until the
+        // session establishes, so a single lost Init self-heals.
+        let sk = SigningKey::generate(&mut OsRng);
+        let mut mgr = SessionManager::new(sk);
+        let dst = [0xDD_u8; 32];
+        let _ = mgr.initiate(&dst); // pending session; last_init_sent ≈ now
+        let t0 = std::time::Instant::now();
+
+        // Not due before the interval elapses.
+        assert!(mgr.pending_handshake_inits(t0).is_empty(),
+            "no retransmit before HANDSHAKE_RETX_INTERVAL_MS");
+
+        // Due after the interval — exactly one Init, for the pending dst.
+        let later = t0 + std::time::Duration::from_millis(HANDSHAKE_RETX_INTERVAL_MS + 50);
+        let inits = mgr.pending_handshake_inits(later);
+        assert_eq!(inits.len(), 1, "pending session retransmits after the interval");
+        assert_eq!(inits[0].0, dst, "retransmit targets the pending dst");
+
+        // Rate-gated: not re-sent again within the same interval.
+        assert!(mgr.pending_handshake_inits(later).is_empty(),
+            "retransmit is rate-gated to HANDSHAKE_RETX_INTERVAL_MS");
+
+        // Established → never retransmits, however much time passes.
+        mgr.get_session(&dst).unwrap().lock().unwrap().established = true;
+        let much_later = later + std::time::Duration::from_secs(10);
+        assert!(mgr.pending_handshake_inits(much_later).is_empty(),
+            "an established session must not retransmit");
     }
 
     #[test]
