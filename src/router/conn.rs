@@ -371,10 +371,12 @@ impl PacketConn {
         // peers' encrypt/decrypt paths stay unblocked (Roadmap #2).
         let pub_key = self.pub_key;
         let (enc_header, tag) = encrypt_header(&pub_key, dst);
-        let handle = {
+        let (handle, dest_coord) = {
             let state = self.inner.lock_or_recover();
+            // Stamp the dst coord so transit nodes can route greedily.
+            let dest_coord = state.coord_table.get(dst).map(|c| c.encode());
             let sm = state.sessions.read_or_recover();
-            sm.get_session(dst)
+            (sm.get_session(dst), dest_coord)
         };
         let Some(handle) = handle else {
             bail!("session not established with {:?}", &dst[..4]);
@@ -391,6 +393,7 @@ impl PacketConn {
                     enc_header,
                     routing_tag: tag,
                     pkt_type: packet::PKT_DATA,
+                    dest_coord,
                     watermark: 0,
                     payload: ciphertext,
                 };
@@ -569,9 +572,11 @@ impl PacketConn {
         // per-peer Mutex<SessionInfo> internally), so a read guard is
         // sufficient — multiple concurrent encrypts to different
         // peers share this lock.
-        let ciphertext = {
+        let (ciphertext, dest_coord) = {
             let state = self.inner.lock_or_recover();
-            state.sessions.read_or_recover().encrypt(dst, &padded)?
+            let dest_coord = state.coord_table.get(dst).map(|c| c.encode());
+            let ct = state.sessions.read_or_recover().encrypt(dst, &padded)?;
+            (ct, dest_coord)
         };
 
         let pub_key = self.pub_key;
@@ -582,6 +587,7 @@ impl PacketConn {
             enc_header,
             routing_tag: tag,
             pkt_type: packet::PKT_DATA,
+            dest_coord,
             watermark: 0,
             payload: ciphertext,
         };
@@ -657,9 +663,11 @@ impl PacketConn {
         }
 
         let padded = pad_payload(payload);
-        let ciphertext = {
+        let (ciphertext, dest_coord) = {
             let state = self.inner.lock_or_recover();
-            state.sessions.read_or_recover().encrypt(dst, &padded)?
+            let dest_coord = state.coord_table.get(dst).map(|c| c.encode());
+            let ct = state.sessions.read_or_recover().encrypt(dst, &padded)?;
+            (ct, dest_coord)
         };
         let pub_key = self.pub_key;
         let (enc_header, tag) = encrypt_header(&pub_key, dst);
@@ -669,6 +677,7 @@ impl PacketConn {
             enc_header,
             routing_tag: tag,
             pkt_type: packet::PKT_DATA,
+            dest_coord,
             watermark: 0,
             payload: ciphertext,
         };

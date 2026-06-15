@@ -2061,6 +2061,85 @@
              `d < best_dist → d > best_dist` mutation returns farthest peer instead");
     }
 
+    // ── greedy_next_hop: the shared transit/source primitive ─────────────────
+
+    #[test]
+    fn greedy_next_hop_picks_strictly_closer_neighbour() {
+        let mut rs = make_router(); // own_coord = origin (rho = 0)
+        let a = [0xA1u8; 32];
+        let b = [0xB1u8; 32];
+        add_dummy_peer(&mut rs, a);
+        add_dummy_peer(&mut rs, b);
+        let dst = HypCoord { rho: 0.8, theta: 0.0 };
+        rs.coord_table.insert(a, HypCoord { rho: 0.7, theta: 0.0 });               // d=0.1 < own 0.8
+        rs.coord_table.insert(b, HypCoord { rho: 0.6, theta: std::f64::consts::PI }); // far
+        assert_eq!(rs.greedy_next_hop(dst, None), Some(a),
+            "must pick the neighbour strictly closer to dst_coord");
+    }
+
+    #[test]
+    fn greedy_next_hop_none_at_local_minimum() {
+        let mut rs = make_router(); // own_coord = origin → already closest to a near-origin dst
+        let a = [0xA1u8; 32];
+        add_dummy_peer(&mut rs, a);
+        let dst = HypCoord { rho: 0.1, theta: 0.0 };
+        rs.coord_table.insert(a, HypCoord { rho: 0.9, theta: 0.0 }); // farther than us (0.8 > 0.1)
+        assert_eq!(rs.greedy_next_hop(dst, None), None,
+            "no strictly-closer neighbour → local minimum → None (caller falls back to cuckoo)");
+    }
+
+    #[test]
+    fn greedy_next_hop_excludes_inbound_peer() {
+        let mut rs = make_router();
+        let a = [0xA1u8; 32];
+        add_dummy_peer(&mut rs, a);
+        let dst = HypCoord { rho: 0.8, theta: 0.0 };
+        rs.coord_table.insert(a, HypCoord { rho: 0.7, theta: 0.0 }); // the only closer hop
+        assert_eq!(rs.greedy_next_hop(dst, Some(a)), None,
+            "the inbound peer must be excluded — no bounce-back / 2-cycle");
+        assert_eq!(rs.greedy_next_hop(dst, None), Some(a), "without exclusion A is chosen");
+    }
+
+    // ── handle_traffic: transit routes by dest_coord, not just cuckoo ─────────
+    // The whole point of Path A: a relay forwards toward the stamped dest_coord
+    // even when NO cuckoo filter holds the tag (so cuckoo-only would dead-end
+    // into a PathNegative). Proves transit geometry is live.
+    #[test]
+    fn handle_traffic_transit_routes_greedily_by_dest_coord() {
+        let mut rs = make_router(); // own_coord = origin
+        let a = [0xA1u8; 32];
+        let b = [0xB1u8; 32];
+        let src = [0x5Cu8; 32];
+        let (tx_a, mut rx_a) = mpsc::channel(32);
+        let (tx_b, mut rx_b) = mpsc::channel(32);
+        let (tx_s, _rx_s) = mpsc::channel(32);
+        rs.add_peer(a, tx_a, 0);
+        rs.add_peer(b, tx_b, 0);
+        rs.add_peer(src, tx_s, 0);
+
+        let dst_coord = HypCoord { rho: 0.8, theta: 0.0 };
+        rs.coord_table.insert(a, HypCoord { rho: 0.7, theta: 0.0 });               // close to dst
+        rs.coord_table.insert(b, HypCoord { rho: 0.6, theta: std::f64::consts::PI }); // far
+
+        // Not addressed to us (random tag, in nobody's cuckoo filter), but it
+        // carries the destination coordinate.
+        let traffic = Traffic {
+            path: vec![],
+            from: src,
+            enc_header: [0u8; 128],
+            routing_tag: [0x99u8; 16],
+            pkt_type: crate::packet::PKT_DATA,
+            dest_coord: Some(dst_coord.encode()),
+            watermark: 0,
+            payload: vec![],
+        };
+        rs.handle_traffic(src, traffic);
+
+        assert!(rx_a.try_recv().is_ok(),
+            "greedy transit must forward toward dest_coord (peer A) with no cuckoo entry");
+        assert!(rx_b.try_recv().is_err(), "must not forward to the farther peer B");
+    }
+
     // ── lookup: XOR distance uses ^ not | (line 1129) ────────────────────────
     // dist[i] = peer_key[i] ^ dst[i]. Mutation: `^ → |`.
     // Setup: dst=[0xFF;32], peer_A=[0xFE;32] (cheap=200ms), peer_B=[0x01;32] (cheap=1ms).
