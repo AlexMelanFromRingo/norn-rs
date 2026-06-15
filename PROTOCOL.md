@@ -1,8 +1,30 @@
 # norn-rs wire protocol
 
 This document is the normative reference for the `norn-rs` protocol as of
-version **0.4.0**. Implementations claiming compatibility MUST match this
-specification byte-for-byte.
+version **0.10.x** (the current flag-day wire format). Implementations claiming
+compatibility MUST match this specification byte-for-byte.
+
+### 0.10 changes vs 0.5 (flag-day — wire-incompatible with 0.9.x)
+
+* **Coordinate format v4 (hyperboloid).** COORD_ANNOUNCE (§9) gains a leading
+  format-version byte and carries an unsaturating radial coordinate (`rho`,
+  linear in tree depth) on the hyperboloid model, replacing the old Poincaré
+  `r = tanh(depth·0.5)` (which saturated to 1.0 in f64 at depth ≳ 38 and lost
+  precision near the boundary). Distances are computed cancellation-free.
+* **Transit greedy ("Path A").** TRAFFIC (§8) carries the destination's
+  hyperbolic coordinate (1 presence byte + 16 bytes) so transit nodes can route
+  greedily by hyperbolic distance instead of relying solely on cuckoo-filter
+  reachability; cuckoo remains the local-minimum fallback. Privacy note: a relay
+  learns the destination's coordinate *region*, not its identity — the opt-in
+  Sphinx layer hides even that.
+* **CAPABILITIES** (TYPE 0x11) — additive, signed, flooded capability announce
+  (e.g. `CAP_ONION_SPHINX`); legacy nodes drop the unknown type (zero impact).
+  Auto-negotiates the opt-in Sphinx onion format per path.
+* **PATH_NEGATIVE** (TYPE 0x0F) — per-link negative-cache signal for fast
+  eviction of routes toward departed targets.
+* **SessionInit retransmission** (no wire change) — a lost SessionInit is
+  re-sent on a maintenance tick with exponential backoff (1 s base, ×2, 30 s cap)
+  until the handshake establishes.
 
 ### 0.5 changes vs 0.4
 
@@ -126,6 +148,8 @@ first byte selects the type:
 | 0x0C | ONION_KEY_ANNOUNCE | Network-wide onion ephemeral pub flood (`§14`). |
 | 0x0D | REPUTATION_REPORT  | Signed trust observation flooded mesh-wide (`§15`). |
 | 0x0E | HOLE_PUNCH         | NAT-traversal endpoint-exchange relay (`§16`). |
+| 0x0F | PATH_NEGATIVE      | Per-link negative-cache signal (fast dead-route eviction). |
+| 0x11 | CAPABILITIES       | Signed, flooded capability announce (e.g. Sphinx onion, `§17`). |
 
 ## 4. Sig request / response
 
@@ -203,10 +227,17 @@ Path length MUST NOT exceed 1024 hops.
 [enc_header: 128]             — see §8.1
 [routing_tag: 16]             — BLAKE2b-128("norn:route" || dest_pub_key)
 [pkt_type: u8]                — 0x00 control, 0x01 data
+[dest_coord_present: u8]      — 0 = absent, 1 = present (v0.10 transit greedy)
+[dest_coord: 16]             — destination HypCoord (§9), ONLY when present
 [watermark: varint]
 [payload_len: varint]
 [payload: payload_len bytes]
 ```
+
+`dest_coord` (v0.10 "Path A") lets transit nodes route greedily by hyperbolic
+distance when the cuckoo filter alone can't place the destination. It is the
+destination's coordinate *region*, not its identity; the opt-in Sphinx onion
+layer hides it.
 
 ### 8.1 enc_header
 
@@ -237,22 +268,34 @@ Path length MUST NOT exceed 1024 hops.
 
 ## 9. COORD_ANNOUNCE (0x0A)
 
-v2 layout (116 bytes):
+v4 layout (117 bytes):
 
 ```
-[coord: 16]                   — (r: f64 LE, theta: f64 LE)
+[version: u8 = 4]             — COORD_FORMAT_V4 (authenticated)
+[coord: 16]                   — HypCoord (rho: f64 LE, theta: f64 LE) — hyperboloid
 [tree_depth: u32 LE]
 [onion_eph_pub: 32]           — sender's current onion ephemeral X25519 pub
-[sig: 64]                     — sender signs (coord || tree_depth || onion_eph_pub)
+[sig: 64]                     — sender signs (version || coord || tree_depth || onion_eph_pub)
 ```
 
+`rho` is the radial hyperbolic distance (linear in tree depth, unsaturating),
+replacing the old Poincaré `r = tanh(depth·0.5)`. Distances are computed
+cancellation-free on the hyperboloid model.
+
 Receivers MUST:
+* reject any `version` byte other than `COORD_FORMAT_V4` (4);
 * verify the signature;
 * reject coords containing NaN or Inf;
 * bound the coord table to 16 384 entries (evict a non-peer entry when full);
 * record `onion_eph_pub` against the announcing peer for later onion building.
 
 ## 10. ONION (0x0B)
+
+This is the **legacy** onion format (the default build). Its per-layer cleartext
+`aead_len` shrinks each hop — a hop-depth distinguisher. An **opt-in** Sphinx mix
+format (constant-size cell, no depth leak) replaces it when built
+`--features sphinx` and negotiated via CAPABILITIES (§17); see
+`docs/onion-sphinx-design.md`. Both ride the same `0x0B` dispatch.
 
 ```
 [routing_tag: 16]             — current layer's intended recipient
@@ -468,3 +511,25 @@ Optional UDP multicast on `ff02::1:9` (per the linkway):
 
 Beacons are unauthenticated — they are only a hint. The receiver dials and
 performs the full TCP handshake before treating the peer as authentic.
+
+## 17. CAPABILITIES (0x11)
+
+Additive, signed, mesh-flooded announce of a node's optional capabilities,
+modelled on ONION_KEY_ANNOUNCE (§14). A legacy node that doesn't know the type
+drops it (zero impact); no existing signed announce changed. Used to
+auto-negotiate the **opt-in** Sphinx onion format per path: a sender builds a
+Sphinx onion only when every hop (relays + destination) has gossiped the
+capability and the path fits `MAX_HOPS`, else it falls back to the legacy onion
+(§10).
+
+```
+[origin: 32]                  — capability owner's ed25519 pub
+[caps: u32 LE]                — capability bitmask (CAP_ONION_SPHINX = 1<<0)
+[seq: u64 LE]                 — monotonic dedup counter
+[valid_from_ms: u64 LE]      — freshness timestamp
+[sig: 64]                     — origin signs (origin || caps || seq || valid_from_ms)
+```
+
+Receivers verify the signature, dedup by `(origin, seq)`, and record
+`origin → caps`. The frame exists only in builds compiled `--features sphinx`; a
+default build neither emits nor requires it.

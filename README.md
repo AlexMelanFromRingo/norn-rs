@@ -10,7 +10,7 @@ The three Norns weave the fate of all beings. This protocol weaves routes betwee
 
 ## What it does
 
-norn-rs creates an encrypted IPv6 mesh network. Each node gets a unique `200::/7` IPv6 address derived deterministically from its ed25519 public key. Nodes connect to each other over any underlying transport (TCP over IPv4 **or** IPv6) and can reach any other node in the mesh by its IPv6 address, even without a direct connection.
+norn-rs creates an encrypted IPv6 mesh network. Each node gets a unique `200::/7` IPv6 address derived deterministically from its ed25519 public key. Nodes connect to each other over any underlying transport (TCP **or** QUIC, over IPv4 **or** IPv6) and can reach any other node in the mesh by its IPv6 address, even without a direct connection.
 
 **The `listen` addresses are the underlying transport addresses** (the physical network), not the overlay addresses. The overlay IPv6 addresses (`200::/7`) are derived from public keys and are independent of the transport. This is the same design as Yggdrasil and cjdns.
 
@@ -19,10 +19,12 @@ norn-rs creates an encrypted IPv6 mesh network. Each node gets a unique `200::/7
 | Feature | Status |
 |---------|--------|
 | K=3 spanning trees (Urd/Verdandi/Skuld) | ✅ |
-| Hyperbolic geometric routing (Kleinberg/Sarkar) | ✅ |
+| Hyperbolic geometric routing (v4 hyperboloid, cancellation-free distance) | ✅ |
+| Transit greedy routing (destination coord stamped in Traffic) | ✅ |
 | Cuckoo filter gossip (2-byte fingerprints, FPR 0.012%) | ✅ |
 | ChaCha20-Poly1305 session encryption | ✅ |
 | X25519 + ML-KEM-768 PQ-hybrid session keys | ✅ |
+| Handshake-init retransmit + exponential backoff | ✅ |
 | Daily ML-KEM long-term keypair rotation (PQ FS) | ✅ |
 | Per-send X25519 key rotation (classical FS) | ✅ |
 | Rotating onion ephemeral keys (post-quantum-relay FS) | ✅ |
@@ -36,6 +38,7 @@ norn-rs creates an encrypted IPv6 mesh network. Each node gets a unique `200::/7
 | Constant-time pub_key / routing_tag comparisons | ✅ |
 | Persistent known-peers cache (survives restart) | ✅ |
 | Prometheus `/metrics` endpoint | ✅ |
+| Per-message-type egress metrics (`norn_tx_bytes_by_type`) | ✅ |
 | `nornctl` admin CLI + shell completions | ✅ |
 | Property-based parser fuzzing (proptest) | ✅ |
 | Anti-amplification audit + size-pinning tests | ✅ |
@@ -45,14 +48,14 @@ norn-rs creates an encrypted IPv6 mesh network. Each node gets a unique `200::/7
 | HolePunch (TYPE 0x0E) for symmetric-NAT traversal | ✅ |
 | Docker image + systemd-grade hardening | ✅ |
 | Network-namespace end-to-end CI harness | ✅ |
-| ProVerif formal model of session handshake | ✅ |
+| ProVerif + Tamarin formal model of session handshake | ✅ |
 | Sliding-window replay protection (64-slot) | ✅ |
 | Source privacy (encrypted enc_header) | ✅ |
 | Destination hiding (routing_tag + enc_header) | ✅ |
 | Payload padding (256-byte blocks) | ✅ |
 | Forwarding jitter (0–49ms, traffic analysis resistance) | ✅ |
 | Cover traffic (random DUMMY packets) | ✅ |
-| Onion routing (Sphinx-inspired, N-hop AEAD layers) | ✅ |
+| Onion routing (legacy N-hop AEAD; opt-in Sphinx mix format via `--features sphinx`) | ✅ |
 | TUN adapter (IPv6 overlay, Linux) | ✅ |
 | TCP transport (IPv4 + IPv6 underlying) | ✅ |
 | Multicast peer discovery (LAN) | ✅ |
@@ -357,3 +360,8 @@ against the just-replaced public key still decap successfully.
 | `v0.6.0` | + security & ops hardening (three audit passes) |
 | `v0.8.0` | + multi-link peer bonding & `sendmmsg`-style write coalescing (the 0.7.0 transport work), per-peer session sharding, opt-in multi-core crypto worker pool |
 | `v0.9.0` | + opt-in transport obfuscation, BIP39/QR key sharing, adaptive control-plane cadence, cached per-packet X25519 DH (~20× faster encrypt) |
+| `v0.10.0` | **flag-day wire bump** — coordinate format v4 (hyperboloid, cancellation-free distance) + transit greedy routing ("Path A": destination coord in Traffic). Opt-in Sphinx onion + capability negotiation. ProVerif **+ Tamarin** formal verification. Router decomposed into `router/`. Not wire-compatible with v0.9.x. |
+| `v0.10.1` | handshake-init exponential backoff (−57 % handshake traffic / −24 % egress at 100-node scale) + per-message-type egress metrics. Wire-compatible with v0.10.0. |
+| `v0.10.2` | transport lock poison-recovery hardening; doc fix. Wire-compatible with v0.10.0/.1. |
+
+See [CHANGELOG.md](CHANGELOG.md) for detailed per-release notes.
