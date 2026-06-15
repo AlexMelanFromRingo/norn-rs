@@ -769,6 +769,7 @@ impl RouterState {
                 match tx.try_send(data.clone()) {
                     Ok(()) => {
                         peer.tx_bytes += len;
+                        record_tx_bytes(data.first().copied().unwrap_or(0), len);
                         peer.last_tx_time = Instant::now();
                         return;
                     }

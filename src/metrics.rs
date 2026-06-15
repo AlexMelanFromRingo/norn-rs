@@ -158,6 +158,14 @@ pub fn render(conn: &PacketConn, started: Instant) -> String {
     out.push_str("# TYPE norn_control_suppressed_total counter\n");
     out.push_str(&format!("norn_control_suppressed_total {ctrl_suppressed}\n"));
 
+    // Per-message-type egress byte accounting — answers "where does the
+    // gossip bandwidth go?" (cuckoo vs reputation vs pathfind vs coord …).
+    out.push_str("# HELP norn_tx_bytes_by_type Bytes sent to peers, by frame type.\n");
+    out.push_str("# TYPE norn_tx_bytes_by_type counter\n");
+    for (ty, bytes) in crate::router::tx_bytes_by_type() {
+        out.push_str(&format!("norn_tx_bytes_by_type{{type=\"{ty}\"}} {bytes}\n"));
+    }
+
     // ── Per-tree spanning-tree state ──────────────────────────────────────
     // Three labelled gauges per K=3 trees — enough for a cluster-wide
     // scraper to reconstruct each tree:

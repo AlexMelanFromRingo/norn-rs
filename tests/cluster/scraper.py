@@ -156,7 +156,9 @@ def main() -> int:
                         continue
                     w.writerow([
                         f"{elapsed:.3f}", host, name,
-                        labels.get("peer", ""), value,
+                        # The single distinguishing label: `peer=` for per-peer
+                        # metrics, `type=` for norn_tx_bytes_by_type, etc.
+                        labels.get("peer") or labels.get("type") or "", value,
                     ])
                     wrote += 1
             f.flush()
