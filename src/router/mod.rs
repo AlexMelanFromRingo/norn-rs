@@ -401,6 +401,10 @@ struct RouterState {
     /// always accepts both. See `path_supports_sphinx` for the Auto decision.
     #[cfg(feature = "sphinx")]
     onion_format: crate::config::OnionFormat,
+    /// Decoy/cover-traffic policy (config; default Light). Read by the cover
+    /// loop in `PacketConn::new` each cycle so a runtime `set_cover_traffic`
+    /// takes effect without a restart.
+    cover_mode: crate::config::CoverTraffic,
     /// Outgoing probe table: probe_id → (peer-we-sent-via, sent_at).
     /// On matching PathNotify → boost trust + remove. On timeout (handled
     /// in cleanup_stale_probes) → decay trust + remove.
@@ -500,6 +504,7 @@ impl RouterState {
             own_caps_seq: 0,
             #[cfg(feature = "sphinx")]
             onion_format: crate::config::OnionFormat::Auto,
+            cover_mode: crate::config::CoverTraffic::Light,
             pending_probes: HashMap::new(),
             reputation: HashMap::new(),
             own_reputation_seq: 0,

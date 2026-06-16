@@ -39,6 +39,9 @@ impl Node {
         // Roadmap #7: optional transport obfuscation. No-op if PSK empty.
         conn.set_obfuscation_psk(&config.obfuscation_psk);
 
+        // Decoy/cover-traffic policy (off/light/constant; default light).
+        conn.set_cover_traffic(config.cover_traffic);
+
         // Onion format we build when sending (opt-in `sphinx` feature; default
         // Auto: Sphinx where the whole path supports it, legacy otherwise).
         #[cfg(feature = "sphinx")]

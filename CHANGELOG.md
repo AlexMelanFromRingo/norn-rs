@@ -4,6 +4,33 @@ All notable changes to norn-rs are documented here. Versions follow Cargo's
 0.x semver: the **minor** number is bumped for breaking (wire/protocol) changes,
 the **patch** number for backward-compatible fixes.
 
+## v0.12.2
+
+> Backward-compatible (no wire change). Cover-traffic behaviour + a new config
+> knob; older configs keep working (default `light`).
+
+**Cover ("decoy") traffic, fixed and made configurable.** Two honest fixes plus
+an opt-in mode — none of which claims full traffic-analysis resistance.
+
+- **Size fix (the important one).** Decoy frames were 64–256 B while real frames
+  live on a ~256·m lattice (≥512 B), so a passive observer could separate cover
+  from real *by length alone* — defeating the point. Decoys now draw their size
+  from the same `PAD_BLOCK` lattice as real frames (mostly the 512 B bucket, with
+  a tail), so they are not length-distinguishable.
+- **New `cover_traffic` config:** `off` | `light` (default, the existing sparse
+  randomised decoys) | `constant` (a continuous decoy floor — one cell to every
+  peer every second; higher bandwidth, opt in). Runtime-settable via
+  `PacketConn::set_cover_traffic`.
+- **Doc accuracy.** SECURITY.md claimed "forwarding jitter" as a defence — there
+  is none (the `jitter` field is a link-cost measurement, not a deliberate
+  delay). Corrected the threat model: padding + size-matched decoys raise the
+  noise floor, but without constant-rate shaping a global passive adversary can
+  still attempt size/timing correlation. The "Global passive adversary" row
+  stays ◐ — constant-rate shaping and forwarding delay remain deliberate
+  non-goals (they break norn's lightweight, low-latency budget).
+
+---
+
 ## v0.12.1
 
 > Backward-compatible (no wire change). Local routing-decision change only —

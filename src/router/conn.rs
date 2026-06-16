@@ -28,6 +28,19 @@ pub struct PacketConn {
     obfs_key: std::sync::OnceLock<[u8; 32]>,
 }
 
+/// Decoy-frame size in `PAD_BLOCK` units for a roll in `0..100`. Free fn so the
+/// size-lattice property (decoys land on the same `PAD_BLOCK` lattice as real
+/// frames, never the old distinguishable 64–256 B band) is unit-testable.
+/// Distribution mimics the real send mix: mostly the smallest 1-payload-block
+/// bucket, with a tail for multi-block sends. Always ≥ 2 blocks.
+fn cover_frame_blocks(roll: u8) -> usize {
+    match roll {
+        0..=79 => 2,  // ≈512 B  (dominant — one payload block + frame overhead)
+        80..=94 => 3, // ≈768 B
+        _ => 4,       // ≈1024 B
+    }
+}
+
 impl PacketConn {
     /// Borrow the signing key (used by the transport layer for handshake signing).
     pub fn signing_key(&self) -> &SigningKey {
@@ -60,6 +73,13 @@ impl PacketConn {
     #[cfg(feature = "sphinx")]
     pub fn set_onion_format(&self, fmt: crate::config::OnionFormat) {
         self.inner.lock_or_recover().onion_format = fmt;
+    }
+
+    /// Set the decoy/cover-traffic policy (see [`crate::config::CoverTraffic`]).
+    /// The cover loop re-reads this each cycle, so it takes effect live. Call
+    /// once at node startup from config.
+    pub fn set_cover_traffic(&self, mode: crate::config::CoverTraffic) {
+        self.inner.lock_or_recover().cover_mode = mode;
     }
 
     /// Install this node's long-term ML-DSA-65 signing identity (Option B
@@ -106,32 +126,59 @@ impl PacketConn {
             });
         }
 
-        // Cover traffic: send DUMMY packets at randomised intervals to all peers.
-        // This makes it harder to correlate traffic patterns with communication endpoints.
+        // Cover traffic: send DUMMY packets to peers so a passive observer
+        // cannot trivially correlate *when* / *how much* a node really sends.
+        // Policy (off/light/constant) is read from RouterState each cycle, so
+        // `set_cover_traffic` takes effect live. Decoys are dropped on receipt.
+        //
+        // Critical for it to be useful: a decoy's wire size must come from the
+        // SAME lattice as real frames. A real Traffic frame is a fixed overhead
+        // (~200 B) plus a `PAD_BLOCK`-multiple payload, i.e. it lands on ~256·m
+        // for m ≥ 2. Decoys therefore use `blocks · PAD_BLOCK` with `blocks`
+        // sampled to mimic the real mix, instead of the old 64–256 B band which
+        // an observer could separate from real traffic by length alone.
         {
             let state = state.clone();
             let mut shutdown = shutdown_rx.clone();
             tokio::spawn(async move {
                 use rand::Rng;
                 let mut rng = rand::rngs::OsRng;
+                // One decoy frame whose length matches the real-frame lattice.
+                let cover_frame = |rng: &mut rand::rngs::OsRng| -> Vec<u8> {
+                    let blocks = cover_frame_blocks(rng.gen_range(0u8..100));
+                    let mut cover = vec![DUMMY];
+                    cover.resize(blocks * PAD_BLOCK, 0u8);
+                    cover
+                };
                 loop {
-                    // Random delay 8–30 seconds
-                    let delay_ms = rng.gen_range(8_000u64..30_000u64);
+                    let mode = state.lock_or_recover().cover_mode;
+                    use crate::config::CoverTraffic;
+                    // Off → idle (still wake periodically to observe a live mode
+                    // change). Light → randomised gaps. Constant → fixed 1 s tick.
+                    let delay_ms = match mode {
+                        CoverTraffic::Off => 5_000,
+                        CoverTraffic::Light => rng.gen_range(8_000u64..30_000u64),
+                        CoverTraffic::Constant => 1_000,
+                    };
                     tokio::select! {
                         _ = tokio::time::sleep(Duration::from_millis(delay_ms)) => {}
                         _ = shutdown.changed() => break,
                     }
-
+                    if matches!(mode, CoverTraffic::Off) {
+                        continue;
+                    }
                     let peers: Vec<PeerId> = {
                         state.lock_or_recover().peers.keys().copied().collect()
                     };
                     for peer in peers {
-                        // ~40% chance per peer per check — adds variability
-                        if rng.gen_bool(0.4) {
-                            // Randomised dummy size (64–256 bytes) to prevent size fingerprinting
-                            let dummy_len = rng.gen_range(64usize..256usize);
-                            let mut cover = vec![DUMMY];
-                            cover.resize(dummy_len, 0u8);
+                        // Light: ~40 % of peers per cycle (variability). Constant:
+                        // every peer, every tick (a continuous decoy floor).
+                        let send = match mode {
+                            CoverTraffic::Constant => true,
+                            _ => rng.gen_bool(0.4),
+                        };
+                        if send {
+                            let cover = cover_frame(&mut rng);
                             state.lock_or_recover().send_to_peer(&peer, cover);
                         }
                     }
@@ -877,5 +924,39 @@ impl PacketConn {
         for pk in peer_keys {
             self.inner.lock_or_recover().send_to_peer(&pk, encoded.clone());
         }
+    }
+}
+
+#[cfg(test)]
+mod cover_tests {
+    use super::cover_frame_blocks;
+    use crate::router::header::PAD_BLOCK;
+
+    #[test]
+    fn decoy_frames_live_on_real_frame_lattice() {
+        // Fix A: for every possible roll the decoy size must be a multiple of
+        // PAD_BLOCK and at least one payload block above the minimum (≥512 B),
+        // i.e. on the same lattice as real frames — never the old, trivially
+        // distinguishable 64–256 B band.
+        for roll in 0u8..100 {
+            let blocks = cover_frame_blocks(roll);
+            let size = blocks * PAD_BLOCK;
+            assert!(blocks >= 2, "decoy must be ≥2 blocks (roll={roll})");
+            assert_eq!(size % PAD_BLOCK, 0, "decoy must sit on the PAD_BLOCK lattice");
+            assert!(size >= 512, "decoy must be ≥512 B, was {size} (roll={roll})");
+            assert!(!(64..256).contains(&size), "must not fall in the old 64–256 B band");
+        }
+    }
+
+    #[test]
+    fn decoy_distribution_favours_smallest_bucket() {
+        // The dominant bucket is the smallest real size (one payload block);
+        // larger frames are a tail. Confirms the mix mimics real traffic.
+        let counts = (0u8..100).map(cover_frame_blocks).fold([0; 5], |mut acc, b| {
+            acc[b] += 1;
+            acc
+        });
+        assert!(counts[2] > counts[3] && counts[3] >= counts[4],
+            "smallest bucket must dominate: {counts:?}");
     }
 }

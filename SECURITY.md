@@ -24,7 +24,7 @@ document spells out what the network is and is not designed to resist.
 | Compromise of *all* relays on an onion circuit            |    ✗     | Deanonymises the flow — a property shared with Tor. |
 | Transit relay on a non-onion path                         |    ◐     | Sees ciphertext + routing metadata only (the `routing_tag` digest and, since v0.10, the destination's hyperbolic **coordinate region** used for greedy transit) — never plaintext, never the destination identity. The opt-in Sphinx layer hides even the coordinate. |
 | Compromise of a node's long-term ed25519 private key      |    ◐     | The key *is* the identity; losing it loses the identity going forward. Past traffic is largely forward-secret (session x25519 rotates every 100 sends; the long-term ML-KEM keypair rotates periodically; onion peel keys are rotating ephemerals). |
-| Global passive adversary observing all links              |    ◐     | Frame padding, forwarding jitter, and cover traffic raise the bar on size/timing correlation but do not make it infeasible. |
+| Global passive adversary observing all links              |    ◐     | Payloads are padded to a 256-byte lattice, and decoy ("cover") traffic — size-matched to the real-frame lattice — obscures *when*/*how much* a node sends (`cover_traffic = off\|light\|constant`). This raises the noise floor for size/timing correlation but is **not** infeasible to defeat: there is no constant-rate shaping (real bursts still ride above the floor), and forwarding is not deliberately delayed. |
 | Quantum adversary                                         |    ◐     | Sessions use a PQ-hybrid X25519 + ML-KEM-768 key (HKDF) — confidential as long as **either** primitive holds. Authentication is now **also** PQ-hybrid: the handshake carries an ML-DSA-65 signature (independent of Ed25519) and verifiers TOFU-pin the ML-DSA key, so established/repeat sessions resist a CRQC. Residual: *first contact* and the underlay transport handshake are still classically authenticated. |
 
 ### Properties claimed
@@ -125,8 +125,12 @@ The session/handshake and routing hardening is in place and (for the handshake)
 3. **Side-channel hardening of the crypto crates** — RustCrypto primitives document
    constant-time properties, but cache/timing leakage at the CPU level is not
    countered with explicit blinding at the session layer.
-4. **Traffic analysis** — padding + jitter + cover traffic raise the bar but a
-   global passive adversary can still attempt size/timing correlation.
+4. **Traffic analysis** — payload padding (256-byte lattice) + decoy traffic
+   (`cover_traffic`, size-matched to real frames) raise the bar, but a global
+   passive adversary can still attempt size/timing correlation: there is no
+   constant-rate shaping and no deliberate forwarding delay (both are non-goals —
+   they would break norn's lightweight, low-latency budget). `constant` mode adds
+   a continuous decoy floor for operators who accept the bandwidth cost.
 
 ## Reporting a vulnerability
 

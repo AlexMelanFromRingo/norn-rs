@@ -100,6 +100,10 @@ pub struct NodeConfig {
     #[serde(default)]
     pub obfuscation_psk: String,
 
+    /// Decoy ("cover") traffic policy (see [`CoverTraffic`]). Default `light`.
+    #[serde(default)]
+    pub cover_traffic: CoverTraffic,
+
     /// Onion wire format this node *builds* when sending via `write_to_onion`
     /// (see [`OnionFormat`]). Default `auto`: the fixed-size Sphinx format on
     /// paths whose every hop advertises support, legacy onion otherwise. Inbound
@@ -108,6 +112,31 @@ pub struct NodeConfig {
     #[cfg(feature = "sphinx")]
     #[serde(default)]
     pub onion_format: OnionFormat,
+}
+
+/// Decoy ("cover") traffic policy. Cover frames are dropped on receipt; their
+/// only purpose is to obscure *when* and *how much* a node really communicates.
+///
+/// Honest scope: even `constant` does NOT make a node traffic-analysis-proof
+/// against a global passive adversary — that needs full constant-rate shaping
+/// (queue + delay real traffic into a fixed schedule), which is a deliberate
+/// non-goal here (it breaks norn's lightweight, low-latency budget). These modes
+/// raise the *noise floor*; real bursts can still ride above it.
+#[derive(Deserialize, Serialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum CoverTraffic {
+    /// No decoy traffic. Lowest bandwidth; a passive observer sees exactly the
+    /// real send pattern.
+    Off,
+    /// Sparse, randomised decoys (default): every 8–30 s, ~40 % of peers get a
+    /// decoy whose size is drawn from the *same* lattice as real frames, so
+    /// cover and real are not separable by length. Negligible bandwidth.
+    #[default]
+    Light,
+    /// A constant decoy floor: one fixed-size cell to every peer every second,
+    /// regardless of real traffic. Meaningfully higher bandwidth (~continuous);
+    /// opt in only if you accept the cost. Still not full CBR shaping (see above).
+    Constant,
 }
 
 /// Which onion-routing wire format a node builds when sending. Receiving/relaying
@@ -155,6 +184,7 @@ impl Default for NodeConfig {
             mdns_enabled: true,
             crypto_workers: 0,
             obfuscation_psk: String::new(),
+            cover_traffic: CoverTraffic::default(),
             #[cfg(feature = "sphinx")]
             onion_format: OnionFormat::default(),
         }
@@ -227,6 +257,14 @@ multicast_port = 9001
 
 # Logging verbosity: error | warn | info | debug | trace
 log_level = "info"
+
+# Decoy ("cover") traffic policy: off | light | constant
+#   off      — no decoys (lowest bandwidth; real send pattern is fully visible)
+#   light    — sparse randomised decoys, size-matched to real frames (default)
+#   constant — a continuous decoy floor to every peer (higher bandwidth; opt in)
+# None of these is full traffic-analysis resistance against a global passive
+# observer — they raise the noise floor only.
+cover_traffic = "light"
 "#
         )
     }
@@ -439,6 +477,23 @@ mod tests {
         let toml_str = NodeConfig::generate_toml();
         let parsed: Result<NodeConfig, _> = toml::from_str(&toml_str);
         assert!(parsed.is_ok(), "generate_toml must produce valid TOML: {:?}", parsed);
+    }
+
+    #[test]
+    fn cover_traffic_parses_all_modes_and_defaults_to_light() {
+        // Default when the field is absent (back-compat with older configs).
+        let c: NodeConfig = toml::from_str("").expect("empty config parses");
+        assert_eq!(c.cover_traffic, CoverTraffic::Light, "default must be light");
+        for (s, want) in [
+            ("off", CoverTraffic::Off),
+            ("light", CoverTraffic::Light),
+            ("constant", CoverTraffic::Constant),
+        ] {
+            let c: NodeConfig = toml::from_str(&format!("cover_traffic = \"{s}\"")).unwrap();
+            assert_eq!(c.cover_traffic, want, "cover_traffic = {s:?}");
+        }
+        // Unknown value is rejected (not silently defaulted).
+        assert!(toml::from_str::<NodeConfig>("cover_traffic = \"bogus\"").is_err());
     }
 
     // ── load from file ────────────────────────────────────────────────────────
