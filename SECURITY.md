@@ -19,7 +19,7 @@ document spells out what the network is and is not designed to resist.
 | Passive eavesdropping on the underlay (TCP / QUIC)        |    ✓     | Payload is end-to-end encrypted with ChaCha20-Poly1305 over PQ-hybrid session keys. |
 | Active man-in-the-middle on the underlay                  |    ✓     | The transport handshake binds the ed25519 identity to the session via a per-connection challenge-response signature (`transport.rs`; `quic.rs`). Signatures are checked with `verify_strict`. |
 | Malicious peer (knows their own keys, can send any frame) |    ✓     | Forwarding is loop-/TTL-bounded, rate-limited, and per-packet AEAD-authenticated; every signed control message is `verify_strict`-checked before it mutates state. Cuckoo poisoning is contained by trust scoring + active probing, **not** fully prevented. |
-| Multiple cooperating malicious peers                      |    ◐     | Trust decay + path-selection randomness limit correlation and lying; full Sybil resistance is **not** claimed. |
+| Multiple cooperating malicious peers                      |    ◐     | Local trust decay + a **signed reputation-gossip** consensus (PoW-weighted observers, trimmed mean, quorum — resists bad-mouthing/self-promotion below ~25 % weight) bias **every** primary routing path (greedy, cuckoo, XOR) away from network-condemned peers. Full Sybil resistance is still **not** claimed: a coalition controlling the *only* closer neighbour / sole route still carries that traffic. |
 | Compromise of one onion relay (opt-in onion path)         |    ✓     | A relay sees neither origin nor destination, only its immediate neighbours. |
 | Compromise of *all* relays on an onion circuit            |    ✗     | Deanonymises the flow — a property shared with Tor. |
 | Transit relay on a non-onion path                         |    ◐     | Sees ciphertext + routing metadata only (the `routing_tag` digest and, since v0.10, the destination's hyperbolic **coordinate region** used for greedy transit) — never plaintext, never the destination identity. The opt-in Sphinx layer hides even the coordinate. |
@@ -110,8 +110,13 @@ The session/handshake and routing hardening is in place and (for the handshake)
 ### Remaining known weaknesses
 
 1. **Cooperating valid-key Sybils** — PoW raises per-identity cost but does not
-   detect multiple expensive-but-valid colluding peers; `trust` decay + active
-   probing mitigate, an explicit reputation-gossip layer is future work.
+   detect multiple expensive-but-valid colluding peers. Mitigated by `trust`
+   decay + active probing **and** a signed reputation-gossip consensus
+   (PoW-weighted, trimmed-mean, quorum-gated) that — as of v0.12.1 — biases
+   *every* primary routing path (greedy/cuckoo/XOR), not just tag-forwarding.
+   Residual: a coalition that controls the only closer neighbour or sole route
+   to a target still carries that traffic, so this is mitigation, not a
+   guarantee.
 2. **Legacy-onion hop-depth leak in a *default* build** — the per-layer `aead_len`
    shrinks ~67 B/hop, a correlation distinguisher for an on-path observer. Mitigated
    by QUIC link encryption; fully closed by building `--features sphinx`. (Note:

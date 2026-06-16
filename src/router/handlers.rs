@@ -461,27 +461,43 @@ impl RouterState {
         }
     }
 
-    /// Greedy hyperbolic next-hop toward `dst_coord`: the neighbour strictly
+    /// Greedy hyperbolic next-hop toward `dst_coord`: a neighbour strictly
     /// closer to it than we are, excluding `exclude` (the inbound peer, so we
     /// never bounce a packet straight back). `None` at a local minimum — no
     /// neighbour improves — so the caller can fall back to cuckoo reachability.
     ///
-    /// Loop-free by construction: every hop it chooses strictly decreases the
-    /// distance to `dst_coord`, so a packet cannot cycle through greedy hops.
-    /// This is what lets TRANSIT nodes route by geometry (see `handle_traffic`)
-    /// instead of leaning entirely on cuckoo freshness.
+    /// Loop-free by construction: it only ever chooses a neighbour **strictly
+    /// closer** to `dst_coord` than we are, so a packet cannot cycle through
+    /// greedy hops. This is what lets TRANSIT nodes route by geometry (see
+    /// `handle_traffic`) instead of leaning entirely on cuckoo freshness.
+    ///
+    /// Among the strictly-closer candidates the pick is **trust-adjusted**:
+    /// rank by `distance / combined_trust`, so a neighbour the network condemns
+    /// (low [`combined_trust`](Self::combined_trust)) loses to an honest,
+    /// slightly-farther — but still strictly closer — peer. Re-ranking *within*
+    /// the strictly-closer set preserves loop-freedom and convergence (every
+    /// hop still strictly decreases distance); it just routes around a
+    /// colluding/Sybil relay when an honest alternative exists, at a cost of at
+    /// most a few extra hops.
     pub(crate) fn greedy_next_hop(&self, dst_coord: HypCoord, exclude: Option<PeerId>) -> Option<PeerId> {
+        let own_dist = self.own_coord.distance(dst_coord); // strict-improvement floor
         let mut best_peer: Option<PeerId> = None;
-        let mut best_dist = self.own_coord.distance(dst_coord); // must strictly improve
+        let mut best_score = f64::INFINITY;
         for (peer_key, peer) in &self.peers {
             if exclude == Some(*peer_key) {
                 continue;
             }
             if let Some(&peer_coord) = self.coord_table.get(&peer.pub_key) {
                 let d = peer_coord.distance(dst_coord);
-                if d < best_dist {
-                    best_dist = d;
-                    best_peer = Some(*peer_key);
+                // Loop-freedom invariant: only neighbours strictly closer than us.
+                if d < own_dist {
+                    let trust =
+                        self.combined_trust(peer_key, peer.trust).clamp(TRUST_MIN, TRUST_MAX) as f64;
+                    let score = d / trust;
+                    if score < best_score {
+                        best_score = score;
+                        best_peer = Some(*peer_key);
+                    }
                 }
             }
         }
@@ -508,7 +524,10 @@ impl RouterState {
         for (peer_key, peer) in &self.peers {
             for tree_id in 0..K {
                 if peer.cuckoo[tree_id].contains(&dst_tag) {
-                    let cost = peer.effective_cost();
+                    // Trust-adjusted cost (local blended with Sybil-hardened
+                    // network consensus), mirroring `lookup_by_tag_excluding`,
+                    // so a network-condemned peer is de-prioritised here too.
+                    let cost = peer.trust_adjusted_cost_with(self.combined_trust(peer_key, peer.trust));
                     let better = match &best {
                         None => true,
                         Some((_, bc)) => cost < *bc,
@@ -529,7 +548,9 @@ impl RouterState {
                 for i in 0..32 {
                     dist[i] = peer_key[i] ^ dst[i];
                 }
-                let cost = peer.effective_cost();
+                // XOR distance is the primary key (correctness/progress toward
+                // the target); trust-adjusted cost only breaks ties.
+                let cost = peer.trust_adjusted_cost_with(self.combined_trust(peer_key, peer.trust));
                 let better = match &best_dist {
                     None => true,
                     Some((bd, bc)) => dist < *bd || (dist == *bd && cost < *bc),

@@ -165,12 +165,8 @@ impl RouterState {
                 continue;
             }
             // Combine local trust with network-consensus trust if available;
-            // consensus = NULL → use local trust alone.
-            let local = peer.trust;
-            let combined = match self.consensus_trust(peer_key) {
-                Some(c) => (local + c) * 0.5,
-                None    => local,
-            };
+            // consensus = NULL → use local trust alone (see `combined_trust`).
+            let combined = self.combined_trust(peer_key, peer.trust);
             let cost = peer.trust_adjusted_cost_with(combined);
             let slot = if self.is_path_negative(peer_key, tag) { &mut best_neg } else { &mut best };
             if slot.is_none_or(|(_, bc)| cost < bc) {

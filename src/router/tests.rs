@@ -2142,6 +2142,71 @@
         assert_eq!(rs.greedy_next_hop(dst, None), Some(a), "without exclusion A is chosen");
     }
 
+    #[test]
+    fn greedy_next_hop_routes_around_low_trust_peer() {
+        // Two neighbours are BOTH strictly closer to dst than we are. The
+        // geometrically-closest one (M) is network-condemned (low trust); the
+        // honest one (H) is slightly farther but still strictly closer. The
+        // trust-adjusted score (distance / combined_trust) must pick H — routing
+        // around the malicious/Sybil relay — while staying strictly closer (so
+        // greedy remains loop-free).
+        let mut rs = make_router(); // own_coord = origin, own_dist to dst = 0.8
+        let m = [0x40u8; 32];
+        let h = [0x41u8; 32];
+        add_dummy_peer(&mut rs, m);
+        add_dummy_peer(&mut rs, h);
+        let dst = HypCoord { rho: 0.8, theta: 0.0 };
+        rs.coord_table.insert(m, HypCoord { rho: 0.7, theta: 0.0 }); // d_M = 0.1 (closest)
+        rs.coord_table.insert(h, HypCoord { rho: 0.5, theta: 0.0 }); // d_H = 0.3 (still < 0.8)
+        rs.peers.get_mut(&m).unwrap().trust = 0.1; // condemned
+        rs.peers.get_mut(&h).unwrap().trust = 2.0; // trusted
+        // score_M = 0.1 / 0.1 = 1.0 ; score_H = 0.3 / 2.0 = 0.15 → H wins.
+        assert_eq!(rs.greedy_next_hop(dst, None), Some(h),
+            "trust-adjusted greedy must route around the low-trust closest peer");
+        // Sanity: equal trust → the geometrically-closest peer (M) wins again.
+        rs.peers.get_mut(&m).unwrap().trust = 2.0;
+        assert_eq!(rs.greedy_next_hop(dst, None), Some(m),
+            "with equal trust, the strictly-closest neighbour wins (pure geometry)");
+    }
+
+    #[test]
+    fn greedy_next_hop_trust_never_overrides_loop_freedom() {
+        // A maximally-trusted neighbour that is NOT strictly closer than us must
+        // still be rejected: trust re-ranks only WITHIN the strictly-closer set,
+        // so it can never break the loop-free strict-improvement invariant.
+        let mut rs = make_router(); // own_coord = origin; own_dist to dst = 0.1
+        let f = [0x42u8; 32];
+        add_dummy_peer(&mut rs, f);
+        let dst = HypCoord { rho: 0.1, theta: 0.0 };
+        rs.coord_table.insert(f, HypCoord { rho: 0.9, theta: 0.0 }); // d_F = 0.8 > own 0.1
+        rs.peers.get_mut(&f).unwrap().trust = TRUST_MAX; // maximally trusted
+        assert_eq!(rs.greedy_next_hop(dst, None), None,
+            "a high-trust but not-closer neighbour must not be chosen (loop-freedom)");
+    }
+
+    #[test]
+    fn lookup_cuckoo_fallback_prefers_higher_trust() {
+        // No coords → greedy_next_hop returns None → cuckoo fallback decides.
+        // Two peers claim the destination tag with identical lag; the
+        // higher-trust one must win (trust-adjusted cost, matching the
+        // tag-forwarding path).
+        let mut rs = make_router();
+        let high = [0x50u8; 32];
+        let low = [0x51u8; 32];
+        add_dummy_peer(&mut rs, high);
+        add_dummy_peer(&mut rs, low);
+        rs.peers.get_mut(&high).unwrap().lag = Duration::from_millis(50);
+        rs.peers.get_mut(&low).unwrap().lag = Duration::from_millis(50);
+        rs.peers.get_mut(&high).unwrap().trust = 2.0;
+        rs.peers.get_mut(&low).unwrap().trust = 0.1;
+        let dst = [0xD7u8; 32];
+        let tag = routing_tag(&dst);
+        rs.peers.get_mut(&high).unwrap().cuckoo[0].add(&tag);
+        rs.peers.get_mut(&low).unwrap().cuckoo[0].add(&tag);
+        assert_eq!(rs.lookup(&dst), Some(high),
+            "cuckoo fallback must de-prioritise the low-trust peer");
+    }
+
     // ── handle_traffic: transit routes by dest_coord, not just cuckoo ─────────
     // The whole point of Path A: a relay forwards toward the stamped dest_coord
     // even when NO cuckoo filter holds the tag (so cuckoo-only would dead-end
