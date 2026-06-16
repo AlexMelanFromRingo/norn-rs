@@ -4,6 +4,41 @@ All notable changes to norn-rs are documented here. Versions follow Cargo's
 0.x semver: the **minor** number is bumped for breaking (wire/protocol) changes,
 the **patch** number for backward-compatible fixes.
 
+## v0.12.0
+
+> ⚠️ **Breaking, flag-day release.** The session handshake wire format changed
+> incompatibly — **all nodes must upgrade together**. A v0.12 node and a v0.11
+> node cannot complete a session (SessionInit/Ack now ~+5.3 KB each). Mismatched
+> peers fail loudly at parse time.
+
+Adds **post-quantum hybrid authentication** to the session handshake. Until now
+only *confidentiality* was PQ-hybrid (X25519 + ML-KEM-768); *authentication* was
+classical Ed25519 only, so a cryptographically-relevant quantum computer (CRQC)
+could forge identities. SessionInit/Ack now also carry an **ML-DSA-65** (FIPS
+204, NIST level 3) signature over the same handshake bytes.
+
+- Each node's ML-DSA key derives from a 32-byte seed **independent of its
+  Ed25519 identity** — a CRQC breaking Ed25519 cannot also forge the PQ
+  signature. `genconfig` emits a random `ml_dsa_seed`; existing configs without
+  one fall back to an ephemeral key (warns; TOFU pin resets on restart).
+- Verifiers **TOFU-pin** each identity's ML-DSA public key (per Ed25519 id;
+  bounded at 8192 entries with eviction). Established and repeat sessions are
+  thus post-quantum authenticated. `ml_dsa_pub` is inside the Ed25519-signed
+  bytes, so a classical MITM cannot substitute it at first contact.
+- The anti-amplification invariant is preserved (Ack and Init grow by the same
+  ML-DSA terms). Flooded announces stay Ed25519-only — the +5.3 KB cost is
+  per-session handshake only, keeping the lightweight per-node budget.
+
+Residual gap (honestly): *first contact* still trusts the classical Ed25519
+channel, and the underlay transport handshake (`transport.rs`/`quic.rs`) remains
+Ed25519-only. So the "Quantum adversary" row in SECURITY.md stays ◐, not ✓.
+
+### Breaking — wire format
+- **SessionInit / SessionAck**: each now carries `ml_dsa_pub` (1952 B) and
+  `ml_dsa_sig` (3309 B) after the ML-KEM field, before `sender_coord`.
+
+---
+
 ## v0.11.0
 
 > ⚠️ **Breaking, flag-day release.** The on-the-wire protocol changed
