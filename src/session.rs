@@ -17,6 +17,7 @@ use anyhow::{bail, Context, Result};
 use chacha20poly1305::{AeadInPlace, ChaCha20Poly1305, Key, KeyInit, Nonce};
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use hkdf::Hkdf;
+use crate::pq_sign::{self, PqSigner, ML_DSA_PUB_BYTES, ML_DSA_SIG_BYTES};
 use ml_kem::array::Array;
 use ml_kem::kem::{Decapsulate, Encapsulate, Kem};
 use ml_kem::{KeyExport, MlKem768, TryKeyInit};
@@ -229,11 +230,14 @@ pub const ML_KEM_PUB_BYTES: usize = 1184;
 pub const ML_KEM_CT_BYTES: usize = 1088;
 pub const ML_KEM_SHARED_BYTES: usize = 32;
 
-/// Total bytes of an encoded SessionInit (v3) frame on the wire. The trailing
-/// 16 bytes are the sender's hyperbolic coord (advisory, unsigned — see struct).
-pub const SESSION_INIT_WIRE_BYTES: usize = 1 + 32 + 64 + 32 + 8 + 32 + ML_KEM_PUB_BYTES + 16;
-/// Total bytes of an encoded SessionAck (v3) frame on the wire.
-pub const SESSION_ACK_WIRE_BYTES: usize = 1 + 32 + 64 + 32 + 8 + 32 + ML_KEM_CT_BYTES + 16;
+/// Total bytes of an encoded SessionInit frame on the wire. Layout:
+/// magic(1) ed_pub(32) ed25519_sig(64) x25519(32) ts(8) recipient(32)
+/// ml_kem_pub + ml_dsa_pub + ml_dsa_sig + sender_coord(16).
+pub const SESSION_INIT_WIRE_BYTES: usize =
+    1 + 32 + 64 + 32 + 8 + 32 + ML_KEM_PUB_BYTES + ML_DSA_PUB_BYTES + ML_DSA_SIG_BYTES + 16;
+/// Total bytes of an encoded SessionAck frame on the wire (ml_kem_ct instead of ml_kem_pub).
+pub const SESSION_ACK_WIRE_BYTES: usize =
+    1 + 32 + 64 + 32 + 8 + 32 + ML_KEM_CT_BYTES + ML_DSA_PUB_BYTES + ML_DSA_SIG_BYTES + 16;
 
 // Anti-amplification: response (Ack) MUST NOT be larger than the trigger (Init).
 // SessionInit carries ml_kem_pub (1184 B); SessionAck carries ml_kem_ct (1088 B).
@@ -585,13 +589,16 @@ pub struct SessionInit {
     pub timestamp_ms: u64,
     pub recipient_ed_pub: [u8; 32],
     pub ml_kem_pub: [u8; ML_KEM_PUB_BYTES],
+    /// Sender's long-term ML-DSA-65 public key (PQ-hybrid auth, Option B). Covered
+    /// by BOTH signatures; TOFU-pinned by the recipient per ed25519 identity.
+    pub ml_dsa_pub: [u8; ML_DSA_PUB_BYTES],
+    /// ML-DSA-65 signature over the same payload as `signature` (incl. ml_dsa_pub):
+    /// post-quantum proof of identity. Verified against the pinned ml_dsa_pub.
+    pub ml_dsa_sig: [u8; ML_DSA_SIG_BYTES],
     /// Sender's current hyperbolic coordinate (`HypCoord::encode`, 16 B), so the
     /// recipient learns where the sender sits in the embedding and can stamp a
     /// real `dest_coord` on reverse traffic → greedy works multi-hop (Phase 2).
-    /// NOT part of the signed payload (the formally-verified sign_bytes are
-    /// unchanged): it is an advisory routing hint, identity-attributed by the
-    /// authenticated handshake; a transit node tampering it only degrades greedy
-    /// to the cuckoo fallback, which trust-decay + active probing already defend.
+    /// NOT part of the signed payload — an advisory routing hint.
     pub sender_coord: [u8; 16],
 }
 
@@ -615,14 +622,18 @@ fn build_init_sign_bytes(
     timestamp_ms: u64,
     recipient_ed_pub: &[u8; 32],
     ml_kem_pub: &[u8; ML_KEM_PUB_BYTES],
+    ml_dsa_pub: &[u8; ML_DSA_PUB_BYTES],
 ) -> Vec<u8> {
-    let mut sign_data = Vec::with_capacity(1 + 32 + 32 + 8 + 32 + ML_KEM_PUB_BYTES);
+    let mut sign_data = Vec::with_capacity(1 + 32 + 32 + 8 + 32 + ML_KEM_PUB_BYTES + ML_DSA_PUB_BYTES);
     sign_data.push(SESSION_INIT_MAGIC);
     sign_data.extend_from_slice(ed_pub);
     sign_data.extend_from_slice(x25519_pub);
     sign_data.extend_from_slice(&timestamp_ms.to_le_bytes());
     sign_data.extend_from_slice(recipient_ed_pub);
     sign_data.extend_from_slice(ml_kem_pub);
+    // ml_dsa_pub is covered by BOTH signatures (Ed25519 + ML-DSA) so a classical
+    // adversary cannot substitute the PQ key on first contact (PQ-hybrid binding).
+    sign_data.extend_from_slice(ml_dsa_pub);
     sign_data
 }
 
@@ -632,14 +643,16 @@ fn build_ack_sign_bytes(
     timestamp_ms: u64,
     recipient_ed_pub: &[u8; 32],
     ml_kem_ct: &[u8; ML_KEM_CT_BYTES],
+    ml_dsa_pub: &[u8; ML_DSA_PUB_BYTES],
 ) -> Vec<u8> {
-    let mut sign_data = Vec::with_capacity(1 + 32 + 32 + 8 + 32 + ML_KEM_CT_BYTES);
+    let mut sign_data = Vec::with_capacity(1 + 32 + 32 + 8 + 32 + ML_KEM_CT_BYTES + ML_DSA_PUB_BYTES);
     sign_data.push(SESSION_ACK_MAGIC);
     sign_data.extend_from_slice(ed_pub);
     sign_data.extend_from_slice(x25519_pub);
     sign_data.extend_from_slice(&timestamp_ms.to_le_bytes());
     sign_data.extend_from_slice(recipient_ed_pub);
     sign_data.extend_from_slice(ml_kem_ct);
+    sign_data.extend_from_slice(ml_dsa_pub);
     sign_data
 }
 
@@ -651,18 +664,21 @@ impl SessionInit {
         recipient_ed_pub: &[u8; 32],
         ml_kem_pub: &[u8; ML_KEM_PUB_BYTES],
         sender_coord: [u8; 16],
+        pq_signer: &PqSigner,
     ) -> Self {
         let ed_pub = signing_key.verifying_key().to_bytes();
         let x_bytes = *x25519_pub.as_bytes();
         let timestamp_ms = now_ms();
+        let ml_dsa_pub = *pq_signer.pub_bytes();
         let sign_data = build_init_sign_bytes(
-            &ed_pub, &x_bytes, timestamp_ms, recipient_ed_pub, ml_kem_pub,
+            &ed_pub, &x_bytes, timestamp_ms, recipient_ed_pub, ml_kem_pub, &ml_dsa_pub,
         );
         let signature = signing_key.sign(&sign_data).to_bytes();
+        let ml_dsa_sig = pq_signer.sign(&sign_data);
         SessionInit {
             ed_pub, signature, x25519_pub: x_bytes,
             timestamp_ms, recipient_ed_pub: *recipient_ed_pub,
-            ml_kem_pub: *ml_kem_pub, sender_coord,
+            ml_kem_pub: *ml_kem_pub, ml_dsa_pub, ml_dsa_sig, sender_coord,
         }
     }
 
@@ -675,6 +691,8 @@ impl SessionInit {
         buf.extend_from_slice(&self.timestamp_ms.to_le_bytes());
         buf.extend_from_slice(&self.recipient_ed_pub);
         buf.extend_from_slice(&self.ml_kem_pub);
+        buf.extend_from_slice(&self.ml_dsa_pub);
+        buf.extend_from_slice(&self.ml_dsa_sig);
         buf.extend_from_slice(&self.sender_coord);
         buf
     }
@@ -701,9 +719,13 @@ impl SessionInit {
         recipient_ed_pub.copy_from_slice(&data[pos..pos + 32]); pos += 32;
         let mut ml_kem_pub = [0u8; ML_KEM_PUB_BYTES];
         ml_kem_pub.copy_from_slice(&data[pos..pos + ML_KEM_PUB_BYTES]); pos += ML_KEM_PUB_BYTES;
+        let mut ml_dsa_pub = [0u8; ML_DSA_PUB_BYTES];
+        ml_dsa_pub.copy_from_slice(&data[pos..pos + ML_DSA_PUB_BYTES]); pos += ML_DSA_PUB_BYTES;
+        let mut ml_dsa_sig = [0u8; ML_DSA_SIG_BYTES];
+        ml_dsa_sig.copy_from_slice(&data[pos..pos + ML_DSA_SIG_BYTES]); pos += ML_DSA_SIG_BYTES;
         let mut sender_coord = [0u8; 16];
         sender_coord.copy_from_slice(&data[pos..pos + 16]);
-        Ok(SessionInit { ed_pub, signature, x25519_pub, timestamp_ms, recipient_ed_pub, ml_kem_pub, sender_coord })
+        Ok(SessionInit { ed_pub, signature, x25519_pub, timestamp_ms, recipient_ed_pub, ml_kem_pub, ml_dsa_pub, ml_dsa_sig, sender_coord })
     }
 
     /// Verify the signature *and* that the init is fresh and addressed to `expected_recipient`.
@@ -725,10 +747,19 @@ impl SessionInit {
         let vk = VerifyingKey::from_bytes(&self.ed_pub)?;
         let sign_data = build_init_sign_bytes(
             &self.ed_pub, &self.x25519_pub, self.timestamp_ms, &self.recipient_ed_pub,
-            &self.ml_kem_pub,
+            &self.ml_kem_pub, &self.ml_dsa_pub,
         );
         vk.verify_strict(&sign_data, &Signature::from_bytes(&self.signature))?;
         Ok(())
+    }
+
+    /// The exact byte string both signatures cover (Ed25519 in `verify` above +
+    /// ML-DSA, checked by the session manager's TOFU path).
+    pub fn signed_bytes(&self) -> Vec<u8> {
+        build_init_sign_bytes(
+            &self.ed_pub, &self.x25519_pub, self.timestamp_ms, &self.recipient_ed_pub,
+            &self.ml_kem_pub, &self.ml_dsa_pub,
+        )
     }
 }
 
@@ -746,9 +777,11 @@ pub struct SessionAck {
     pub timestamp_ms: u64,
     pub recipient_ed_pub: [u8; 32],
     pub ml_kem_ct: [u8; ML_KEM_CT_BYTES],
-    /// Sender's current hyperbolic coordinate (advisory, unsigned — see
-    /// `SessionInit::sender_coord`). Lets the initiator learn the responder's
-    /// coord so it can stamp `dest_coord` and route greedily (Phase 2).
+    /// Responder's ML-DSA-65 public key (PQ-hybrid auth) + signature, mirroring
+    /// SessionInit. Covered by both signatures; TOFU-pinned by the initiator.
+    pub ml_dsa_pub: [u8; ML_DSA_PUB_BYTES],
+    pub ml_dsa_sig: [u8; ML_DSA_SIG_BYTES],
+    /// Responder's current hyperbolic coordinate (advisory, unsigned — Phase 2).
     pub sender_coord: [u8; 16],
 }
 
@@ -759,18 +792,21 @@ impl SessionAck {
         recipient_ed_pub: &[u8; 32],
         ml_kem_ct: &[u8; ML_KEM_CT_BYTES],
         sender_coord: [u8; 16],
+        pq_signer: &PqSigner,
     ) -> Self {
         let ed_pub = signing_key.verifying_key().to_bytes();
         let x_bytes = *x25519_pub.as_bytes();
         let timestamp_ms = now_ms();
+        let ml_dsa_pub = *pq_signer.pub_bytes();
         let sign_data = build_ack_sign_bytes(
-            &ed_pub, &x_bytes, timestamp_ms, recipient_ed_pub, ml_kem_ct,
+            &ed_pub, &x_bytes, timestamp_ms, recipient_ed_pub, ml_kem_ct, &ml_dsa_pub,
         );
         let signature = signing_key.sign(&sign_data).to_bytes();
+        let ml_dsa_sig = pq_signer.sign(&sign_data);
         SessionAck {
             ed_pub, signature, x25519_pub: x_bytes,
             timestamp_ms, recipient_ed_pub: *recipient_ed_pub,
-            ml_kem_ct: *ml_kem_ct, sender_coord,
+            ml_kem_ct: *ml_kem_ct, ml_dsa_pub, ml_dsa_sig, sender_coord,
         }
     }
 
@@ -783,6 +819,8 @@ impl SessionAck {
         buf.extend_from_slice(&self.timestamp_ms.to_le_bytes());
         buf.extend_from_slice(&self.recipient_ed_pub);
         buf.extend_from_slice(&self.ml_kem_ct);
+        buf.extend_from_slice(&self.ml_dsa_pub);
+        buf.extend_from_slice(&self.ml_dsa_sig);
         buf.extend_from_slice(&self.sender_coord);
         buf
     }
@@ -809,9 +847,13 @@ impl SessionAck {
         recipient_ed_pub.copy_from_slice(&data[pos..pos + 32]); pos += 32;
         let mut ml_kem_ct = [0u8; ML_KEM_CT_BYTES];
         ml_kem_ct.copy_from_slice(&data[pos..pos + ML_KEM_CT_BYTES]); pos += ML_KEM_CT_BYTES;
+        let mut ml_dsa_pub = [0u8; ML_DSA_PUB_BYTES];
+        ml_dsa_pub.copy_from_slice(&data[pos..pos + ML_DSA_PUB_BYTES]); pos += ML_DSA_PUB_BYTES;
+        let mut ml_dsa_sig = [0u8; ML_DSA_SIG_BYTES];
+        ml_dsa_sig.copy_from_slice(&data[pos..pos + ML_DSA_SIG_BYTES]); pos += ML_DSA_SIG_BYTES;
         let mut sender_coord = [0u8; 16];
         sender_coord.copy_from_slice(&data[pos..pos + 16]);
-        Ok(SessionAck { ed_pub, signature, x25519_pub, timestamp_ms, recipient_ed_pub, ml_kem_ct, sender_coord })
+        Ok(SessionAck { ed_pub, signature, x25519_pub, timestamp_ms, recipient_ed_pub, ml_kem_ct, ml_dsa_pub, ml_dsa_sig, sender_coord })
     }
 
     pub fn verify(&self, expected_recipient: &[u8; 32]) -> Result<()> {
@@ -827,10 +869,18 @@ impl SessionAck {
         let vk = VerifyingKey::from_bytes(&self.ed_pub)?;
         let sign_data = build_ack_sign_bytes(
             &self.ed_pub, &self.x25519_pub, self.timestamp_ms, &self.recipient_ed_pub,
-            &self.ml_kem_ct,
+            &self.ml_kem_ct, &self.ml_dsa_pub,
         );
         vk.verify_strict(&sign_data, &Signature::from_bytes(&self.signature))?;
         Ok(())
+    }
+
+    /// The exact byte string both signatures cover (for the ML-DSA TOFU check).
+    pub fn signed_bytes(&self) -> Vec<u8> {
+        build_ack_sign_bytes(
+            &self.ed_pub, &self.x25519_pub, self.timestamp_ms, &self.recipient_ed_pub,
+            &self.ml_kem_ct, &self.ml_dsa_pub,
+        )
     }
 }
 
@@ -878,6 +928,15 @@ pub struct SessionManager {
     /// router whenever it recomputes `own_coord`. Stamped into outbound
     /// SessionInit/Ack so peers learn where we sit in the embedding (Phase 2).
     own_coord: [u8; 16],
+    /// Long-term ML-DSA-65 signing identity for PQ-hybrid handshake auth
+    /// (Option B). Defaults to an ephemeral key; nornd installs the
+    /// config-seeded one via `set_pq_signer` for stable cross-restart TOFU.
+    pq_signer: PqSigner,
+    /// TOFU pins: peer ed25519 identity → the ML-DSA public key first seen for it.
+    /// On a repeat handshake the peer MUST present the same ML-DSA key (else it's
+    /// a key-substitution / downgrade attempt → reject). In-memory (resets on our
+    /// restart — a documented limitation; persisting pins is a follow-up). Bounded.
+    pq_pins: HashMap<[u8; 32], [u8; ML_DSA_PUB_BYTES]>,
 }
 
 /// Per-source rate-limit window for inbound `handle_init`. Must be short
@@ -890,6 +949,9 @@ pub const INIT_RATE_WINDOW: std::time::Duration = std::time::Duration::from_secs
 pub const MAX_INITS_PER_WINDOW: usize = 4;
 /// Hard cap on the rate-log map size — bounds memory under Sybil attempts.
 const MAX_INIT_RATE_LOG_ENTRIES: usize = 4_096;
+/// Cap on TOFU pin entries (ed25519 → ML-DSA pub). Bounds memory; pins are
+/// advisory hardening, so under a flood we evict rather than refuse service.
+const MAX_PQ_PINS: usize = 8_192;
 
 impl SessionManager {
     pub fn new(signing_key: SigningKey) -> Self {
@@ -900,6 +962,8 @@ impl SessionManager {
             _pq_pending: HashMap::new(),
             init_rate_log: HashMap::new(),
             own_coord: [0u8; 16], // origin until the router pushes the real coord
+            pq_signer: PqSigner::generate_ephemeral(),
+            pq_pins: HashMap::new(),
         }
     }
 
@@ -908,6 +972,46 @@ impl SessionManager {
     /// our position and can route to us greedily.
     pub fn set_own_coord(&mut self, coord: [u8; 16]) {
         self.own_coord = coord;
+    }
+
+    /// Install the node's long-term (config-seeded) ML-DSA signing identity,
+    /// replacing the ephemeral default. Called once at startup by nornd.
+    pub fn set_pq_signer(&mut self, signer: PqSigner) {
+        self.pq_signer = signer;
+    }
+
+    /// Our ML-DSA public key bytes (advertised in outbound handshakes).
+    pub fn pq_pub(&self) -> [u8; ML_DSA_PUB_BYTES] {
+        *self.pq_signer.pub_bytes()
+    }
+
+    /// PQ-hybrid TOFU check for a handshake: the presented ML-DSA key must match
+    /// any pin we already hold for this identity (reject substitution), the
+    /// ML-DSA signature must verify against it, and on first contact we pin it.
+    fn pq_verify_and_pin(
+        &mut self,
+        ed_pub: &[u8; 32],
+        ml_dsa_pub: &[u8; ML_DSA_PUB_BYTES],
+        signed: &[u8],
+        sig: &[u8; ML_DSA_SIG_BYTES],
+    ) -> Result<()> {
+        if let Some(pinned) = self.pq_pins.get(ed_pub)
+            && pinned != ml_dsa_pub
+        {
+            bail!("PQ key mismatch for known identity {:?} — pin violation / key substitution", &ed_pub[..4]);
+        }
+        if !pq_sign::verify(ml_dsa_pub, signed, sig) {
+            bail!("invalid ML-DSA signature from {:?}", &ed_pub[..4]);
+        }
+        if !self.pq_pins.contains_key(ed_pub) {
+            if self.pq_pins.len() >= MAX_PQ_PINS
+                && let Some(victim) = self.pq_pins.keys().next().copied()
+            {
+                self.pq_pins.remove(&victim);
+            }
+            self.pq_pins.insert(*ed_pub, *ml_dsa_pub);
+        }
+        Ok(())
     }
 
     /// Record an init attempt from `source` and return whether the source is
@@ -996,6 +1100,11 @@ impl SessionManager {
         }
         let our_pub = self.our_signing_key.verifying_key().to_bytes();
         init.verify(&our_pub)?;
+        // PQ-hybrid auth (Option B): verify the ML-DSA signature against the
+        // sender's TOFU-pinned key (pins on first contact). A pin mismatch or bad
+        // ML-DSA sig rejects the handshake — a CRQC that forged the Ed25519 sig
+        // still can't forge ML-DSA against an established identity's pinned key.
+        self.pq_verify_and_pin(&init.ed_pub, &init.ml_dsa_pub, &init.signed_bytes(), &init.ml_dsa_sig)?;
 
         let remote_x25519_pub = X25519PublicKey::from(init.x25519_pub);
 
@@ -1030,7 +1139,7 @@ impl SessionManager {
             }
             let local_pub = X25519PublicKey::from(&existing.local_x25519_priv);
             let ack = SessionAck::create(
-                &self.our_signing_key, &local_pub, &init.ed_pub, &ml_kem_ct, self.own_coord,
+                &self.our_signing_key, &local_pub, &init.ed_pub, &ml_kem_ct, self.own_coord, &self.pq_signer,
             );
             return Ok(ack.encode());
         }
@@ -1045,7 +1154,7 @@ impl SessionManager {
             .insert(init.ed_pub, std::sync::Arc::new(std::sync::Mutex::new(info)));
 
         let ack = SessionAck::create(
-            &self.our_signing_key, &local_pub, &init.ed_pub, &ml_kem_ct, self.own_coord,
+            &self.our_signing_key, &local_pub, &init.ed_pub, &ml_kem_ct, self.own_coord, &self.pq_signer,
         );
         Ok(ack.encode())
     }
@@ -1058,6 +1167,8 @@ impl SessionManager {
         let ack = SessionAck::decode(data)?;
         let our_pub = self.our_signing_key.verifying_key().to_bytes();
         ack.verify(&our_pub)?;
+        // PQ-hybrid auth (Option B): TOFU-verify the responder's ML-DSA signature.
+        self.pq_verify_and_pin(&ack.ed_pub, &ack.ml_dsa_pub, &ack.signed_bytes(), &ack.ml_dsa_sig)?;
         let remote_x_pub = X25519PublicKey::from(ack.x25519_pub);
 
         // Decap with the current dk. If we're inside an ML-KEM rotation
@@ -1102,7 +1213,7 @@ impl SessionManager {
             std::sync::Arc::new(std::sync::Mutex::new(info)),
         );
         SessionInit::create(
-            &self.our_signing_key, &local_pub, remote_ed_pub, self.pq_keys.pub_bytes(), self.own_coord,
+            &self.our_signing_key, &local_pub, remote_ed_pub, self.pq_keys.pub_bytes(), self.own_coord, &self.pq_signer,
         ).encode()
     }
 
@@ -1187,7 +1298,7 @@ impl SessionManager {
             let local_pub = info.local_x25519_pub;
             drop(info);
             let init = SessionInit::create(
-                &self.our_signing_key, &local_pub, ed_pub, self.pq_keys.pub_bytes(), self.own_coord,
+                &self.our_signing_key, &local_pub, ed_pub, self.pq_keys.pub_bytes(), self.own_coord, &self.pq_signer,
             )
             .encode();
             out.push((*ed_pub, init));
@@ -1364,6 +1475,36 @@ mod tests {
         ack[50] ^= 0xFF;
         assert!(mgr_a.handle_ack(&ack).is_err(),
             "tampered SessionAck signature must be rejected");
+    }
+
+    #[test]
+    fn pq_tofu_rejects_ml_dsa_key_substitution() {
+        // A full handshake pins A's ML-DSA key at B. Then simulate a CRQC that
+        // has FORGED A's Ed25519 signature (it can re-sign as A) but presents a
+        // DIFFERENT ML-DSA key — B must reject it on the TOFU pin, so the session
+        // stays post-quantum-authenticated for the established relationship.
+        let sk_a = SigningKey::generate(&mut OsRng);
+        let sk_b = SigningKey::generate(&mut OsRng);
+        let b_pub = sk_b.verifying_key().to_bytes();
+        let mut a = SessionManager::new(sk_a.clone());
+        let mut b = SessionManager::new(sk_b);
+
+        let init = a.initiate(&b_pub);
+        b.handle_init(&init).expect("first handshake pins A's ML-DSA key at B");
+
+        // CRQC forgery: A's ed25519 sig over a substituted (attacker) ML-DSA key.
+        let attacker = crate::pq_sign::PqSigner::generate_ephemeral();
+        let mut forged = SessionInit::decode(&init).unwrap();
+        forged.ml_dsa_pub = *attacker.pub_bytes();
+        let sd = forged.signed_bytes();
+        forged.signature = sk_a.sign(&sd).to_bytes(); // forged Ed25519 (as a CRQC could)
+        forged.ml_dsa_sig = attacker.sign(&sd); // attacker's own ML-DSA sig (verifies vs its key)
+
+        let err = b.handle_init(&forged.encode()).unwrap_err().to_string();
+        assert!(
+            err.contains("pin") || err.contains("mismatch"),
+            "B must reject the substituted ML-DSA key on the TOFU pin: {err}"
+        );
     }
 
     // ── Sliding window replay protection ─────────────────────────────────────
@@ -1620,13 +1761,13 @@ mod tests {
         let x_priv = StaticSecret::random_from_rng(OsRng);
         let x_pub = X25519PublicKey::from(&x_priv);
         let ek = dummy_ml_kem_pub();
-        let init = SessionInit::create(&sk, &x_pub, &recipient, &ek, [0u8; 16]);
+        let init = SessionInit::create(&sk, &x_pub, &recipient, &ek, [0u8; 16], &crate::pq_sign::PqSigner::generate_ephemeral());
         assert!(init.verify(&recipient).is_ok(), "valid init must verify");
         // Tamper with x25519_pub — signature no longer matches
         let bad_init = SessionInit { x25519_pub: [0xFFu8; 32], ..init };
         assert!(bad_init.verify(&recipient).is_err(), "tampered x25519_pub must fail verify");
         // Tamper with ed_pub — signature fails
-        let init = SessionInit::create(&sk, &x_pub, &recipient, &ek, [0u8; 16]);
+        let init = SessionInit::create(&sk, &x_pub, &recipient, &ek, [0u8; 16], &crate::pq_sign::PqSigner::generate_ephemeral());
         let bad_init = SessionInit {
             x25519_pub: init.x25519_pub,
             ed_pub: [0xEEu8; 32],
@@ -1640,7 +1781,7 @@ mod tests {
         let sk = SigningKey::generate(&mut OsRng);
         let recipient = SigningKey::generate(&mut OsRng).verifying_key().to_bytes();
         let x_pub = X25519PublicKey::from(&StaticSecret::random_from_rng(OsRng));
-        let init = SessionInit::create(&sk, &x_pub, &recipient, &dummy_ml_kem_pub(), [0u8; 16]);
+        let init = SessionInit::create(&sk, &x_pub, &recipient, &dummy_ml_kem_pub(), [0u8; 16], &crate::pq_sign::PqSigner::generate_ephemeral());
         let bad_init = SessionInit { ml_kem_pub: [0xCDu8; ML_KEM_PUB_BYTES], ..init };
         assert!(bad_init.verify(&recipient).is_err(),
             "tampered ml_kem_pub must invalidate the signature");
@@ -1652,7 +1793,7 @@ mod tests {
         let intended = SigningKey::generate(&mut OsRng).verifying_key().to_bytes();
         let other    = SigningKey::generate(&mut OsRng).verifying_key().to_bytes();
         let x_pub = X25519PublicKey::from(&StaticSecret::random_from_rng(OsRng));
-        let init = SessionInit::create(&sk, &x_pub, &intended, &dummy_ml_kem_pub(), [0u8; 16]);
+        let init = SessionInit::create(&sk, &x_pub, &intended, &dummy_ml_kem_pub(), [0u8; 16], &crate::pq_sign::PqSigner::generate_ephemeral());
         // Wrong recipient must reject (anti cross-target replay)
         assert!(init.verify(&other).is_err(), "init bound to {:?} must not verify for {:?}", &intended[..4], &other[..4]);
         assert!(init.verify(&intended).is_ok());
@@ -1663,12 +1804,10 @@ mod tests {
         let sk = SigningKey::generate(&mut OsRng);
         let recipient = SigningKey::generate(&mut OsRng).verifying_key().to_bytes();
         let x_pub = X25519PublicKey::from(&StaticSecret::random_from_rng(OsRng));
-        let mut init = SessionInit::create(&sk, &x_pub, &recipient, &dummy_ml_kem_pub(), [0u8; 16]);
+        let mut init = SessionInit::create(&sk, &x_pub, &recipient, &dummy_ml_kem_pub(), [0u8; 16], &crate::pq_sign::PqSigner::generate_ephemeral());
         // Roll the timestamp 10 minutes into the past and re-sign to keep the sig valid.
         init.timestamp_ms = init.timestamp_ms.saturating_sub(10 * 60 * 1000);
-        let sign_data = build_init_sign_bytes(
-            &init.ed_pub, &init.x25519_pub, init.timestamp_ms, &init.recipient_ed_pub, &init.ml_kem_pub,
-        );
+        let sign_data = init.signed_bytes();
         init.signature = sk.sign(&sign_data).to_bytes();
         let err = init.verify(&recipient).unwrap_err().to_string();
         assert!(err.contains("window"), "stale init must mention window: {err}");

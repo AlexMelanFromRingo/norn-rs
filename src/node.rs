@@ -28,6 +28,11 @@ impl Node {
         // Apply Sybil-resistance threshold from config.
         conn.set_min_peer_difficulty_bits(config.min_peer_difficulty_bits);
 
+        // Option B PQ-hybrid handshake: install our long-term ML-DSA-65 identity
+        // from the persisted seed (stable TOFU pin across restarts). Falls back
+        // to an ephemeral key with a warning if no seed is configured.
+        conn.set_pq_signer(config.pq_signer()?);
+
         // Roadmap #2: optional multi-core crypto worker pool. No-op at 0.
         conn.enable_crypto_pool(config.crypto_workers as usize);
 

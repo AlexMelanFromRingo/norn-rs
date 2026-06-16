@@ -62,6 +62,18 @@ impl PacketConn {
         self.inner.lock_or_recover().onion_format = fmt;
     }
 
+    /// Install this node's long-term ML-DSA-65 signing identity (Option B
+    /// PQ-hybrid handshake). Call once at node startup from the config seed;
+    /// without it the SessionManager keeps the ephemeral key it was created
+    /// with (the TOFU pin then resets on restart).
+    pub fn set_pq_signer(&self, signer: crate::pq_sign::PqSigner) {
+        self.inner
+            .lock_or_recover()
+            .sessions
+            .write_or_recover()
+            .set_pq_signer(signer);
+    }
+
     /// Roadmap #7: the derived obfuscation key, or `None` when
     /// obfuscation is off. Read by the TCP transport per connection.
     pub fn obfuscation_key(&self) -> Option<[u8; 32]> {

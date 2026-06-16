@@ -25,7 +25,7 @@ document spells out what the network is and is not designed to resist.
 | Transit relay on a non-onion path                         |    ◐     | Sees ciphertext + routing metadata only (the `routing_tag` digest and, since v0.10, the destination's hyperbolic **coordinate region** used for greedy transit) — never plaintext, never the destination identity. The opt-in Sphinx layer hides even the coordinate. |
 | Compromise of a node's long-term ed25519 private key      |    ◐     | The key *is* the identity; losing it loses the identity going forward. Past traffic is largely forward-secret (session x25519 rotates every 100 sends; the long-term ML-KEM keypair rotates periodically; onion peel keys are rotating ephemerals). |
 | Global passive adversary observing all links              |    ◐     | Frame padding, forwarding jitter, and cover traffic raise the bar on size/timing correlation but do not make it infeasible. |
-| Quantum adversary                                         |    ◐     | Sessions use a PQ-hybrid X25519 + ML-KEM-768 key (HKDF). Confidential as long as **either** primitive holds. Authentication (Ed25519) is still classical — a CRQC would forge identities for newly-issued messages. |
+| Quantum adversary                                         |    ◐     | Sessions use a PQ-hybrid X25519 + ML-KEM-768 key (HKDF) — confidential as long as **either** primitive holds. Authentication is now **also** PQ-hybrid: the handshake carries an ML-DSA-65 signature (independent of Ed25519) and verifiers TOFU-pin the ML-DSA key, so established/repeat sessions resist a CRQC. Residual: *first contact* and the underlay transport handshake are still classically authenticated. |
 
 ### Properties claimed
 
@@ -77,6 +77,16 @@ The session/handshake and routing hardening is in place and (for the handshake)
 * **Post-quantum hybrid handshake** — SessionInit carries an ML-KEM-768
   encapsulation key, SessionAck a ciphertext; both sides derive `pq_shared` mixed
   into every per-packet AEAD key. Confidential while *either* X25519 or ML-KEM holds.
+* **Post-quantum hybrid authentication (TOFU)** — SessionInit/Ack also carry an
+  **ML-DSA-65** (FIPS 204, NIST level 3) signature alongside the Ed25519 one,
+  over the same handshake bytes (`pq_sign.rs`). Each node's ML-DSA key is derived
+  from a 32-byte seed **independent of its Ed25519 identity** (a CRQC that breaks
+  Ed25519 cannot also forge it). Verifiers **TOFU-pin** each identity's ML-DSA key
+  (per Ed25519 id; bounded at 8192 with eviction), so established and repeat
+  sessions are post-quantum authenticated. The ml_dsa_pub is inside the
+  Ed25519-signed bytes, so a classical MITM cannot substitute it at first contact.
+  Residual gap: *first contact* still trusts the classical Ed25519 channel, and
+  the underlay transport handshake (`transport.rs`/`quic.rs`) stays Ed25519-only.
 * **Formal verification (done)** — the v3 handshake is modelled in **ProVerif**
   (session-key secrecy, capability-gossip authenticity) and **Tamarin** (mutual
   authentication, injective key agreement, perfect forward secrecy). The Tamarin

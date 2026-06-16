@@ -1,6 +1,6 @@
 [package]
 name = "norn-rs"
-version = "0.11.0"
+version = "0.12.0"
 edition = "2024"
 description = "Next-generation mesh routing protocol — hyperbolic routing, K=3 spanning trees, ChaCha20-Poly1305 sessions"
 license = "MIT"
@@ -51,6 +51,9 @@ clap_complete = "4"
 mutants = "0.0.3"
 zeroize = { version = "1.8", features = ["zeroize_derive"] }
 ml-kem = { version = "0.3", features = ["zeroize", "getrandom"] }
+# PQ-hybrid signatures (Option B: ML-DSA-65 alongside Ed25519 on the handshake,
+# TOFU-pinned per identity). Independent of the Ed25519 key on purpose.
+ml-dsa = { version = "0.1", features = ["rand_core"] }
 hkdf = "0.12"
 subtle = "2"
 mdns-sd = { version = "0.19", default-features = false, features = ["async"] }

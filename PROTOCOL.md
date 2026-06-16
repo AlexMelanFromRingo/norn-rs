@@ -1,8 +1,22 @@
 # norn-rs wire protocol
 
 This document is the normative reference for the `norn-rs` protocol as of
-version **0.11.x** (the current flag-day wire format). Implementations claiming
+version **0.12.x** (the current flag-day wire format). Implementations claiming
 compatibility MUST match this specification byte-for-byte.
+
+### 0.12 changes vs 0.11 (flag-day — wire-incompatible with 0.11.x)
+
+Adds **post-quantum hybrid authentication** to the session handshake:
+
+* **ML-DSA-65 signature on SessionInit/SessionAck.** Each handshake message now
+  carries `ml_dsa_pub` (1952 B) and `ml_dsa_sig` (3309 B), placed after the
+  ML-KEM field and before the trailing advisory `sender_coord` (§11). The
+  ML-DSA signature covers the same bytes as the Ed25519 one **including
+  `ml_dsa_pub`**, so the PQ key cannot be substituted by a classical MITM.
+  Verifiers TOFU-pin `ml_dsa_pub` per Ed25519 identity. The node's ML-DSA key
+  derives from a config `ml_dsa_seed` independent of the Ed25519 key.
+* The anti-amplification invariant (`SESSION_INIT_WIRE_BYTES` ≥
+  `SESSION_ACK_WIRE_BYTES`) is preserved: both grow by the same ML-DSA terms.
 
 ### 0.11 changes vs 0.10 (flag-day — wire-incompatible with 0.10.x)
 
@@ -366,45 +380,55 @@ and 0–49 ms jitter as TRAFFIC forwarding.
 Carried inside TRAFFIC packets with `pkt_type = 0x00`. Two messages, both
 sign-then-encapsulate.
 
-### 11.1 SessionInit (1369 bytes)
+### 11.1 SessionInit (6630 bytes)
 
 ```
 [magic: 1 = 0x74 't' (v3)]
 [ed_pub: 32]                       — sender's identity
-[signature: 64]
+[signature: 64]                    — Ed25519
 [x25519_pub: 32]                   — sender's current x25519 pub
 [timestamp_ms: u64 LE]
 [recipient_ed_pub: 32]             — intended responder's identity
 [ml_kem_pub: 1184]                 — sender's ML-KEM-768 encapsulation key
+[ml_dsa_pub: 1952]                 — sender's ML-DSA-65 verifying key (v0.12; TOFU-pinned)
+[ml_dsa_sig: 3309]                 — ML-DSA-65 signature over the signed bytes (v0.12)
 [sender_coord: 16]                 — sender's HypCoord (v0.11; advisory, NOT signed)
 ```
 
-`signature` covers everything except the sig field **and the trailing
-sender_coord** (an advisory routing hint, not security-critical):
-`magic || ed_pub || x25519_pub || timestamp_ms || recipient_ed_pub || ml_kem_pub`.
-The recipient records `sender_coord` so it can stamp `dest_coord` on reverse
-traffic (greedy routing, §0.11 changes).
+Both signatures cover the same **signed bytes** — everything except the two
+signature fields and the trailing advisory `sender_coord`:
+`magic || ed_pub || x25519_pub || timestamp_ms || recipient_ed_pub || ml_kem_pub
+|| ml_dsa_pub`. Including `ml_dsa_pub` in the signed bytes prevents a classical
+MITM from substituting the PQ key at first contact. The recipient records
+`sender_coord` so it can stamp `dest_coord` on reverse traffic (greedy routing,
+§0.11 changes).
 
 Receivers MUST:
 * match `recipient_ed_pub` against their own pub_key;
 * reject if `|now - timestamp_ms| > 60 000 ms`;
 * verify the Ed25519 signature;
+* verify the ML-DSA-65 signature and **TOFU-pin** `ml_dsa_pub` for this
+  `ed_pub`; reject if it differs from an existing pin (key-substitution guard);
 * ML-KEM-encapsulate a fresh shared secret against `ml_kem_pub`; the
   resulting ciphertext goes into the Ack and the shared secret becomes
   `pq_shared` on the responder's side.
 
-### 11.2 SessionAck (1273 bytes)
+### 11.2 SessionAck (6534 bytes)
 
 Same layout but with `magic = 0x62` ('b') and the `ml_kem_pub` field replaced
-(the trailing advisory `sender_coord: 16` is still present):
+(the `ml_dsa_pub`/`ml_dsa_sig` fields and trailing advisory `sender_coord: 16`
+are still present, in the same positions):
 
 ```
 [ml_kem_ct: 1088]                  — ciphertext from responder's encap
+[ml_dsa_pub: 1952]                 — responder's ML-DSA-65 verifying key (v0.12)
+[ml_dsa_sig: 3309]                 — ML-DSA-65 signature over the signed bytes (v0.12)
 [sender_coord: 16]                 — responder's HypCoord (v0.11; advisory, NOT signed)
 ```
 
-The anti-amplification invariant still holds: both messages grew by 16 B, so
-`SESSION_ACK_WIRE_BYTES (1273) ≤ SESSION_INIT_WIRE_BYTES (1369)`.
+The anti-amplification invariant still holds: both messages grew by the same
+ML-DSA terms (1952 + 3309), so
+`SESSION_ACK_WIRE_BYTES (6534) ≤ SESSION_INIT_WIRE_BYTES (6630)`.
 
 Initiators MUST:
 * only accept an Ack for which a corresponding `initiate()` is pending —
