@@ -24,7 +24,8 @@ norn-rs creates an encrypted IPv6 mesh network. Each node gets a unique `200::/7
 | Transit greedy routing (destination coord stamped in Traffic; cuckoo fallback) | ✅ |
 | Cuckoo filter gossip (2-byte fingerprints, FPR 0.012%) | ✅ |
 | ChaCha20-Poly1305 session encryption | ✅ |
-| X25519 + ML-KEM-768 PQ-hybrid session keys | ✅ |
+| X25519 + ML-KEM-768 PQ-hybrid session keys (confidentiality) | ✅ |
+| ML-DSA-65 PQ-hybrid handshake signatures + TOFU pinning (authentication) | ✅ |
 | Handshake-init retransmit + exponential backoff | ✅ |
 | Daily ML-KEM long-term keypair rotation (PQ FS) | ✅ |
 | Per-send X25519 key rotation (classical FS) | ✅ |
@@ -32,7 +33,7 @@ norn-rs creates an encrypted IPv6 mesh network. Each node gets a unique `200::/7
 | Fixed-size onion cells (1280 B, Tor-style) | ✅ |
 | Onion replay LRU per relay | ✅ |
 | Active route-validation prober (cuckoo anti-poison) | ✅ |
-| Per-peer trust scoring biases routing | ✅ |
+| Trust-aware routing on every primary path (greedy/cuckoo/XOR) | ✅ |
 | Hyperbolic coord consistency check | ✅ |
 | Authenticated TCP handshake (NRN1 magic) | ✅ |
 | Sybil resistance via per-key PoW (configurable bits) | ✅ |
@@ -45,7 +46,7 @@ norn-rs creates an encrypted IPv6 mesh network. Each node gets a unique `200::/7
 | Anti-amplification audit + size-pinning tests | ✅ |
 | QUIC transport (`quic://`) alongside TCP | ✅ |
 | mDNS / DNS-SD `_norn._tcp.local` discovery | ✅ |
-| Reputation gossip (TYPE 0x0D) for cross-mesh trust consensus | ✅ |
+| Reputation gossip (TYPE 0x0D) — PoW-weighted, trimmed-mean, quorum consensus | ✅ |
 | HolePunch (TYPE 0x0E) for symmetric-NAT traversal | ✅ |
 | Docker image + systemd-grade hardening | ✅ |
 | Network-namespace end-to-end CI harness | ✅ |
@@ -55,7 +56,7 @@ norn-rs creates an encrypted IPv6 mesh network. Each node gets a unique `200::/7
 | Destination hiding (routing_tag + enc_header) | ✅ |
 | Payload padding (256-byte blocks) | ✅ |
 | Forwarding jitter (0–49ms, traffic analysis resistance) | ✅ |
-| Cover traffic (random DUMMY packets) | ✅ |
+| Cover traffic — size-matched decoys, configurable (`off`/`light`/`constant`) | ✅ |
 | Onion routing (legacy N-hop AEAD; opt-in Sphinx mix format via `--features sphinx`) | ✅ |
 | TUN adapter (IPv6 overlay, Linux) | ✅ |
 | TCP transport (IPv4 + IPv6 underlying) | ✅ |
@@ -111,7 +112,9 @@ The routing tag is `BLAKE2b("norn:route" || dest_pub_key)[..16]` — a privacy-p
 - **Source and destination hiding**: the `enc_header` field encrypts both source and destination identities. Intermediate nodes cannot determine who is talking to whom.
 - **Onion routing**: packets can be wrapped in N concentric AEAD layers (one per relay). Each relay peels one layer and forwards without knowing the full path.
 - **Anti-replay**: 64-slot sliding window prevents replay attacks while tolerating out-of-order delivery.
-- **Traffic analysis resistance**: payload padding, random forwarding jitter, and cover traffic resist timing and size correlation attacks.
+- **Post-quantum hybrid handshake**: session *confidentiality* mixes X25519 + ML-KEM-768; session *authentication* adds an ML-DSA-65 signature beside Ed25519, TOFU-pinned per identity from a seed independent of the Ed25519 key. Established/repeat sessions resist a quantum adversary; first contact and the underlay transport handshake remain classically authenticated.
+- **Trust-aware routing**: a Sybil-hardened reputation consensus (signed gossip, PoW-weighted, trimmed-mean, quorum) biases *every* primary routing path (greedy/cuckoo/XOR) away from network-condemned peers — not full Sybil resistance, but mitigation everywhere.
+- **Traffic analysis resistance** *(partial — see [SECURITY.md](SECURITY.md))*: payload padding (256-byte lattice), random 0–49 ms transit-forward jitter, and size-matched cover traffic (`cover_traffic = off|light|constant`) raise the noise floor. There is no constant-rate shaping, so a global passive adversary is not fully defeated.
 
 ## Building
 
@@ -143,6 +146,10 @@ sudo nornd -c norn.toml
 # KEEP THIS SECRET. Determines your IPv6 address.
 private_key = "..."
 
+# Seed for the long-term ML-DSA-65 handshake-signing key (PQ-hybrid auth),
+# independent of private_key. KEEP THIS SECRET. Stable so peers' TOFU pins hold.
+ml_dsa_seed = "..."
+
 # TCP addresses to accept incoming peer connections on.
 # Can be IPv4 or IPv6.
 listen = ["tcp://0.0.0.0:9001"]
@@ -162,6 +169,10 @@ multicast_port = 9001
 
 # Logging: error | warn | info | debug | trace
 log_level = "info"
+
+# Decoy/cover traffic: off | light (default) | constant
+# Raises the noise floor against traffic analysis (not full resistance).
+cover_traffic = "light"
 ```
 
 ## Admin API
