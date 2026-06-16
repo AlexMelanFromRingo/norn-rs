@@ -21,13 +21,11 @@ an opt-in mode — none of which claims full traffic-analysis resistance.
   randomised decoys) | `constant` (a continuous decoy floor — one cell to every
   peer every second; higher bandwidth, opt in). Runtime-settable via
   `PacketConn::set_cover_traffic`.
-- **Doc accuracy.** SECURITY.md claimed "forwarding jitter" as a defence — there
-  is none (the `jitter` field is a link-cost measurement, not a deliberate
-  delay). Corrected the threat model: padding + size-matched decoys raise the
-  noise floor, but without constant-rate shaping a global passive adversary can
-  still attempt size/timing correlation. The "Global passive adversary" row
-  stays ◐ — constant-rate shaping and forwarding delay remain deliberate
-  non-goals (they break norn's lightweight, low-latency budget).
+- **Doc accuracy.** Clarified the traffic-analysis threat model in SECURITY.md:
+  the real defences are payload padding (256-byte lattice), random 0–49 ms
+  transit-forward jitter, and now size-matched decoys. The honest residual is the
+  absence of *constant-rate shaping* (a deliberate non-goal — it breaks norn's
+  lightweight, low-latency budget), so the "Global passive adversary" row stays ◐.
 
 ---
 
