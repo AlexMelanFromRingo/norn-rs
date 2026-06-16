@@ -32,6 +32,19 @@ pub struct PqSigner {
 }
 
 impl PqSigner {
+    /// Generate an ephemeral keypair from OS randomness. Used as the default
+    /// before a config-seeded key is installed (the TOFU pin then resets on
+    /// restart — fine for tests; nornd installs a persisted seed in production).
+    pub fn generate_ephemeral() -> Self {
+        use rand::{rngs::OsRng, RngCore};
+        let mut seed = [0u8; ML_DSA_SEED_BYTES];
+        OsRng.fill_bytes(&mut seed);
+        let signer = Self::from_seed(&seed);
+        // best-effort scrub
+        seed.iter_mut().for_each(|b| *b = 0);
+        signer
+    }
+
     /// Deterministically derive the keypair from a 32-byte seed.
     pub fn from_seed(seed: &[u8; ML_DSA_SEED_BYTES]) -> Self {
         let sk = SigningKey::<MlDsa65>::from_seed(&B32::from(*seed));

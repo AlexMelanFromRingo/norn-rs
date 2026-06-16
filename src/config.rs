@@ -3,6 +3,7 @@
 use anyhow::{Context, Result};
 use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
+use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use zeroize::Zeroize;
@@ -11,6 +12,14 @@ use zeroize::Zeroize;
 pub struct NodeConfig {
     /// Hex-encoded ed25519 private key. Generated fresh if absent.
     pub private_key: Option<String>,
+
+    /// Hex-encoded 32-byte seed for the node's long-term ML-DSA-65 signing key
+    /// (PQ-hybrid handshake auth; **independent** of `private_key` on purpose —
+    /// see `pq_sign`). If absent, an ephemeral random key is used and peers'
+    /// TOFU pins reset on restart; set this (genconfig does) for stable
+    /// cross-restart post-quantum authentication.
+    #[serde(default)]
+    pub ml_dsa_seed: Option<String>,
 
     /// TCP listen addresses, e.g. ["tcp://0.0.0.0:9001"]
     #[serde(default = "default_listen")]
@@ -132,6 +141,7 @@ impl Default for NodeConfig {
     fn default() -> Self {
         NodeConfig {
             private_key: None,
+            ml_dsa_seed: None,
             listen: default_listen(),
             peers: vec![],
             tun_name: default_tun_name(),
@@ -182,12 +192,21 @@ impl NodeConfig {
     pub fn generate_toml() -> String {
         let sk = SigningKey::generate(&mut OsRng);
         let key_hex = hex::encode(sk.to_bytes());
+        let mut seed = [0u8; 32];
+        OsRng.fill_bytes(&mut seed);
+        let ml_dsa_seed_hex = hex::encode(seed);
+        seed.zeroize();
         format!(
             r#"# norn-rs configuration
 
 # Your node's private key (ed25519, 32 bytes hex).
 # KEEP THIS SECRET. Regenerate to get a new identity and address.
 private_key = "{key_hex}"
+
+# Seed (32 bytes hex) for the node's long-term ML-DSA-65 signing key — the
+# post-quantum half of session authentication (independent of private_key).
+# KEEP THIS SECRET. Stable across restarts so peers' PQ TOFU pins hold.
+ml_dsa_seed = "{ml_dsa_seed_hex}"
 
 # TCP addresses to listen on for incoming peer connections.
 listen = ["tcp://0.0.0.0:9001"]
@@ -244,6 +263,44 @@ log_level = "info"
                 }
                 tracing::warn!("using ephemeral key (NORN_ALLOW_EPHEMERAL_KEY set) — identity will change on restart");
                 Ok(SigningKey::generate(&mut OsRng))
+            }
+        }
+    }
+
+    /// The node's long-term ML-DSA-65 signing identity (PQ-hybrid handshake auth).
+    /// Uses `ml_dsa_seed` if set (stable across restarts → peers' TOFU pins hold);
+    /// otherwise an ephemeral random seed, logged at warn (pins reset on restart).
+    /// Seed bytes are zeroized after the signer is constructed.
+    pub fn pq_signer(&self) -> Result<crate::pq_sign::PqSigner> {
+        use crate::pq_sign::{PqSigner, ML_DSA_SEED_BYTES};
+        match &self.ml_dsa_seed {
+            Some(hex_seed) => {
+                let mut bytes = hex::decode(hex_seed).context("decoding ml_dsa_seed hex")?;
+                if bytes.len() != ML_DSA_SEED_BYTES {
+                    bytes.zeroize();
+                    anyhow::bail!(
+                        "ml_dsa_seed must be {} bytes ({} hex chars), got {}",
+                        ML_DSA_SEED_BYTES, ML_DSA_SEED_BYTES * 2, bytes.len()
+                    );
+                }
+                let mut arr = [0u8; ML_DSA_SEED_BYTES];
+                arr.copy_from_slice(&bytes);
+                bytes.zeroize();
+                let signer = PqSigner::from_seed(&arr);
+                arr.zeroize();
+                Ok(signer)
+            }
+            None => {
+                tracing::warn!(
+                    "ml_dsa_seed not set — using an EPHEMERAL ML-DSA key; peers' \
+                     post-quantum TOFU pins will reset on restart. Run `genconfig` or add a \
+                     32-byte hex `ml_dsa_seed` for stable PQ authentication."
+                );
+                let mut arr = [0u8; ML_DSA_SEED_BYTES];
+                OsRng.fill_bytes(&mut arr);
+                let signer = PqSigner::from_seed(&arr);
+                arr.zeroize();
+                Ok(signer)
             }
         }
     }
