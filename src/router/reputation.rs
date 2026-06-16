@@ -179,6 +179,19 @@ impl RouterState {
             .insert(observer, (seq, score, recorded_at));
     }
 
+    /// Blend a peer's *local* trust with the Sybil-hardened network-consensus
+    /// trust (from gossiped, PoW-weighted, trimmed-mean `ReputationReport`s).
+    /// When no consensus is available (below quorum), falls back to local trust
+    /// alone. This is the single trust signal every routing path should rank by,
+    /// so a peer the wider network condemns is de-prioritised everywhere — not
+    /// just on the tag-forwarding path.
+    pub(crate) fn combined_trust(&self, peer_key: &PeerId, local: f32) -> f32 {
+        match self.consensus_trust(peer_key) {
+            Some(c) => (local + c) * 0.5,
+            None => local,
+        }
+    }
+
     /// Compute consensus trust for `observed` with three Sybil/collusion hardenings:
     ///
     ///   1. **PoW-weighted observers.** Each observer's score is multiplied

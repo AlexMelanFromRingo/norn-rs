@@ -4,6 +4,37 @@ All notable changes to norn-rs are documented here. Versions follow Cargo's
 0.x semver: the **minor** number is bumped for breaking (wire/protocol) changes,
 the **patch** number for backward-compatible fixes.
 
+## v0.12.1
+
+> Backward-compatible (no wire change). Local routing-decision change only —
+> v0.12.1 and v0.12.0 nodes interoperate.
+
+**Trust-aware primary routing.** The Sybil-hardened reputation consensus
+(signed gossip, PoW-weighted observers, trimmed mean, quorum) already existed
+but was applied to only one path — tag-forwarding (`lookup_by_tag_excluding`).
+The primary `lookup(dst)` data path was **trust-blind** across all three of its
+strategies, so ~half of transit (greedy, load-bearing since v0.11) and the whole
+full-key path ignored the network's verdict on a peer.
+
+- `greedy_next_hop` now ranks the strictly-closer candidates by
+  `distance / combined_trust` instead of pure distance, routing around a
+  network-condemned relay when an honest alternative exists. It only re-ranks
+  **within** the strictly-closer set, so greedy loop-freedom and convergence are
+  preserved (worst case: a few extra hops).
+- The cuckoo fallback and XOR last-resort in `lookup` now use
+  `trust_adjusted_cost_with(combined_trust)` (XOR distance stays the primary key
+  for correctness; trust only breaks ties), matching the tag-forwarding path.
+- New `combined_trust` helper blends local trust with consensus (the single
+  signal every path now ranks by); de-duplicates the prior inline logic.
+
+No new wire messages, no new flooding (reputation gossip already exists), no new
+per-node state (the reputation table is already bounded). Honest residual: a
+coalition controlling the *only* closer neighbour / sole route still carries
+that traffic — the "Multiple cooperating malicious peers" row in SECURITY.md
+stays ◐.
+
+---
+
 ## v0.12.0
 
 > ⚠️ **Breaking, flag-day release.** The session handshake wire format changed
